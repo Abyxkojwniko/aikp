@@ -23,6 +23,8 @@ env/
 /rpg_backend/
 # Auto-downloaded portable Python / Node (created by _aikp_setup.ps1)
 /tools/
+# Release bundle build output (created by build_release.ps1)
+/dist/
 
 # ── Backend runtime data (regenerated at runtime) ──
 backend/sessions/

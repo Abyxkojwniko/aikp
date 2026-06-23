@@ -28,6 +28,7 @@ $Venv      = Join-Path $Root '.venv'
 $VenvPy    = Join-Path $Venv 'Scripts\python.exe'
 $ReqFile   = Join-Path $Root 'backend\requirements.txt'
 $StRoot    = Join-Path $Root 'Tavern\SillyTavern'
+$PortablePy = Join-Path $Tools 'python\python.exe'   # bundle runtime (no venv)
 
 function Say($msg)  { Write-Host "  $msg" -ForegroundColor Gray }
 function Step($msg) { Write-Host "`n>> $msg" -ForegroundColor Cyan }
@@ -99,37 +100,57 @@ function Install-PortablePython {
 }
 
 # =========================================================================
-# 2. Create venv + install backend deps (idempotent via a hash marker)
+# 2. Resolve a Python runtime + install backend deps (idempotent)
+#    Two supported layouts:
+#      • .venv  — created locally on first run (preferred; honours venv choice)
+#      • tools\python — a portable Python with deps installed directly into it,
+#                       used by the relocatable release bundle (venv is NOT
+#                       path-portable, so the bundle must avoid it)
 # =========================================================================
-function Ensure-Venv {
-    Step "检查后端运行环境 (.venv) ..."
-    if (-not (Test-Path $VenvPy)) {
-        $base = Resolve-BasePython
-        if (-not $base) { $base = Install-PortablePython }
-        Say "用 $base 创建虚拟环境 .venv ..."
-        # $base is a real python.exe path; call operator handles spaces in paths.
-        & $base -m venv $Venv
-        if (-not (Test-Path $VenvPy)) { throw "创建 .venv 失败" }
-        Ok "虚拟环境已创建"
-    } else {
-        Ok "虚拟环境已存在"
-    }
+function Resolve-PyRuntime {
+    if (Test-Path $VenvPy)     { return $VenvPy }      # local venv
+    if (Test-Path $PortablePy) { return $PortablePy }  # bundled portable python
+    # Nothing yet — create a venv from a base/portable python.
+    $base = Resolve-BasePython
+    if (-not $base) { $base = Install-PortablePython }
+    Step "创建虚拟环境 .venv ..."
+    Say "用 $base 创建 .venv ..."
+    & $base -m venv $Venv          # call operator handles spaces in the path
+    if (-not (Test-Path $VenvPy)) { throw "创建 .venv 失败" }
+    Ok "虚拟环境已创建"
+    return $VenvPy
 }
 
-function Ensure-PyDeps {
-    Step "检查后端依赖 ..."
+function Ensure-PyEnv {
+    Step "检查后端运行环境 ..."
     if (-not (Test-Path $ReqFile)) { throw "缺少 $ReqFile" }
-    $marker = Join-Path $Venv '.deps.hash'
+    $script:PyExe = Resolve-PyRuntime
+    # Deps marker lives next to whichever python we resolved.
+    $marker = Join-Path (Split-Path $script:PyExe) '.aikp_deps.hash'
     $want   = (Get-FileHash $ReqFile -Algorithm SHA256).Hash
     $have   = if (Test-Path $marker) { Get-Content $marker -Raw } else { '' }
-    if ($have.Trim() -eq $want) { Ok "依赖已是最新"; return }
+    if ($have.Trim() -eq $want) { Ok "后端依赖已就绪"; return }
 
     Say "安装/更新 Python 依赖（首次约 1-3 分钟）..."
-    & $VenvPy -m pip install --upgrade pip --quiet
-    & $VenvPy -m pip install -r $ReqFile
+    & $script:PyExe -m pip install --upgrade pip --quiet
+    & $script:PyExe -m pip install -r $ReqFile
     if ($LASTEXITCODE -ne 0) { throw "pip install 失败" }
     Set-Content -Path $marker -Value $want -Encoding ascii
     Ok "后端依赖就绪"
+}
+
+# Offline embedding model: the release bundle ships ChromaDB's MiniLM model
+# under runtime_cache\; ChromaDB hard-codes its cache to ~/.cache/chroma, so
+# copy it there on first run. No-op when no bundled cache exists (online use).
+function Ensure-ChromaModel {
+    $bundled = Join-Path $Root 'runtime_cache\chroma_onnx\all-MiniLM-L6-v2'
+    if (-not (Test-Path $bundled)) { return }
+    $dest = Join-Path $env:USERPROFILE '.cache\chroma\onnx_models\all-MiniLM-L6-v2'
+    if (Test-Path (Join-Path $dest 'onnx\model.onnx')) { return }
+    Step "部署离线语义检索模型 ..."
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    Copy-Item -Path (Join-Path $bundled '*') -Destination $dest -Recurse -Force
+    Ok "离线模型已部署"
 }
 
 # =========================================================================
@@ -190,8 +211,8 @@ try {
     Write-Host "  （已配置过则秒过，无需手动安装任何东西）" -ForegroundColor DarkGray
     Write-Host "============================================" -ForegroundColor Cyan
 
-    Ensure-Venv
-    Ensure-PyDeps
+    Ensure-PyEnv
+    Ensure-ChromaModel
     Ensure-Node
     Ensure-NodeModules
 
