@@ -21,6 +21,8 @@ venv/
 env/
 # Conda env committed by mistake — never ship
 /rpg_backend/
+# Auto-downloaded portable Python / Node (created by _aikp_setup.ps1)
+/tools/
 
 # ── Backend runtime data (regenerated at runtime) ──
 backend/sessions/

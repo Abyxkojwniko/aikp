@@ -7,22 +7,34 @@ echo ============================================
 echo            AIKP   AI 跑团主持
 echo ============================================
 echo.
-echo  正在启动游戏，首次启动可能需要 10-30 秒，请耐心等待...
+echo  正在启动游戏。首次启动会自动配置环境（可能需要几分钟下载），
+echo  之后每次启动都很快，请耐心等待...
 echo.
 
-echo  [0/3] 清理可能残留的旧进程（确保加载最新代码）...
+echo  [0/4] 检查并自动配置运行环境（首次较慢，之后秒过）...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0_aikp_setup.ps1"
+if errorlevel 1 (
+    echo.
+    echo  [!] 环境自动配置失败，无法启动。请把上面的红色错误反馈。
+    pause
+    exit /b 1
+)
+echo      环境已就绪 ✓
+echo.
+
+echo  [1/4] 清理可能残留的旧进程（确保加载最新代码）...
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8001" ^| findstr "LISTENING"') do taskkill /F /PID %%a >nul 2>nul
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do taskkill /F /PID %%a >nul 2>nul
 ping -n 2 127.0.0.1 >nul
 
-echo  [1/3] 启动游戏引擎（后端，端口 8001）...
+echo  [2/4] 启动游戏引擎（后端，端口 8001）...
 start "AIKP 引擎（请勿关闭）" /min "%~dp0_aikp_backend.bat"
 
-echo  [2/3] 启动游戏界面（前端，端口 8000）...
+echo  [3/4] 启动游戏界面（前端，端口 8000）...
 start "AIKP 界面（请勿关闭）" /min "%~dp0_aikp_frontend.bat"
 
 echo.
-echo  [3/3] 等待服务就绪（不会死等，就绪后自动打开浏览器）
+echo  [4/4] 等待服务就绪（不会死等，就绪后自动打开浏览器）
 echo.
 
 REM ==== 等后端 8001 就绪 ====
