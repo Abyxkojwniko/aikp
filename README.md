@@ -85,7 +85,7 @@ API Key 解析顺序：请求头 `Authorization` → 环境变量 `DEEPSEEK_API_
 |---|---|
 | `DEEPSEEK_API_KEY` | （必填） |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` |
-| `DEEPSEEK_MODEL` | `deepseek-chat` |
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash` |
 
 ## 目录
 
