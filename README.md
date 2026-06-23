@@ -34,12 +34,7 @@ cp .env.example .env          # 然后编辑 .env，填入你的 DEEPSEEK_API_KE
 
 ## 运行
 
-Windows 一键启动（双击或命令行）：
-
-```bat
-_aikp_backend.bat     :: 启动后端  (端口 8001)
-_aikp_frontend.bat    :: 启动前端  (端口 8000)
-```
+点击启动游戏.bat
 
 手动启动（两个终端）：
 
