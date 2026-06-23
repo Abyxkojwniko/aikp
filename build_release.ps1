@@ -87,13 +87,22 @@ if(-not (Test-Path (Join-Path $Stage 'tools\node\node.exe'))){ throw "Node 解�
 Ok "便携 Node 就绪"
 
 # -------------------------------------------------- 3. copy the app source
+# IMPORTANT: robocopy /XD with a BARE name excludes that name ANYWHERE in the
+# tree. We must exclude the app's own top-level dirs by FULL PATH, otherwise
+# e.g. excluding "dist"/"cache" would also delete every node_modules\**\dist
+# and break packages like "yaml". Only __pycache__/.git are excluded by name
+# (we genuinely want those gone recursively).
 Step "拷贝程序文件"
-Robo (Join-Path $Repo 'backend') (Join-Path $Stage 'backend') `
-     @('__pycache__','sessions','uploads','world_book','_chroma') `
+$beSrc = Join-Path $Repo 'backend'
+Robo $beSrc (Join-Path $Stage 'backend') `
+     @('__pycache__', (Join-Path $beSrc 'sessions'), (Join-Path $beSrc 'uploads'),
+       (Join-Path $beSrc 'world_book'), (Join-Path $beSrc '_chroma')) `
      @('_t.py','_test_parser.py','_read_xlsx.py','rebuild_backend.py')
-Robo (Join-Path $Repo 'Tavern\SillyTavern') (Join-Path $Stage 'Tavern\SillyTavern') `
-     @('data','backups','cache','thumbnails','dist','.git') `
-     @('config.yaml')
+$stSrc = Join-Path $Repo 'Tavern\SillyTavern'
+Robo $stSrc (Join-Path $Stage 'Tavern\SillyTavern') `
+     @('.git', (Join-Path $stSrc 'data'), (Join-Path $stSrc 'backups'),
+       (Join-Path $stSrc 'cache'), (Join-Path $stSrc 'thumbnails'), (Join-Path $stSrc 'dist')) `
+     @((Join-Path $stSrc 'config.yaml'))
 # root files needed to run
 $rootFiles = @('启动游戏.bat','停止游戏.bat','_aikp_backend.bat','_aikp_frontend.bat',
                '_aikp_setup.ps1','start.bat','start.ps1','.env.example',

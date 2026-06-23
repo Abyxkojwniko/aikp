@@ -1,6 +1,7 @@
 # AIKP backend dependencies — install with:  pip install -r requirements.txt
 fastapi==0.136.3
 uvicorn==0.49.0
+python-multipart==0.0.32
 openai==2.41.1
 langgraph==1.2.4
 chromadb==1.5.9
