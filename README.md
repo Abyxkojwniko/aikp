@@ -6,7 +6,18 @@ AI 驱动的 TRPG（CoC / D&D）游戏主持人（KP/GM）。前端为定制版 
 
 > 模组内容（商业版权）不随仓库分发，请自行准备并放入 `models/`。
 
-## 快速开始（Windows，零配置）
+## 下载（最省事：整合包）
+
+到 [Releases](../../releases) 下载 `AIKP-Portable-*-win64.zip`（约 430MB），解压后：
+
+1. 复制 `.env.example` 为 `.env`，填入你的 DeepSeek API Key（在 https://platform.deepseek.com/ 获取）。
+2. **双击 `AIKP.exe`**（或 `启动游戏.bat`）。
+
+整合包内置便携版 Python、Node、全部依赖和离线语义模型，**无需联网配置环境、无需装任何东西**，解压即玩。
+
+如果你更想从源码运行（仓库体积小、自动联网配置），见下面「快速开始」。
+
+## 快速开始（Windows，源码 + 零配置）
 
 1. 下载 / 克隆本仓库。
 2. 复制 `.env.example` 为 `.env`，填入你的 DeepSeek API Key（在 https://platform.deepseek.com/ 获取）。
