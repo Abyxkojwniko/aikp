@@ -740,7 +740,12 @@ def _maybe_apply_movement(state: "GMState", content: str) -> str:
     # the scene is "黎明公馆会客厅").
     hits = []
     for tid, labels in _exit_labels(current_scene, world):
-        if any(l in content for l in labels):
+        # Only ≥3-char labels are safe to substring-match against free prose;
+        # 2-char labels collide with ordinary narration and would falsely fire a
+        # move. (They're still used for the explicit 〔前往：X〕 marker above,
+        # matched against the short marker text rather than the whole reply.)
+        strong = [l for l in labels if len(l) >= 3]
+        if strong and any(l in content for l in strong):
             hits.append(tid)
     hits = list(dict.fromkeys(hits))
     if len(hits) == 1:

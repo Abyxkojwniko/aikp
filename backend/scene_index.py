@@ -37,7 +37,11 @@ def build_scene_index(world: dict) -> dict[str, list[str]]:
         is_mobile_npc = (entity.get("type") == "npc" and len(present_in) > 1)
         if is_mobile_npc:
             ename = entity.get("name", "")
-            if ename:
+            # Only widen on a bare substring match when the name is ≥3 chars.
+            # 2-char Chinese names collide too easily with ordinary prose, and a
+            # false hit would teleport an NPC into a scene they're not in. Short
+            # names rely on the parser's all_scenes instead.
+            if ename and len(ename) >= 3:
                 for sid, scene in world.get("scenes", {}).items():
                     if sid in present_in:
                         continue

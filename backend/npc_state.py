@@ -77,6 +77,9 @@ def merge_npcs(world: dict) -> dict[str, dict]:
     legacy = world.get("npcs", {})
 
     merged: dict[str, dict] = {}
+    # NPCs whose style came from the parse-time LLM (entity['style']); for these
+    # we must NOT clobber it with the runtime keyword heuristic on re-infer.
+    explicit_styles: set[str] = set()
 
     def _extract(eid: str, entity: dict):
         name = entity.get("name", eid)
@@ -116,6 +119,11 @@ def merge_npcs(world: dict) -> dict[str, dict]:
         entry = merged[name]
         entry["_ids"].append(eid)
 
+        # Parse-time LLM style wins over the runtime heuristic.
+        if entity.get("style"):
+            entry["static"]["style"] = entity["style"]
+            explicit_styles.add(name)
+
         # Merge static: use richer data
         s = entry["static"]
         for field in ["profession", "appearance", "personality"]:
@@ -124,15 +132,19 @@ def merge_npcs(world: dict) -> dict[str, dict]:
             if new_val and len(new_val) > len(existing):
                 s[field] = new_val
 
-        # Re-infer style if personality was updated
-        if s["personality"]:
+        # Re-infer style if personality was updated — but never override a
+        # parse-time LLM style (that's the whole point of baking it in).
+        if s["personality"] and name not in explicit_styles:
             s["style"] = infer_style(s["personality"])
 
         # Merge dialogue topics (unique by topic name)
         dialogue = entity.get("dialogue", {})
+        dtrust = entity.get("dialogue_trust") or {}  # parse-time LLM trust map
         for topic, data in (dialogue.items() if isinstance(dialogue, dict) else {}):
             text = data if isinstance(data, str) else data.get("text", str(data))
             trust_req = data.get("trust_required") if isinstance(data, dict) else None
+            if trust_req is None:
+                trust_req = dtrust.get(topic)
             if trust_req is None:
                 trust_req = default_trust(topic)
             if topic not in s["dialogue"]:

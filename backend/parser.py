@@ -165,6 +165,32 @@ PASS_STORYLINE_SYSTEM = """你是 TRPG 剧情分析师。模组里有些 NPC 会
 规则：npc_id 必须用清单里给定的 id。arc 按剧情先后排序。does 忠于原文，不编造。"""
 
 
+PASS_NPC_STYLE_SYSTEM = """你是 TRPG 角色分析师。根据每个 NPC 的【人设/性格描述】，判定他们的【说话风格 style】，并为他们的每个【对话话题】判定【需要的信任度 dialogue_trust】。
+
+这是给 KP 用的：风格决定 KP 扮演该 NPC 时话的多少和语气；信任度决定玩家要多熟才能从该 NPC 嘴里问出这个话题。
+
+【style】三项都必须从下列固定取值里选（不得自创、不得用中文）：
+- verbosity（话多少）：many_words（健谈/滔滔不绝）| normal（正常）| few_words（寡言/简练，1-2句）| grunt（几乎只用单字/点头/哼）
+- tone（语气）：cheerful（开朗愉快）| nervous（紧张焦虑）| gruff（冷硬粗暴/低沉）| academic（严谨理性/学术拘谨）| neutral（中性）
+- initiative（主动性）：active（主动搭话/自来熟）| passive（被动，被问才答）
+
+【dialogue_trust】：为每个给定话题给一个 0-100 的整数。粗略基准（再按性格与话题私密程度微调，越私密越高）：
+- 寒暄/问候/公开信息：0
+- 一般话题：10-20
+- 个人/家庭：约 25
+- 恐惧/弱点/创伤：约 30
+- 秘密/过去/隐私：50 或更高
+
+输出 ONLY JSON，格式：
+{
+  "npc_id": {
+    "style": {"verbosity":"...","tone":"...","initiative":"..."},
+    "dialogue_trust": {"话题名": 整数}
+  }
+}
+规则：npc_id 用清单里给定的 id；style 三项只能用上面列出的英文取值；dialogue_trust 的话题名必须与给定话题完全一致；只判定清单里的 NPC，不新增。"""
+
+
 # ── Parser Class ──────────────────────────────────────────────
 
 class ModuleParser:
@@ -744,6 +770,68 @@ class ModuleParser:
                 target["storyline_secret"] = secret
         print(f"[PARSER] NPC storylines: added arcs to {added} NPCs", flush=True)
 
+    def pass_npc_style(self, world_book: dict) -> None:
+        """Determine each NPC's speaking style + per-topic trust thresholds with a
+        single LLM pass at PARSE time, baked into static data (entity['style'] and
+        entity['dialogue_trust']). This replaces the runtime keyword heuristics in
+        npc_state (infer_style/default_trust), which stay only as a fallback for
+        old world books or if this pass fails. Style at parse-time is more robust
+        across modules than guessing from a hand-tuned keyword table at runtime."""
+        entities = world_book.get("entities", {})
+        npcs = {eid: e for eid, e in entities.items()
+                if isinstance(e, dict) and e.get("type") == "npc"}
+        if not npcs:
+            return
+        blocks = []
+        for eid, e in npcs.items():
+            topics = list((e.get("dialogue") or {}).keys())
+            blocks.append(
+                f'{eid}：名字={e.get("name","")}，职业={e.get("profession","")}\n'
+                f'  性格：{(e.get("personality","") or "（无）")[:400]}\n'
+                f'  对话话题：{("、".join(topics) if topics else "（无）")}'
+            )
+        user = ("== NPC 清单 ==\n" + "\n\n".join(blocks)
+                + "\n\n请为每个 NPC 判定 style 和 dialogue_trust，按要求输出 JSON。")
+        raw = self._llm(PASS_NPC_STYLE_SYSTEM, user, temperature=0.0,
+                        max_tokens=4096, json_mode=True)
+        result = self._parse_json(raw)
+        if not isinstance(result, dict):
+            print("[PARSER] NPC style: no valid result", flush=True)
+            return
+
+        _VERB = {"many_words", "normal", "few_words", "grunt"}
+        _TONE = {"cheerful", "nervous", "gruff", "academic", "neutral"}
+        _INIT = {"active", "passive"}
+        styled = 0
+        for nid, data in result.items():
+            target = entities.get(nid)
+            if not isinstance(target, dict) or not isinstance(data, dict):
+                continue
+            st = data.get("style")
+            if isinstance(st, dict):
+                # Clamp to the known vocabulary; fall back to safe defaults so a
+                # bad enum can never break downstream behavior shaping.
+                target["style"] = {
+                    "verbosity": st.get("verbosity") if st.get("verbosity") in _VERB else "normal",
+                    "tone": st.get("tone") if st.get("tone") in _TONE else "neutral",
+                    "initiative": st.get("initiative") if st.get("initiative") in _INIT else "passive",
+                }
+                styled += 1
+            dt = data.get("dialogue_trust")
+            if isinstance(dt, dict):
+                valid_topics = set((target.get("dialogue") or {}).keys())
+                clean = {}
+                for topic, val in dt.items():
+                    if topic not in valid_topics:
+                        continue
+                    try:
+                        clean[topic] = max(0, min(100, int(val)))
+                    except (TypeError, ValueError):
+                        continue
+                if clean:
+                    target["dialogue_trust"] = clean
+        print(f"[PARSER] NPC style: set style for {styled} NPCs", flush=True)
+
     def pass3_5_validate(self, world_book: dict) -> list[str]:
         """Validate world book completeness."""
         issues: list[str] = []
@@ -873,6 +961,15 @@ class ModuleParser:
             self.pass_npc_storylines(text, world_book)
         except Exception as e:
             print(f"[PARSER] NPC storyline error: {e}", flush=True)
+
+        # Pass 3.8: NPC style + per-topic trust — bake speaking style and dialogue
+        # trust thresholds into static data, replacing the runtime keyword
+        # heuristics (npc_state.infer_style/default_trust, now fallback-only).
+        print("[PARSER] Pass 3.8: Inferring NPC style/trust...", flush=True)
+        try:
+            self.pass_npc_style(world_book)
+        except Exception as e:
+            print(f"[PARSER] NPC style error: {e}", flush=True)
 
         # Pass 3.5: Validation
         print("[PARSER] Pass 3.5: Validating...", flush=True)
