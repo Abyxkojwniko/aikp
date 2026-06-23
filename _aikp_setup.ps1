@@ -57,6 +57,15 @@ function Download($url, $dest) {
     if (-not (Test-Path $dest)) { throw "下载后文件不存在: $dest" }
 }
 
+# Try mirror(s) first, fall back to the next URL. China users get the fast
+# npmmirror CDN; everyone else falls back to the official host.
+function DownloadAny([string[]]$urls, $dest) {
+    foreach ($u in $urls) {
+        try { Download $u $dest; return } catch { Say "  换源重试：$($_.Exception.Message)" }
+    }
+    throw "所有下载源都失败：$dest"
+}
+
 # =========================================================================
 # 1. Locate (or install) a base Python able to build the venv
 # =========================================================================
@@ -82,10 +91,12 @@ function Resolve-BasePython {
 function Install-PortablePython {
     Step "未检测到 Python，正在自动下载安装（约 30MB，免管理员）..."
     New-Item -ItemType Directory -Force -Path $Tools | Out-Null
-    $url     = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-amd64.exe"
     $exe     = Join-Path $Tools "python-$PY_VERSION-amd64.exe"
     $target  = Join-Path $Tools 'python'
-    Download $url $exe
+    DownloadAny @(
+        "https://registry.npmmirror.com/-/binary/python/$PY_VERSION/python-$PY_VERSION-amd64.exe",
+        "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-amd64.exe"
+    ) $exe
     Say "静默安装 Python $PY_VERSION 到 tools\python ..."
     # Per-user install to a project-local dir — no admin, no PATH pollution.
     $pyArgs = @('/quiet','InstallAllUsers=0','PrependPath=0','Include_pip=1',
@@ -132,8 +143,10 @@ function Ensure-PyEnv {
     if ($have.Trim() -eq $want) { Ok "后端依赖已就绪"; return }
 
     Say "安装/更新 Python 依赖（首次约 1-3 分钟）..."
-    & $script:PyExe -m pip install --upgrade pip --quiet
-    & $script:PyExe -m pip install -r $ReqFile
+    # Tsinghua PyPI mirror — fast/reliable in China; harmless elsewhere.
+    $pi = @('-i','https://pypi.tuna.tsinghua.edu.cn/simple','--trusted-host','pypi.tuna.tsinghua.edu.cn')
+    & $script:PyExe -m pip install --upgrade pip --quiet @pi
+    & $script:PyExe -m pip install -r $ReqFile @pi
     if ($LASTEXITCODE -ne 0) { throw "pip install 失败" }
     Set-Content -Path $marker -Value $want -Encoding ascii
     Ok "后端依赖就绪"
@@ -170,9 +183,11 @@ function Ensure-Node {
     Step "未检测到 Node.js，正在自动下载便携版（约 30MB，免安装）..."
     New-Item -ItemType Directory -Force -Path $Tools | Out-Null
     $name = "node-v$NODE_VERSION-win-x64"
-    $url  = "https://nodejs.org/dist/v$NODE_VERSION/$name.zip"
     $zip  = Join-Path $Tools "$name.zip"
-    Download $url $zip
+    DownloadAny @(
+        "https://registry.npmmirror.com/-/binary/node/v$NODE_VERSION/$name.zip",
+        "https://nodejs.org/dist/v$NODE_VERSION/$name.zip"
+    ) $zip
     Say "解压 Node ..."
     Expand-Archive -Path $zip -DestinationPath $Tools -Force
     Remove-Item $zip -ErrorAction SilentlyContinue

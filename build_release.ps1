@@ -39,6 +39,15 @@ function Download($url,$dest){
     if(-not (Test-Path $dest)){ throw "下载后文件不存在: $dest" }
 }
 
+# Try mirror(s) first, fall back to the next URL on failure. China users get
+# the fast npmmirror CDN; everyone else falls back to the official host.
+function DownloadAny([string[]]$urls,$dest){
+    foreach($u in $urls){
+        try { Download $u $dest; return } catch { Say "  换源重试：$($_.Exception.Message)" }
+    }
+    throw "所有下载源都失败：$dest"
+}
+
 # robocopy returns a bitmask; 0-7 = success, >=8 = real failure
 function Robo($src,$dst,[string[]]$xd,[string[]]$xf){
     $a = @($src,$dst,'/E','/NFL','/NDL','/NJH','/NJS','/NP','/R:1','/W:1')
@@ -57,20 +66,35 @@ $tmp = Join-Path $Dist '_tmp'
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 # ------------------------------------------- 1. portable Python + backend deps
-Step "安装便携 Python $PY_VERSION 并装后端依赖"
+# Use the EMBEDDABLE zip (not the installer): no registry, no admin, always
+# extracts cleanly, and re-runnable. The installer registers per-user and on a
+# 2nd run enters "modify" mode without populating a fresh TargetDir.
+Step "部署便携 Python $PY_VERSION（embeddable）并装后端依赖"
 $pyDir = Join-Path $Stage 'tools\python'
 $pyExe = Join-Path $pyDir 'python.exe'
-$inst  = Join-Path $tmp "python-$PY_VERSION-amd64.exe"
-Download "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-amd64.exe" $inst
-$p = Start-Process -FilePath $inst -Wait -PassThru -ArgumentList @(
-    '/quiet','InstallAllUsers=0','PrependPath=0','Include_pip=1',
-    'Include_test=0','Include_launcher=0','Include_doc=0','SimpleInstall=1',
-    "TargetDir=$pyDir")
-if($p.ExitCode -ne 0){ throw "Python 安装器退出码 $($p.ExitCode)" }
+New-Item -ItemType Directory -Force -Path $pyDir | Out-Null
+$embed = Join-Path $tmp "python-$PY_VERSION-embed.zip"
+DownloadAny @(
+    "https://registry.npmmirror.com/-/binary/python/$PY_VERSION/python-$PY_VERSION-embed-amd64.zip",
+    "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-embed-amd64.zip"
+) $embed
+Expand-Archive -Path $embed -DestinationPath $pyDir -Force
 if(-not (Test-Path $pyExe)){ throw "未找到 $pyExe" }
+# Enable site-packages so pip + deps are importable (embeddable disables it).
+$pth = Get-ChildItem $pyDir -Filter 'python*._pth' | Select-Object -First 1
+$lines = Get-Content $pth.FullName
+$lines = $lines | ForEach-Object { $_ -replace '^\s*#\s*import\s+site\s*$','import site' }
+if($lines -notcontains 'Lib\site-packages'){ $lines += 'Lib\site-packages' }
+Set-Content -Path $pth.FullName -Value $lines -Encoding ascii
+# Bootstrap pip (embeddable has no ensurepip).
+$getpip = Join-Path $tmp 'get-pip.py'
+Download 'https://bootstrap.pypa.io/get-pip.py' $getpip
+& $pyExe $getpip --no-warn-script-location
+if($LASTEXITCODE -ne 0){ throw "get-pip 失败" }
 Say "pip install 依赖（chromadb/onnxruntime 较大，请耐心）..."
-& $pyExe -m pip install --upgrade pip --quiet
-& $pyExe -m pip install -r $Req
+$pi = @('-i','https://pypi.tuna.tsinghua.edu.cn/simple','--trusted-host','pypi.tuna.tsinghua.edu.cn')
+& $pyExe -m pip install --upgrade pip --quiet @pi
+& $pyExe -m pip install -r $Req @pi
 if($LASTEXITCODE -ne 0){ throw "pip install 失败" }
 $hash = (Get-FileHash $Req -Algorithm SHA256).Hash
 Set-Content -Path (Join-Path $pyDir '.aikp_deps.hash') -Value $hash -Encoding ascii
@@ -80,7 +104,10 @@ Ok "便携 Python 就绪"
 Step "下载便携 Node.js $NODE_VERSION"
 $nodeName = "node-v$NODE_VERSION-win-x64"
 $nodeZip  = Join-Path $tmp "$nodeName.zip"
-Download "https://nodejs.org/dist/v$NODE_VERSION/$nodeName.zip" $nodeZip
+DownloadAny @(
+    "https://registry.npmmirror.com/-/binary/node/v$NODE_VERSION/$nodeName.zip",
+    "https://nodejs.org/dist/v$NODE_VERSION/$nodeName.zip"
+) $nodeZip
 Expand-Archive -Path $nodeZip -DestinationPath $tmp -Force
 Move-Item (Join-Path $tmp $nodeName) (Join-Path $Stage 'tools\node')
 if(-not (Test-Path (Join-Path $Stage 'tools\node\node.exe'))){ throw "Node 解压失败" }
