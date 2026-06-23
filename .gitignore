@@ -1,0 +1,82 @@
+# =========================================================================
+#  AIKP .gitignore — ship ONLY what's needed to run (frontend + backend).
+#  Excluded: secrets, conda env, node deps, commercial modules, logs, docs.
+# =========================================================================
+
+# ── Secrets & local env (NEVER commit a real key) ──
+.env
+.env.*
+!.env.example
+**/secrets.json
+*.pem
+*.key
+**/certs/
+
+# ── Python cache / local virtualenvs ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+# Conda env committed by mistake — never ship
+/rpg_backend/
+
+# ── Backend runtime data (regenerated at runtime) ──
+backend/sessions/
+backend/uploads/
+backend/world_book/
+
+# ── Commercial TRPG modules — copyrighted, do NOT redistribute ──
+/models/*
+!/models/.gitkeep
+
+# ── Logs & scratch / temp files ──
+*.log
+_*.json
+_*.txt
+_story_raw.json
+
+# ── Debug / one-off scripts (not part of the runtime) ──
+backend/_t.py
+backend/_test_parser.py
+backend/_read_xlsx.py
+backend/rebuild_backend.py
+
+# ── Design / architecture docs & assistant files (not needed to run) ──
+docs/
+CLAUDE.md
+.opencode/
+.claude/
+
+# ── Tests, tooling & utilities (not needed to RUN the app) ──
+test/
+tool/
+reparse.py
+dependency/
+
+# ── Personal / status / design docs (keep only README.md) ──
+项目状态与测试清单.md
+*状态*.md
+*清单*.md
+*交接*.md
+*设计*.md
+*架构*.md
+*报告*.md
+
+# ── SillyTavern frontend: ship SOURCE (incl. the modified aikp extension),
+#    but NOT its deps, user data (chats + secrets), or runtime config ──
+Tavern/SillyTavern/node_modules/
+Tavern/SillyTavern/data/
+Tavern/SillyTavern/backups/
+Tavern/SillyTavern/cache/
+Tavern/SillyTavern/dist/
+Tavern/SillyTavern/config.yaml
+Tavern/SillyTavern/.git/
+Tavern/SillyTavern/thumbnails/
+
+# ── OS / IDE ──
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

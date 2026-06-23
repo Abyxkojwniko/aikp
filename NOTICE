@@ -1,0 +1,21 @@
+AIKP — AI 跑团主持
+Copyright 2026 Abyxkojwniko
+
+This product includes software developed by Abyxkojwniko.
+
+================================================================
+License boundary (this repository contains two parts)
+================================================================
+
+1. backend/ and the top-level launcher scripts (the original work)
+   Licensed under the Apache License, Version 2.0 (see ./LICENSE).
+
+2. Tavern/SillyTavern/ (a modified version of SillyTavern)
+   Licensed under the GNU Affero General Public License v3.0
+   (AGPL-3.0). See Tavern/SillyTavern/LICENSE for its terms.
+   SillyTavern is the work of its original authors; modifications
+   in this directory remain under AGPL-3.0.
+
+The two parts run as separate processes communicating over HTTP;
+the Apache-2.0 license applies only to the original backend code,
+not to the bundled SillyTavern frontend.

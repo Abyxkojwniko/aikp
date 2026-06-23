@@ -1,0 +1,15 @@
+{
+    "display_name": "AIKP GM Engine",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "AIKP",
+    "version": "2.0.0",
+    "description": "TRPG AI Game Master engine integration. Manages world book upload, parsing, selection, and game state display.",
+    "hooks": {
+        "activate": "init"
+    }
+}

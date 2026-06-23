@@ -1,0 +1,10 @@
+# AIKP backend dependencies — install with:  pip install -r requirements.txt
+fastapi==0.136.3
+uvicorn==0.49.0
+openai==2.41.1
+langgraph==1.2.4
+chromadb==1.5.9
+pydantic==2.13.4
+openpyxl==3.1.5
+# Optional: only needed to parse PDF modules
+pypdf>=4.0.0
