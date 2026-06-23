@@ -80,11 +80,16 @@ DownloadAny @(
 ) $embed
 Expand-Archive -Path $embed -DestinationPath $pyDir -Force
 if(-not (Test-Path $pyExe)){ throw "未找到 $pyExe" }
-# Enable site-packages so pip + deps are importable (embeddable disables it).
+# Fix the embeddable Python's path config (._pth):
+#  - enable site-packages so pip + deps import
+#  - add the backend dir (..\..\backend, relative to python.exe at runtime so
+#    it survives relocation) — embeddable does NOT auto-add the script dir, so
+#    server.py's `from engine import ...` would otherwise fail.
 $pth = Get-ChildItem $pyDir -Filter 'python*._pth' | Select-Object -First 1
 $lines = Get-Content $pth.FullName
 $lines = $lines | ForEach-Object { $_ -replace '^\s*#\s*import\s+site\s*$','import site' }
 if($lines -notcontains 'Lib\site-packages'){ $lines += 'Lib\site-packages' }
+if($lines -notcontains '..\..\backend'){ $lines += '..\..\backend' }
 Set-Content -Path $pth.FullName -Value $lines -Encoding ascii
 # Bootstrap pip (embeddable has no ensurepip).
 $getpip = Join-Path $tmp 'get-pip.py'
