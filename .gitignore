@@ -67,6 +67,7 @@ dependency/
 *设计*.md
 *架构*.md
 *报告*.md
+结项报告.md
 
 # ── SillyTavern frontend: ship SOURCE (incl. the modified aikp extension),
 #    but NOT its deps, user data (chats + secrets), or runtime config ──
