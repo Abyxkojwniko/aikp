@@ -1,4 +1,5 @@
 @echo off
-rem Convenience alias â€” the real launcher is å¯åŠ¨æ¸¸æˆ.bat (auto-configures env).
+chcp 936 >nul
+rem Convenience alias ¡ª the real launcher is Æô¶¯ÓÎÏ·.bat (auto-configures env).
 cd /d "%~dp0"
-call "%~dp0å¯åŠ¨æ¸¸æˆ.bat"
+call "%~dp0Æô¶¯ÓÎÏ·.bat"

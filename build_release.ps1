@@ -146,9 +146,11 @@ foreach($f in $rootFiles){
 # empty models/ for the player's own world books
 New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'models') | Out-Null
 Set-Content -Path (Join-Path $Stage 'models\.gitkeep') -Value '' -Encoding ascii
-# ASCII shim that AIKP.exe launches (avoids a Chinese filename in the exe)
-$shim = "@echo off`r`nchcp 65001 >nul`r`ncd /d `"%~dp0`"`r`ncall `"%~dp0启动游戏.bat`"`r`n"
-[System.IO.File]::WriteAllText((Join-Path $Stage '_aikp_launch.bat'), $shim, (New-Object System.Text.UTF8Encoding($false)))
+# ASCII-named shim that AIKP.exe launches. Encoded as GBK + chcp 936 so its
+# Chinese filename reference renders/resolves on a Chinese (936) console — the
+# same encoding the copied .bat launchers use.
+$shim = "@echo off`r`nchcp 936 >nul`r`ncd /d `"%~dp0`"`r`ncall `"%~dp0启动游戏.bat`"`r`n"
+[System.IO.File]::WriteAllText((Join-Path $Stage '_aikp_launch.bat'), $shim, [System.Text.Encoding]::GetEncoding(936))
 Ok "程序文件已拷贝"
 
 # --------------------------------------- 4. precache offline embedding model
@@ -213,11 +215,25 @@ class AikpLauncher {
 }
 
 # ----------------------------------------------------------------- 6. zip it
+# Prefer 7-Zip (multithreaded deflate — far faster than single-threaded tar on
+# this ~1GB tree of tens of thousands of small files). Fall back to tar, then
+# Compress-Archive.
 Step "打包为 zip"
 if(Test-Path $Zip){ Remove-Item $Zip -Force }
+$sevenzip = @(
+    'D:\7zip\7-Zip\7z.exe',
+    'C:\Program Files\7-Zip\7z.exe',
+    'C:\Program Files (x86)\7-Zip\7z.exe',
+    (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 $tar = (Get-Command tar.exe -ErrorAction SilentlyContinue).Source
-if($tar){ & $tar -a -c -f $Zip -C $Dist 'AIKP'; if($LASTEXITCODE -ne 0){ throw "tar 打包失败" } }
-else    { Compress-Archive -Path $Stage -DestinationPath $Zip -Force }
+if($sevenzip){
+    Say "用 7-Zip 多线程压缩 ..."
+    Push-Location $Dist
+    try { & $sevenzip a -tzip -mx=5 -mmt=on $Zip 'AIKP' | Out-Null; if($LASTEXITCODE -ne 0){ throw "7z 打包失败" } }
+    finally { Pop-Location }
+} elseif($tar){ & $tar -a -c -f $Zip -C $Dist 'AIKP'; if($LASTEXITCODE -ne 0){ throw "tar 打包失败" } }
+else { Compress-Archive -Path $Stage -DestinationPath $Zip -Force }
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 $sizeMB = [math]::Round(((Get-Item $Zip).Length/1MB),1)
