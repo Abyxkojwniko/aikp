@@ -763,11 +763,16 @@ async function pollParse(uploadId, filename) {
                     progressFill.css('width', '100%');
                     statusText.text('');
                     spinner.hide();
-                    toastr.success(
-                        `"${d.world_name}" ready! (${d.scene_count} scenes, ${d.entity_count} entities)`,
-                        'AIKP',
-                        { timeOut: 10000 },
-                    );
+                    const qualityText = d.quality_score !== undefined
+                        ? `, reconstruction ${d.quality_score}/100`
+                        : '';
+                    const readyMessage = `"${d.world_name}" ready! (${d.scene_count} scenes, ${d.entity_count} entities${qualityText})`;
+                    if (d.quality_passed === false) {
+                        const failed = (d.failed_node_ids || []).join(', ') || 'see validation report';
+                        toastr.warning(`${readyMessage}. Review failed nodes: ${failed}`, 'AIKP', { timeOut: 15000 });
+                    } else {
+                        toastr.success(readyMessage, 'AIKP', { timeOut: 10000 });
+                    }
                     // Auto-switch to new world book
                     try {
                         $('#custom_model_id').val(d.world_name).trigger('input');

@@ -1,0 +1,498 @@
+import json
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "backend"))
+
+from action_system import plan_action, validate_action
+from engine import _build_current_story_node_block, narration_provider, run_gm_turn
+from models import create_session
+from parser import (
+    ModuleParser, _assemble_world_book, _bind_document_provenance,
+    _merge_story_node_details, _prepare_full_rebuild,
+    _score_global_reconstruction, _score_story_node_detail,
+    _select_node_evidence,
+)
+from scene_index import build_entity_index, build_scene_index
+from server import _completed_parse_job
+from state_manager import initialize_session_from_world
+from world_state import append_world_event
+
+
+def reconstructed_module():
+    return {
+        "overview": {
+            "title": "Nested Test",
+            "mystery": "A missing letter.",
+            "opening": "You enter the study.",
+            "starting_scene": "study",
+            "starting_node": "study_node",
+            "rule_system": "coc",
+        },
+        "story_spine": {
+            "premise": "Find the letter.",
+            "truth": "It is inside the bookshelf.",
+            "timeline": ["The letter was hidden."],
+            "invariants": ["The storybook is fiction inside the module."],
+        },
+        "narrative_scopes": [
+            {"id": "physical", "kind": "physical", "navigable": True},
+            {"id": "storybook", "kind": "document", "parent_scope": "physical",
+             "navigable": False},
+        ],
+        "entity_registry": [],
+        "story_tree": {
+            "root_id": "root",
+            "nodes": [
+                {"id": "root", "parent_id": "", "children": [
+                    "study_node", "hall_node", "book_node"],
+                 "title": "Root", "kind": "root", "scope_id": "physical",
+                 "playable": False, "summary": "Whole story.",
+                 "source_refs": [0], "preconditions": [], "outcomes": [],
+                 "successors": [], "expected_facets": {}},
+                {"id": "study_node", "parent_id": "root", "children": [],
+                 "title": "Search the study", "kind": "scene",
+                 "scope_id": "physical", "playable": True,
+                 "summary": "Search for the letter.", "source_refs": [0],
+                 "preconditions": [], "outcomes": ["study searched"],
+                 "successors": ["hall_node"],
+                 "expected_facets": {"scenes": 1, "objects": 2,
+                                     "state_changes": 1}},
+                {"id": "hall_node", "parent_id": "root", "children": [],
+                 "title": "Enter the hall", "kind": "scene",
+                 "scope_id": "physical", "playable": True,
+                 "summary": "Continue into the hall.", "source_refs": [0],
+                 "preconditions": ["study searched"], "outcomes": [],
+                 "successors": [], "expected_facets": {"scenes": 1}},
+                {"id": "book_node", "parent_id": "root", "children": [],
+                 "title": "Story inside the book", "kind": "event",
+                 "scope_id": "storybook", "playable": False,
+                 "summary": "Embedded fiction only.", "source_refs": [0],
+                 "preconditions": [], "outcomes": [], "successors": [],
+                 "expected_facets": {}},
+            ],
+            "relations": [
+                {"from": "study_node", "to": "hall_node", "type": "before"}
+            ],
+        },
+        "scenes": [
+            {"id": "study", "name": "Study", "scope_id": "physical",
+             "navigable": True, "desc": "A study.", "source_quote": "You enter the study."},
+            {"id": "hall", "name": "Hall", "scope_id": "physical",
+             "navigable": True, "desc": "A hall.", "source_quote": "The hall is quiet."},
+            {"id": "black_forest", "name": "Black Forest", "scope_id": "storybook",
+             "navigable": False, "desc": "A castle rises in the book.",
+             "source_quote": "In the story, a castle rises in the Black Forest."},
+        ],
+        "npcs": [],
+        "objects": [
+            {"id": "door", "name": "wooden door", "type": "door", "scene": "study",
+             "scope_id": "physical", "source_start": 10,
+             "source_quote": "A wooden door leads to the hall."},
+            {"id": "door", "name": "wooden door", "type": "door", "scene": "hall",
+             "scope_id": "physical", "source_start": 80,
+             "source_quote": "Another wooden door closes the hall."},
+            {"id": "bookshelf", "name": "bookshelf", "type": "object", "scene": "study",
+             "scope_id": "physical", "portable": False,
+             "interactions": {"inspect": "Dust hides a narrow gap."},
+             "source_quote": "A bookshelf covers the west wall."},
+            {"id": "castle_gate", "name": "castle gate", "type": "door",
+             "scene": "black_forest", "scope_id": "storybook",
+             "source_quote": "The hero opens the castle gate."},
+        ],
+        "clues": [],
+        "events": [],
+        "scene_graph": {
+            "study": {"exits": {"hall": "hall", "enter the book": "black_forest"}},
+            "hall": {"exits": {"study": "study", "invented": "moon_base"}},
+        },
+        "story_beats": [{
+            "id": "search", "name": "Search", "scenes": ["study", "black_forest"],
+            "critical_clues": [], "optional_clues": [], "advance_when": "visited",
+            "unlocks_scenes": ["hall", "black_forest"],
+        }],
+    }
+
+
+def detailed_story_nodes():
+    return [
+        {
+            "node_id": "study_node",
+            "node_summary": "The investigators search the study and establish the route to the hall.",
+            "scenes": [{"id": "study", "name": "Study", "scope_id": "physical",
+                        "navigable": True, "desc": "A study.", "source_ref": 0,
+                        "source_quote": "You enter the study."}],
+            "npcs": [],
+            "objects": [
+                {"id": "door", "name": "wooden door", "type": "door",
+                 "scene": "study", "scope_id": "physical", "source_ref": 0,
+                 "source_quote": "A wooden door leads to the hall."},
+                {"id": "bookshelf", "name": "bookshelf", "type": "object",
+                 "scene": "study", "scope_id": "physical", "portable": False,
+                 "interactions": {"inspect": "Dust hides a narrow gap."},
+                 "source_ref": 0,
+                 "source_quote": "A bookshelf covers the west wall."},
+            ],
+            "clues": [], "events": [],
+            "state_transitions": [{"subject_id": "study_node",
+                                   "dimension": "condition", "before": "unsearched",
+                                   "after": "searched", "condition": "search completed",
+                                   "source_ref": 0,
+                                   "source_quote": "A bookshelf covers the west wall."}],
+            "knowledge_changes": [], "promises_payoffs": [], "branch_edges": [],
+        },
+        {
+            "node_id": "hall_node",
+            "node_summary": "The investigators enter the quiet hall after leaving the study.",
+            "scenes": [{"id": "hall", "name": "Hall", "scope_id": "physical",
+                        "navigable": True, "desc": "A hall.", "source_ref": 0,
+                        "source_quote": "The hall is quiet."}],
+            "npcs": [],
+            "objects": [{"id": "door", "name": "wooden door", "type": "door",
+                         "scene": "hall", "scope_id": "physical", "source_ref": 0,
+                         "source_quote": "Another wooden door closes the hall."}],
+            "clues": [], "events": [], "state_transitions": [],
+            "knowledge_changes": [], "promises_payoffs": [], "branch_edges": [],
+        },
+    ]
+
+
+class FullStoryRebuildTests(unittest.TestCase):
+    def test_full_rebuild_receives_document_ending_beyond_old_pass0_limit(self):
+        parser = object.__new__(ModuleParser)
+        parser.model = "mock"
+        parser._last_error = None
+        captured = {}
+
+        def fake_llm(system, user, **kwargs):
+            captured["system"] = system
+            captured["user"] = user
+            return json.dumps(reconstructed_module())
+
+        parser._llm = fake_llm
+        text = "You enter the study.\n" + ("middle text\n" * 6500) + "FINAL_CAUSAL_REVEAL"
+
+        result = parser.pass_full_rebuild(text)
+
+        self.assertTrue(result)
+        self.assertIn("FINAL_CAUSAL_REVEAL", captured["user"])
+        self.assertIn("COMPLETE MODULE DOCUMENT", captured["user"])
+        self.assertIn("causal story spine", captured["system"])
+
+    def test_parse_uses_rebuilt_story_without_segmented_storyline_pass(self):
+        parser = object.__new__(ModuleParser)
+        parser.model = "mock"
+        parser._last_error = None
+        source = (
+            "You enter the study. A wooden door leads to the hall. "
+            "A bookshelf covers the west wall. The hall is quiet. "
+            "Another wooden door closes the hall. In the story, a castle "
+            "rises in the Black Forest. The hero opens the castle gate."
+        )
+        rebuilt = reconstructed_module()
+        _bind_document_provenance(rebuilt, source)
+        parser.pass_full_rebuild = Mock(return_value=rebuilt)
+        parser.rebuild_story_tree_nodes = Mock(return_value=(
+            detailed_story_nodes(),
+            {"method": "test", "threshold": 82, "overall": 100,
+             "passed": True, "node_count": 2, "failed_node_ids": [], "nodes": []},
+        ))
+        parser.pass_game_mechanics = Mock()
+        parser.pass_npc_storylines = Mock()
+        parser.pass_npc_style = Mock()
+
+        world = parser.parse(source)
+
+        self.assertEqual("hierarchical_story_tree_rebuild", world["_parser_mode"])
+        self.assertIn("story_spine", world)
+        self.assertTrue(world["reconstruction_quality"]["passed"])
+        self.assertNotIn("black_forest", world["scenes"])
+        self.assertEqual("hall", world["scenes"]["study"]["exits"]["继续：Enter the hall"])
+        parser.pass_npc_storylines.assert_not_called()
+
+    def test_embedded_story_scene_never_becomes_runtime_map(self):
+        overview, pass1, pass2, embedded = _prepare_full_rebuild(reconstructed_module())
+        world = _assemble_world_book(pass1, pass2, overview)
+
+        self.assertEqual({"study", "hall"}, set(world["scenes"]))
+        self.assertNotIn("black_forest", world["scenes"])
+        self.assertEqual(["hall"], list(world["scenes"]["study"]["exits"].values()))
+        self.assertEqual(["study"], list(world["scenes"]["hall"]["exits"].values()))
+        embedded_scenes = [
+            scene["id"]
+            for setting in embedded["embedded_settings"]
+            for scene in setting["scenes"]
+        ]
+        self.assertIn("black_forest", embedded_scenes)
+        self.assertEqual(["study"], world["story_beats"][0]["scenes"])
+        self.assertEqual(["hall"], world["story_beats"][0]["unlocks_scenes"])
+
+    def test_same_named_doors_are_distinct_scene_instances(self):
+        overview, pass1, pass2, _embedded = _prepare_full_rebuild(reconstructed_module())
+        world = _assemble_world_book(pass1, pass2, overview)
+        doors = {
+            eid: entity for eid, entity in world["entities"].items()
+            if entity.get("name") == "wooden door"
+        }
+
+        self.assertEqual(2, len(doors))
+        self.assertEqual({"study", "hall"}, {door["home_scene"] for door in doors.values()})
+        self.assertEqual(2, len(set(doors)))
+
+    def test_two_same_room_doors_with_different_evidence_both_survive(self):
+        rebuilt = reconstructed_module()
+        rebuilt["objects"].append({
+            "id": "door", "name": "wooden door", "type": "door", "scene": "study",
+            "scope_id": "physical", "source_start": 35,
+            "source_quote": "A second wooden door opens to the garden.",
+        })
+        overview, pass1, pass2, _embedded = _prepare_full_rebuild(rebuilt)
+        world = _assemble_world_book(pass1, pass2, overview)
+
+        study_doors = [
+            eid for eid, entity in world["entities"].items()
+            if entity.get("name") == "wooden door" and entity.get("scene") == "study"
+        ]
+        self.assertEqual(2, len(study_doors))
+
+    def test_explicit_unique_object_keeps_one_continuous_identity(self):
+        rebuilt = reconstructed_module()
+        rebuilt["objects"].extend([
+            {"id": "red_book", "name": "red book", "type": "document",
+             "scene": "study", "scope_id": "physical", "unique_identity": True,
+             "source_start": 100, "source_quote": "The red book starts in the study."},
+            {"id": "red_book", "name": "red book", "type": "document",
+             "scene": "hall", "scope_id": "physical", "unique_identity": True,
+             "source_start": 200, "source_quote": "Later, the red book is in the hall."},
+        ])
+        overview, pass1, pass2, _embedded = _prepare_full_rebuild(rebuilt)
+        world = _assemble_world_book(pass1, pass2, overview)
+        books = [
+            entity for entity in world["entities"].values()
+            if entity.get("name") == "red book"
+        ]
+
+        self.assertEqual(1, len(books))
+        self.assertEqual(["study", "hall"], books[0]["all_scenes"])
+        self.assertEqual("red_book", books[0]["continuity_id"])
+
+    def test_bookshelf_is_a_visible_inspectable_object(self):
+        overview, pass1, pass2, _embedded = _prepare_full_rebuild(reconstructed_module())
+        world = _assemble_world_book(pass1, pass2, overview)
+        world.update({"name": "Nested Test", "opening": "You enter the study."})
+        scene_index = build_scene_index(world)
+        entity_index = build_entity_index(world)
+        session = create_session("bookshelf", world["name"])
+        initialize_session_from_world(session, world)
+
+        proposal = plan_action(
+            "检查bookshelf", session, world, scene_index, entity_index)
+        resolution = validate_action(proposal, session, world)
+
+        self.assertEqual("bookshelf", proposal["target_id"])
+        self.assertEqual("inspect", proposal["intent"])
+        self.assertEqual("accepted", resolution["status"])
+        self.assertTrue(resolution["requires_adjudication"])
+
+
+class HierarchicalReconstructionQualityTests(unittest.TestCase):
+    def setUp(self):
+        self.source = (
+            "## Study\nYou enter the study. A bookshelf covers the west wall. "
+            "Searching it reveals a letter.\n"
+            "## Hall\nThe hall is quiet."
+        )
+        self.contract = {
+            "id": "study_node", "title": "Search the study", "scope_id": "physical",
+            "source_refs": [0], "preconditions": [], "outcomes": ["letter found"],
+            "successors": [],
+            "expected_facets": {"scenes": 1, "objects": 1, "state_changes": 1},
+        }
+
+    def _good_detail(self, evidence):
+        source_ref = evidence["source_refs"][0]
+        return {
+            "node_id": "study_node",
+            "node_summary": (
+                "The study is searched methodically. The west-wall bookshelf is the "
+                "focus of the investigation and finding the concealed letter changes "
+                "the investigation state for the following node."
+            ),
+            "scenes": [{
+                "id": "study", "name": "Study", "scope_id": "physical",
+                "desc": (
+                    "The investigators enter the study and can inspect the west-wall "
+                    "bookshelf, where the module places the actionable discovery."
+                ),
+                "source_ref": source_ref, "source_quote": "You enter the study.",
+                "source_verified": True,
+            }],
+            "npcs": [],
+            "objects": [{
+                "id": "bookshelf", "name": "bookshelf", "scene": "study",
+                "source_ref": source_ref,
+                "source_quote": "A bookshelf covers the west wall.",
+                "source_verified": True,
+            }],
+            "clues": [], "events": [],
+            "state_transitions": [{
+                "subject_id": "letter", "dimension": "knowledge",
+                "before": "hidden", "after": "found", "condition": "bookshelf searched",
+                "source_ref": source_ref,
+                "source_quote": "Searching it reveals a letter.",
+                "source_verified": True,
+            }],
+            "knowledge_changes": [], "promises_payoffs": [], "branch_edges": [],
+        }
+
+    def test_node_evidence_uses_closed_catalog_and_reports_bad_refs(self):
+        contract = dict(self.contract)
+        contract["source_refs"] = [999999]
+
+        evidence = _select_node_evidence(self.source, contract)
+
+        self.assertEqual([999999], evidence["invalid_requested_refs"])
+        self.assertNotIn(999999, evidence["source_refs"])
+        self.assertTrue(evidence["source_refs"])
+
+    def test_deterministic_score_rejects_unsupported_records(self):
+        evidence = _select_node_evidence(self.source, self.contract)
+        detail = self._good_detail(evidence)
+        detail["objects"][0]["source_verified"] = False
+
+        report = _score_story_node_detail(
+            self.contract, detail, evidence, {"study_node"})
+
+        self.assertLess(report["overall"], 100)
+        self.assertTrue(any("unverified detailed records" in error
+                            for error in report["hard_errors"]))
+
+    def test_low_scoring_node_is_rebuilt_with_targeted_feedback(self):
+        parser = object.__new__(ModuleParser)
+        parser.model = "mock"
+        parser._last_error = None
+        evidence = _select_node_evidence(self.source, self.contract)
+        bad = {"node_id": "study_node", "scenes": [], "objects": [],
+               "clues": [], "events": [], "state_transitions": [],
+               "knowledge_changes": [], "promises_payoffs": [], "branch_edges": []}
+        good = self._good_detail(evidence)
+        blueprint = {
+            "story_spine": {}, "narrative_scopes": [], "entity_registry": [],
+            "story_tree": {"root_id": "study_node", "nodes": [self.contract],
+                           "relations": []},
+        }
+        parser.pass_node_rebuild = Mock(side_effect=[bad, good])
+        parser.pass_node_evaluation = Mock(return_value={
+            "scores": {"source_fidelity": 100, "causal_completeness": 100,
+                       "detail_completeness": 100, "state_tracking": 100,
+                       "branch_completeness": 100, "scope_consistency": 100},
+            "unsupported_claims": [], "missing_details": [],
+            "contradictions": [], "repair_instructions": [],
+        })
+
+        details, quality = parser.rebuild_story_tree_nodes(self.source, blueprint)
+
+        self.assertEqual(2, parser.pass_node_rebuild.call_count)
+        self.assertIsNotNone(parser.pass_node_rebuild.call_args_list[1].kwargs["feedback"])
+        self.assertTrue(quality["passed"])
+        self.assertEqual(2, details[0]["_quality"]["attempts"])
+
+    def test_global_quality_rejects_dangling_successor(self):
+        blueprint = reconstructed_module()
+        blueprint["story_tree"]["nodes"][1]["successors"] = ["missing_node"]
+        quality = {"overall": 100, "passed": True, "node_count": 2}
+
+        report = _score_global_reconstruction(blueprint, quality)
+
+        self.assertFalse(report["passed"])
+        self.assertLess(report["global_dimensions"]["story_graph_closure"], 100)
+        self.assertTrue(any("missing_node" in error for error in report["graph_errors"]))
+
+    def test_merge_distinguishes_critical_and_optional_clues(self):
+        blueprint = reconstructed_module()
+        details = detailed_story_nodes()
+        details[0]["clues"] = [
+            {"id": "letter", "critical": True},
+            {"id": "dust", "critical": False},
+        ]
+
+        rebuilt = _merge_story_node_details(blueprint, details, {"passed": True})
+        beat = next(row for row in rebuilt["story_beats"]
+                    if row["id"] == "study_node")
+
+        self.assertEqual(["letter"], beat["critical_clues"])
+        self.assertEqual(["dust"], beat["optional_clues"])
+
+    def test_parse_status_exposes_failed_quality_gate(self):
+        world = {
+            "name": "Low Quality", "scenes": {"study": {}}, "entities": {},
+            "reconstruction_quality": {
+                "overall": 71, "passed": False,
+                "failed_node_ids": ["study_node"],
+                "global_dimensions": {"story_graph_closure": 100},
+            },
+            "_validation_issues": ["Story reconstruction quality gate failed"],
+        }
+
+        result = _completed_parse_job(world, "/tmp/world.json")
+
+        self.assertEqual("done", result["status"])
+        self.assertFalse(result["quality_passed"])
+        self.assertEqual(71, result["quality_score"])
+        self.assertEqual(["study_node"], result["failed_node_ids"])
+
+    def test_runtime_context_selects_only_current_detailed_node(self):
+        world = reconstructed_module()
+        world["detailed_story_nodes"] = detailed_story_nodes()
+
+        block = _build_current_story_node_block(world, "study")
+
+        self.assertIn("study_node", block)
+        self.assertIn("search completed", block)
+        self.assertNotIn("investigators enter the quiet hall", block.lower())
+
+
+class ObjectLocationNarrationTests(unittest.TestCase):
+    def test_static_scene_source_cannot_restore_carried_object(self):
+        world = {
+            "name": "Location Ledger", "rule_system": "coc",
+            "starting_scene": "study", "opening": "桌上放着铜币。",
+            "scenes": {"study": {
+                "name": "书房", "desc": "一间书房。", "source_text": "桌上放着铜币。",
+                "exits": {},
+            }},
+            "entities": {"coin": {
+                "type": "item", "name": "铜币", "scene": "study",
+                "home_scene": "study", "initial_state": "present",
+            }},
+        }
+        scene_index = build_scene_index(world)
+        entity_index = build_entity_index(world)
+        session = create_session("wrong-location", world["name"])
+        initialize_session_from_world(session, world)
+        append_world_event(session, world, {"type": "item_picked_up", "entity_id": "coin"})
+
+        with patch("engine.load_world", return_value=world), \
+                patch("engine.get_indices", return_value=(scene_index, entity_index)), \
+                patch("engine.get_session", return_value=session), \
+                patch("engine.save_session"), \
+                patch("rag.hybrid_search", return_value=[]), \
+                patch("engine.get_or_compress_conversation_summary", return_value=""), \
+                narration_provider(lambda _request: "你看到桌上仍放着铜币。"):
+            response = run_gm_turn(
+                [{"role": "user", "content": "我看看桌面"}],
+                model=world["name"], chat_id=session["chat_id"],
+                api_key="manual-provider-no-api-key",
+            )
+
+        self.assertIn("没有在当前场景看到", response)
+        self.assertNotIn("桌上仍放着", response)
+        self.assertIn("coin", session["inventory_entity_ids"])
+
+
+if __name__ == "__main__":
+    unittest.main()

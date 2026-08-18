@@ -14,13 +14,14 @@ from typing import Any
 def _resolve_scene_id(value: Any, world: dict) -> str:
     scenes = world.get("scenes", {})
     raw = str(value or "").strip()
-    if raw in scenes:
+    if raw in scenes and scenes.get(raw, {}).get("navigable", True):
         return raw
     return next(
         (
             sid
             for sid, scene in scenes.items()
             if isinstance(scene, dict)
+            and scene.get("navigable", True)
             and str(scene.get("name", "")).strip() == raw
         ),
         "",

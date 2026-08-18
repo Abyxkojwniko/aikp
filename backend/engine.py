@@ -1142,6 +1142,162 @@ def _reject_uncommitted_world_mutation(state: "GMState", content: str) -> str:
     return "眼前没有发生足以改变场景、人物或物品状态的已确认事件。"
 
 
+_OBJECT_PRESENT_BEFORE_RE = (
+    r'(?:看见|看到|发现|注意到|眼前(?:有|是)?|这里有|屋内有|房间里有|'
+    r'桌上|地上|架上|柜中|门边)'
+)
+_OBJECT_PRESENT_AFTER_RE = (
+    r'(?:就在|仍在|还在|摆着|放着|躺着|立着|出现在|映入眼帘|'
+    r'\bis\s+here\b|\b(?:lies|rests|sits|stands|appears)\b)'
+)
+_NEGATED_PRESENCE_RE = _re.compile(
+    r'(?:没|没有|并未|并没有|不曾|未能|找不到|不在|不存在).{0,16}'
+    r'(?:看见|看到|发现|注意到|有|摆着|放着|出现)',
+    flags=_re.IGNORECASE,
+)
+_ENVIRONMENT_PLACEMENT_RE = _re.compile(
+    r'(?:这里有|屋内有|房间里有|桌上|地上|架上|柜中|门边|墙上|角落|'
+    r'摆着|放着|躺着|立着|出现在)',
+    flags=_re.IGNORECASE,
+)
+_CARRIED_PLACEMENT_RE = _re.compile(
+    r'(?:手中|手里|身上|背包|口袋|携带|拿着|握着|持有)',
+    flags=_re.IGNORECASE,
+)
+
+
+def _build_object_location_ledger(state: "GMState", current_scene_id: str) -> str:
+    """Render dynamic locations that override the scene's initial source prose."""
+    world = state["world"]
+    session = state["session"]
+    facts = ensure_fact_state(session, world)
+    here, carried, displaced = [], [], []
+    for eid, entity in world.get("entities", {}).items():
+        if not isinstance(entity, dict) or entity.get("type") == "npc":
+            continue
+        fact = facts.get(eid, {})
+        if not fact.get("known", False) and not fact.get("visible", False):
+            continue
+        name = str(entity.get("name", eid))
+        label = f"{name} [id={eid}]"
+        location = fact.get("location", {})
+        kind, location_id = location.get("kind"), str(location.get("id", ""))
+        if fact.get("exists", True) and kind == "scene" and location_id == current_scene_id:
+            if fact.get("visible", False):
+                here.append(label)
+        elif fact.get("exists", True) and kind == "inventory":
+            carried.append(label)
+        elif str(entity.get("home_scene", entity.get("scene", ""))) == current_scene_id:
+            displaced.append(f"{label}: now {kind}:{location_id or '-'}")
+
+    lines = [
+        "=== AUTHORITATIVE OBJECT LOCATION LEDGER ===",
+        "This dynamic ledger overrides static scene source text. Static source "
+        "describes only the initial layout; never restore a moved, carried, "
+        "consumed, destroyed, or absent object from that prose.",
+        "HERE NOW: " + ("; ".join(here) if here else "none"),
+        "CARRIED BY PLAYER: " + ("; ".join(carried) if carried else "none"),
+    ]
+    if displaced:
+        lines.append("MENTIONED BY THIS SCENE'S INITIAL SOURCE BUT ABSENT NOW: " + "; ".join(displaced))
+    return "\n".join(lines)
+
+
+def _build_current_story_node_block(world: dict, current_scene_id: str) -> str:
+    """Return only the detailed story node that owns the active runtime scene."""
+    current_detail = next((
+        detail for detail in world.get("detailed_story_nodes", [])
+        if isinstance(detail, dict) and any(
+            isinstance(scene, dict) and str(scene.get("id", "")) == current_scene_id
+            for scene in detail.get("scenes", [])
+        )
+    ), None)
+    if not current_detail:
+        return ""
+    node_id = str(current_detail.get("node_id", ""))
+    contract = next((
+        node for node in world.get("story_tree", {}).get("nodes", [])
+        if isinstance(node, dict) and str(node.get("id", "")) == node_id
+    ), {})
+    payload = {
+        "node_id": node_id,
+        "title": contract.get("title", ""),
+        "preconditions": contract.get("preconditions", []),
+        "outcomes": contract.get("outcomes", []),
+        "successors": contract.get("successors", []),
+        "node_summary": current_detail.get("node_summary", ""),
+        "state_transitions": current_detail.get("state_transitions", []),
+        "knowledge_changes": current_detail.get("knowledge_changes", []),
+        "promises_payoffs": current_detail.get("promises_payoffs", []),
+        "branch_edges": current_detail.get("branch_edges", []),
+    }
+    return (
+        "=== CURRENT STORY NODE (KP-ONLY LOCAL CAUSAL MODEL) ===\n"
+        "Use this node for local causality and branch consequences. A listed transition "
+        "is descriptive until its condition is satisfied and code commits the matching "
+        "world event; never apply it merely because it appears here.\n"
+        + _bounded_excerpt(
+            json.dumps(payload, ensure_ascii=False, indent=1),
+            5000,
+            "current story node detail omitted",
+        )
+    )
+
+
+def _reject_wrong_location_object_claims(state: "GMState", content: str) -> str:
+    """Reject prose that visually restores an object at a non-authoritative place."""
+    if not content:
+        return content
+    world = state["world"]
+    session = state["session"]
+    target_scene = str(
+        state.get("movement_target")
+        or session.get("player_state", {}).get("current_scene", "")
+    )
+    facts = ensure_fact_state(session, world)
+    for eid, entity in world.get("entities", {}).items():
+        if not isinstance(entity, dict) or entity.get("type") == "npc":
+            continue
+        name = str(entity.get("name", "") or "").strip()
+        if len(name) < 2 or name not in content:
+            continue
+        fact = facts.get(eid, {})
+        location = fact.get("location", {})
+        at_scene = bool(
+            fact.get("exists", True)
+            and location.get("kind") == "scene"
+            and str(location.get("id", "")) == target_scene
+        )
+        carried = bool(fact.get("exists", True) and location.get("kind") == "inventory")
+        is_present = at_scene
+        if is_present:
+            continue
+        escaped = _re.escape(name)
+        claim = _re.compile(
+            rf'(?:{_OBJECT_PRESENT_BEFORE_RE}).{{0,28}}{escaped}|'
+            rf'{escaped}.{{0,28}}(?:{_OBJECT_PRESENT_AFTER_RE})',
+            flags=_re.IGNORECASE,
+        )
+        match = claim.search(content)
+        if not match:
+            continue
+        left = max(0, match.start() - 20)
+        window = content[left:min(len(content), match.end() + 20)]
+        if _NEGATED_PRESENCE_RE.search(window):
+            continue
+        if carried and (
+                _CARRIED_PLACEMENT_RE.search(window)
+                or not _ENVIRONMENT_PLACEMENT_RE.search(window)):
+            continue
+        print(
+            f"[ENGINE] Rejected wrong-location object claim: {eid!r} "
+            f"not at {target_scene!r}",
+            flush=True,
+        )
+        return "你没有在当前场景看到该物品；其位置仍以已经确认的行动结果为准。"
+    return content
+
+
 def _maybe_arm_dynamic_check(state: "GMState", content: str) -> str:
     """If the LLM emitted a 〔检定：技能〕 marker for an uncertain action the module
     didn't pre-define, arm a dynamic pending_check (reusing the same player-roll
@@ -2180,6 +2336,24 @@ def assemble_context(state: GMState) -> GMState:
         if kp_knowledge:
             parts.append("")
             parts.append(kp_knowledge)
+        story_spine = world.get("story_spine", {})
+        if isinstance(story_spine, dict) and story_spine:
+            parts.append("")
+            parts.append(
+                "=== STORY SPINE (KP-ONLY GLOBAL CAUSAL MODEL) ===\n"
+                "Use this to keep causes, chronology, and invariants coherent. "
+                "Do not reveal its secrets directly.\n"
+                + _bounded_excerpt(
+                    json.dumps(story_spine, ensure_ascii=False, indent=1),
+                    2800,
+                    "story spine detail omitted",
+                )
+            )
+        current_node_block = _build_current_story_node_block(
+            world, current_scene_id)
+        if current_node_block:
+            parts.append("")
+            parts.append(current_node_block)
 
     # L0.6: PLOT PROGRESS — current phase, undiscovered clues, next milestone.
     # Soft constraint: gives the LLM story-direction sense so it can guide the
@@ -2226,6 +2400,8 @@ def assemble_context(state: GMState) -> GMState:
             "until their reveal conditions are satisfied.\n"
             + source_excerpt
         )
+    parts.append("")
+    parts.append(_build_object_location_ledger(state, current_scene_id))
     parts.append("")
     parts.append(state_snapshot)
 
@@ -2663,6 +2839,7 @@ def narrate(state: GMState) -> GMState:
     content = _maybe_apply_movement(state, content)
     content = _reject_uncommitted_movement(state, content)
     content = _reject_uncommitted_world_mutation(state, content)
+    content = _reject_wrong_location_object_claims(state, content)
     # Dynamic check: the LLM may request a skill check for an uncertain action the
     # module didn't pre-define — arm it (player rolls next) and strip the marker.
     content = _maybe_arm_dynamic_check(state, content)

@@ -246,8 +246,34 @@ def health():
             "source_marker_entity_recovery",
             "committed_world_mutation_guard",
             "authored_aggressive_branch",
+            "full_document_story_rebuild",
+            "hierarchical_story_tree_rebuild",
+            "reconstruction_quality_gate",
+            "narrative_scope_guard",
+            "object_instance_identity",
+            "object_location_ledger",
         ],
     }
+
+
+def _completed_parse_job(world: dict, path: str) -> dict:
+    quality = world.get("reconstruction_quality", {})
+    result = {
+        "status": "done", "progress": 100,
+        "world_name": world.get("name"),
+        "path": path,
+        "scene_count": len(world.get("scenes", {})),
+        "entity_count": len(world.get("entities", {})),
+        "validation_issues": world.get("_validation_issues", []),
+    }
+    if isinstance(quality, dict) and quality:
+        result.update({
+            "quality_score": quality.get("overall", 0),
+            "quality_passed": bool(quality.get("passed")),
+            "failed_node_ids": quality.get("failed_node_ids", []),
+            "quality_dimensions": quality.get("global_dimensions", {}),
+        })
+    return result
 
 
 @app.get("/api/worlds")
@@ -943,13 +969,7 @@ def parse_local(req: ParseLocalRequest, fast_request: Request):
                 world["name"] = stem
             path = save_world_book(world.get("name", stem), world)
             _feed_to_rag(world)
-            _parse_jobs[upload_id] = {
-                "status": "done", "progress": 100,
-                "world_name": world.get("name"),
-                "path": path,
-                "scene_count": len(world.get("scenes", {})),
-                "entity_count": len(world.get("entities", {})),
-            }
+            _parse_jobs[upload_id] = _completed_parse_job(world, path)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1009,13 +1029,7 @@ def parse_text(req: ParseTextRequest, fast_request: Request):
             if not world.get("name") or world.get("name") in ("Unknown", "parsed_module", ""):
                 world["name"] = stem
             path = save_world_book(world.get("name", stem), world)
-            _parse_jobs[upload_id] = {
-                "status": "done", "progress": 100,
-                "world_name": world.get("name"),
-                "path": path,
-                "scene_count": len(world.get("scenes", {})),
-                "entity_count": len(world.get("entities", {})),
-            }
+            _parse_jobs[upload_id] = _completed_parse_job(world, path)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1058,13 +1072,7 @@ def parse_module(upload_id: str, fast_request: Request):
             parser_obj = ModuleParser(api_key=api_key)
             world = parser_obj.parse(text)
             path = save_world_book(world.get("name", "parsed_module"), world)
-            _parse_jobs[upload_id] = {
-                "status": "done", "progress": 100,
-                "world_name": world.get("name"),
-                "path": path,
-                "scene_count": len(world.get("scenes", {})),
-                "entity_count": len(world.get("entities", {})),
-            }
+            _parse_jobs[upload_id] = _completed_parse_job(world, path)
         except Exception as e:
             import traceback
             traceback.print_exc()
