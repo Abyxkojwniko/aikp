@@ -15,6 +15,49 @@ Layers:
 from __future__ import annotations
 
 
+_HIDDEN_ENTITY_STATES = frozenset({
+    "hidden", "unknown", "undiscovered", "unrevealed", "concealed",
+    "secret", "sealed_hidden", "not_found",
+})
+_REVEALED_CLUE_STATES = frozenset({
+    "found", "read", "opened", "discovered", "revealed", "obtained",
+    "in_inventory", "used", "present", "visible", "available",
+})
+
+
+def entity_is_player_visible(eid: str, world: dict, session: dict) -> bool:
+    """Return whether an entity may be named in player-facing scene context.
+
+    NPCs and ordinary items are visible unless their state explicitly says
+    otherwise. Clues are closed by default: they become visible only through a
+    discovery state or the scene-clue discovery ledger.
+    """
+    # Fact state is authoritative when available. It separates knowledge and
+    # visibility from the legacy one-string state machine.
+    if session is not None:
+        try:
+            from world_state import entity_is_visible
+            return entity_is_visible(eid, world, session)
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    entity = world.get("entities", {}).get(eid, {})
+    etype = entity.get("type", "")
+    state = session.get("entity_states", {}).get(
+        eid, entity.get("initial_state", "default"))
+    state = str(state or "default").lower()
+
+    if state in _HIDDEN_ENTITY_STATES:
+        return False
+    if etype == "clue":
+        return (
+            state in _REVEALED_CLUE_STATES
+            or eid in session.get("discovered_clues", [])
+            or f"{eid}_discovered" in session.get("flags", [])
+        )
+    return True
+
+
 # ── Keyword Matching ───────────────────────────────────────────
 
 def keyword_match(player_input: str, scene_entity_ids: list[str],
@@ -43,10 +86,17 @@ def keyword_match(player_input: str, scene_entity_ids: list[str],
 
 def build_scene_layer(scene_id: str, world: dict,
                       scene_index: dict[str, list[str]],
-                      entity_index: dict[str, dict]) -> str:
-    """Build SCENE layer: location + present NPC/item names (1 line each)."""
+                      entity_index: dict[str, dict],
+                      session: dict | None = None) -> str:
+    """Build the player-observable SCENE layer.
+
+    Hidden entities remain available elsewhere as KP-only source material, but
+    their names must not be mixed into this layer: models tend to repeat a clue
+    simply because it appeared beside visible furniture and NPCs.
+    """
     scenes = world.get("scenes", {})
     scene = scenes.get(scene_id, {})
+    session = session or {}
 
     lines = []
     name = scene.get("name", scene_id)
@@ -66,7 +116,11 @@ def build_scene_layer(scene_id: str, world: dict,
         lines.append("Exits: " + " | ".join(exit_names))
 
     # Present NPCs (name only, 1 line each)
-    eids = scene_index.get(scene_id, [])
+    from world_state import scene_entity_ids
+    eids = [
+        eid for eid in scene_entity_ids(session, world, scene_index, scene_id)
+        if entity_is_player_visible(eid, world, session)
+    ]
     npc_ids = [eid for eid in eids
                if entity_index.get(eid, {}).get("type") == "npc"]
     if npc_ids:

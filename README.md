@@ -1,8 +1,10 @@
 # AIKP — AI 跑团主持
 
+作者：[@Abyxkojw](https://github.com/Abyxkojwniko)
+
 AI 驱动的 TRPG（CoC / D&D）游戏主持人（KP/GM）。前端为定制版 SillyTavern，后端为 FastAPI，
-通过 OpenAI 兼容接口对接 LLM。把跑团模组解析成结构化世界书后，以「确定性状态机 + LLM 叙事」的
-方式主持一局游戏。
+通过 OpenAI 兼容接口对接 LLM。把跑团模组解析成结构化世界书后，以「AI 语义理解 +
+事实状态/事件验证 + LLM 叙事」的方式主持游戏。
 
 > 模组内容（商业版权）不随仓库分发，请自行准备并放入 `models/`。
 
@@ -98,6 +100,17 @@ Tavern/SillyTavern/     定制版前端（含 public/scripts/extensions/aikp 扩
 models/                 放置你的世界书（不随仓库分发）
 .venv/  tools/          自动生成的运行环境（已 gitignore，不随仓库分发）
 ```
+
+## 运行时边界
+
+- AI 仅从「当前可见对象 + 背包对象」的封闭候选集中解析玩家动作。
+- 代码验证位置、可见性、持有关系、锁和道具等前置条件。
+- 验证后的变化写入 `world_events`，当前世界事实从事件与 `entity_facts` 得到。
+- 旧模组的 `states/triggers` 仅作为明确检定和原文分支的兼容规则。
+- NPC 对话必须选择交谈对象；普通 object 可选择以消除歧义，也可用自然语言指定。
+- 场景导航只暴露当前可达出口；玩家可选择稳定场景 ID，再用“去那里”等自然表达移动。
+- 会话分别记录 `discovered_scene_ids`、`visited_scene_ids` 和 `selected_scene_id`，隐藏或未解锁出口不会进入候选。
+- 解析器会审计未映射的原文结构段。补回的场景名称、描述和来源全部取自模组原文，分类模型不能创建场景内容。
 
 ## 许可
 

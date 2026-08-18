@@ -78,13 +78,19 @@ def index_world_book(module_name: str, world: dict) -> int:
 
         etype = entity.get("type", "unknown")
         ename = entity.get("name", eid)
-        desc = entity.get("description", "")
+        desc = entity.get("description", "") or entity.get("desc", "")
         scene = entity.get("scene", "")
 
         # Build a rich text representation for embedding
         text_parts = [f"[{module_name}] {etype}: {ename}"]
         if desc:
             text_parts.append(desc)
+        if entity.get("appearance"):
+            text_parts.append(f"Appearance: {entity['appearance']}")
+        if entity.get("personality"):
+            text_parts.append(f"Personality: {entity['personality']}")
+        if entity.get("source_quote"):
+            text_parts.append(f"Canonical source: {entity['source_quote']}")
         states = entity.get("states", {})
         if isinstance(states, dict):
             for sname, sdef in states.items():
@@ -100,6 +106,25 @@ def index_world_book(module_name: str, world: dict) -> int:
             "type": etype,
             "name": ename,
             "scene": scene,
+        })
+
+    for sid, scene in world.get("scenes", {}).items():
+        if not isinstance(scene, dict):
+            continue
+        source = scene.get("source_text", "")
+        desc = scene.get("desc", "") or scene.get("description", "")
+        if not source and not desc:
+            continue
+        name = scene.get("name", sid)
+        ids.append(f"scene:{sid}")
+        documents.append(
+            f"[{module_name}] scene: {name}\n"
+            f"{source or desc}"
+        )
+        metadatas.append({
+            "type": "scene",
+            "name": name,
+            "scene": sid,
         })
 
     if not ids:
@@ -161,21 +186,18 @@ def hybrid_search(
     current_scene: str,
     n_results: int = 5,
 ) -> list[dict]:
-    """Hybrid retrieval: semantic search + scene priority re-ranking.
-    Returns up to n_results relevant items, with current-scene entities prioritized."""
-    all_results = query(module_name, query_text, n_results=n_results * 2)
+    """Retrieve canonical facts from the current scene only.
 
-    if not all_results:
-        return []
-
-    # Boost current-scene entities
-    for item in all_results:
-        if item.get("metadata", {}).get("scene") == current_scene:
-            item["distance"] = item.get("distance", 1.0) * 0.5  # halve distance = higher relevance
-
-    # Re-sort by adjusted distance
-    all_results.sort(key=lambda x: x.get("distance", 1.0))
-    return all_results[:n_results]
+    Searching the entire module can surface a future clue or antagonist secret
+    before the player reaches that scene. Cross-scene continuity is supplied by
+    the deterministic session log and matched-NPC memory instead.
+    """
+    return query(
+        module_name,
+        query_text,
+        n_results=n_results,
+        filter_scene=current_scene,
+    )
 
 
 def summary(module_name: str) -> dict:

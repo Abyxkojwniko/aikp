@@ -15,6 +15,8 @@ import json
 import os
 import time
 import re
+import hashlib
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -59,14 +61,29 @@ For each CLUE players can find in a scene:
   "reveals": what piece of the mystery this exposes (KP perspective, e.g. "证明伯爵曾被谋杀")
   "points_to": scene_id this clue naturally leads players toward next (empty string if none)
 
+SOURCE GROUNDING: Every scene, NPC, item, clue, and event must include
+"source_quote": an exact 1-3 sentence quote copied from CHUNK TEXT that proves
+the entry exists. Never paraphrase or invent a quote. Use an empty string when
+the chunk contains no supporting sentence.
+
 Return ONLY valid JSON:
 {
-  "scenes": [{"id":"short_english_slug","name":"中文名","desc":"3-5 sentence description","purpose":"one KP sentence","type":"location"}],
-  "npcs": [{"id":"...","name":"...","scene":"scene_id","profession":"...","appearance":"...","personality":"...","dialogue":{"topic":"line"}}],
-  "items": [{"id":"...","name":"...","scene":"scene_id","desc":"..."}],
-  "clues": [{"id":"...","name":"...","scene":"scene_id","desc":"...","check":"Skill DC","reveals":"...","points_to":""}],
-  "events": [{"id":"...","name":"...","desc":"...","scene":"scene_id","trigger":"..."}]
+  "scenes": [{"id":"short_english_slug","name":"中文名","desc":"3-5 sentence description","purpose":"one KP sentence","type":"location","source_quote":"exact quote"}],
+  "npcs": [{"id":"...","name":"...","scene":"scene_id","profession":"...","public_label":"原文中玩家在未知姓名时实际看见的称呼，必须逐字出现于该场景原文且不得包含姓名或秘密身份；无法确认则留空","appearance":"...","personality":"...","dialogue":{"topic":"line"},"source_quote":"exact quote"}],
+  "items": [{"id":"...","name":"...","scene":"scene_id","desc":"...","source_quote":"exact quote"}],
+  "clues": [{"id":"...","name":"...","scene":"scene_id","desc":"...","check":"Skill DC","reveals":"...","points_to":"","source_quote":"exact quote"}],
+  "events": [{"id":"...","name":"...","desc":"...","scene":"scene_id","trigger":"...","source_quote":"exact quote"}]
 }"""
+
+SCENE_COVERAGE_SYSTEM = """Audit source-backed module sections that were not mapped to scenes.
+Select ONLY sections that are physical playable locations, or numbered solo-adventure
+encounter/choice nodes that the player can actually enter during play.
+Reject chapters, rules, credits, character sheets, handouts, endings, background lore,
+and non-playable event descriptions.
+You cannot create text or names. Return candidate_start values only from the supplied list.
+Return ONLY valid JSON:
+{"additions":[{"candidate_start":123,"kind":"location or event","reason":"brief classification reason"}]}
+"""
 
 PASS2_SYSTEM = """Given entities extracted from a TRPG module, do two things:
 
@@ -360,7 +377,9 @@ class ModuleParser:
         ctx += f"\n--- CHUNK TEXT ---\n{chunk.text}"
 
         raw = self._llm(PASS1_SYSTEM, ctx, temperature=0.3)
-        return self._parse_json(raw)
+        result = self._parse_json(raw)
+        _bind_chunk_provenance(result, chunk)
+        return result
 
     def pass1_extract_all(self, chunks: list[Chunk], overview: dict) -> list[dict]:
         results = []
@@ -467,7 +486,8 @@ class ModuleParser:
           1. Name + alias matching (code)
           2. Small LLM call for remaining unmatched (Pass 1.5b)
           3. Merge groups, remap scene references
-        """
+"""
+
         all_npcs, all_scenes = [], []
         all_items, all_clues, all_events = [], [], []
         for r in pass1_results:
@@ -669,10 +689,81 @@ class ModuleParser:
                     best_seg = seg
             if best_seg and best_score >= 3:
                 scene["source_text"] = best_seg["text"]
+                scene["source_start"] = best_seg.get("start", 0)
+                if re.fullmatch(r'\d{1,3}', str(best_seg.get("title", ""))):
+                    scene["source_section_number"] = int(best_seg["title"])
                 bound += 1
 
         print(f"[PARSER:1.7] Bound {bound}/{len(scenes)} scenes "
               f"to source text", flush=True)
+
+    def pass1_8_recover_scenes(self, pass1_results: list[dict],
+                               original_text: str) -> None:
+        """Recover omitted playable locations from a closed source-section set."""
+        if not pass1_results:
+            return
+        scene_data = pass1_results[0].setdefault("scenes", [])
+        candidates = _scene_coverage_candidates(original_text, scene_data)
+        if not candidates:
+            print("[PARSER:1.8] Scene coverage complete", flush=True)
+            return
+
+        numeric = [item for item in candidates if item.get("kind_hint") == "event"]
+        ordinary = [item for item in candidates if item.get("kind_hint") != "event"]
+        accepted: list[dict] = _apply_scene_coverage_repair(
+            scene_data, numeric, {
+                "additions": [
+                    {"candidate_start": item["start"], "kind": "event"}
+                    for item in numeric
+                ],
+            })
+        for offset in range(0, len(ordinary), 20):
+            batch = ordinary[offset:offset + 20]
+            compact = [{
+                "candidate_start": item["start"],
+                "heading": item["name"],
+                "excerpt": item["text"][:700],
+            } for item in batch]
+            try:
+                raw = self._llm(
+                    SCENE_COVERAGE_SYSTEM,
+                    "Existing scenes:\n"
+                    + json.dumps([
+                        {"id": s.get("id"), "name": s.get("name")}
+                        for s in scene_data
+                    ], ensure_ascii=False)
+                    + "\n\nUnmapped source candidates:\n"
+                    + json.dumps(compact, ensure_ascii=False, indent=1),
+                    temperature=0.1,
+                    max_tokens=2048,
+                )
+                proposal = self._parse_json(raw)
+            except Exception as exc:
+                print(f"[PARSER:1.8] Coverage batch failed: {exc}", flush=True)
+                continue
+            accepted.extend(_apply_scene_coverage_repair(
+                scene_data + accepted, batch, proposal))
+
+        if accepted:
+            scene_data.extend(accepted)
+        print(
+            f"[PARSER:1.8] Recovered {len(accepted)}/{len(candidates)} "
+            "unmapped source sections as scenes",
+            flush=True,
+        )
+
+    def pass1_9_recover_marked_entities(self, pass1_results: list[dict],
+                                        original_text: str) -> None:
+        """Recover explicit NPC/item markers that semantic extraction omitted."""
+        if not pass1_results:
+            return
+        recovered = _recover_source_marked_entities(
+            pass1_results[0], original_text)
+        print(
+            f"[PARSER:1.9] Recovered {recovered['npcs']} NPCs and "
+            f"{recovered['items']} items from source markers",
+            flush=True,
+        )
 
     # ── Pass 3.5: Validation ──────────────────────────────────
 
@@ -691,33 +782,48 @@ class ModuleParser:
         scene_list = [f'{sid}（{s.get("name","")}）'
                       for sid, s in scenes.items() if isinstance(s, dict)]
 
-        user = (
-            f"== 模组原文 ==\n{text[:32000]}\n\n"
-            f"== 实体清单（id（名字, 类型, 场景）） ==\n" + "\n".join(ent_list) + "\n\n"
-            f"== 场景清单（id（名字）） ==\n" + "\n".join(scene_list) + "\n\n"
-            f"请提取原文里所有判定点，关联到上面的实体 id，构造状态机，按要求输出 JSON。"
-        )
-        raw = self._llm(PASS_MECHANICS_SYSTEM, user, temperature=0.2, max_tokens=8192)
-        result = self._parse_json(raw)
-        if not isinstance(result, dict):
-            print("[PARSER] Game mechanics: no valid result", flush=True)
-            return
-
         added = 0
-        for tid, sm in result.items():
-            if not isinstance(sm, dict):
+        windows = list(_iter_text_windows(text))
+        for window_index, window in enumerate(windows, start=1):
+            print(
+                f"[PARSER] Game mechanics window {window_index}/{len(windows)}",
+                flush=True,
+            )
+            user = (
+                f"== 模组原文（第 {window_index}/{len(windows)} 段）==\n{window}\n\n"
+                f"== 实体清单（id（名字, 类型, 场景）） ==\n" + "\n".join(ent_list) + "\n\n"
+                f"== 场景清单（id（名字）） ==\n" + "\n".join(scene_list) + "\n\n"
+                f"只提取当前原文段明确出现的判定点，关联到上面的实体 id，按要求输出 JSON。"
+            )
+            raw = self._llm(
+                PASS_MECHANICS_SYSTEM,
+                user,
+                temperature=0.1,
+                max_tokens=8192,
+            )
+            result = self._parse_json(raw)
+            if not isinstance(result, dict):
+                print(
+                    f"[PARSER] Game mechanics window {window_index}: no valid result",
+                    flush=True,
+                )
                 continue
-            target = entities.get(tid) or scenes.get(tid)
-            if not isinstance(target, dict):
-                continue
-            states = sm.get("states")
-            if isinstance(states, dict) and states:
-                target.setdefault("states", {}).update(states)
-                if sm.get("initial_state"):
-                    target["initial_state"] = sm["initial_state"]
-                elif not target.get("initial_state"):
-                    target["initial_state"] = next(iter(states))
-                added += 1
+
+            for tid, sm in result.items():
+                if not isinstance(sm, dict):
+                    continue
+                target = entities.get(tid) or scenes.get(tid)
+                if not isinstance(target, dict):
+                    continue
+                states = sm.get("states")
+                if isinstance(states, dict) and states:
+                    before = len(target.get("states", {}))
+                    target.setdefault("states", {}).update(states)
+                    if sm.get("initial_state") and not target.get("initial_state"):
+                        target["initial_state"] = sm["initial_state"]
+                    elif not target.get("initial_state"):
+                        target["initial_state"] = next(iter(states))
+                    added += len(target["states"]) - before
         print(f"[PARSER] Game mechanics: added check/SAN states to {added} entities", flush=True)
 
     def pass_npc_storylines(self, text: str, world_book: dict) -> None:
@@ -742,32 +848,57 @@ class ModuleParser:
         beat_list = [f'{b.get("id","")}（{b.get("name","")}）'
                      for b in beats if isinstance(b, dict)]
 
-        user = (
-            f"== 模组原文 ==\n{text[:36000]}\n\n"
-            f"== NPC 清单（id（名字，出现场景）） ==\n" + "\n".join(npc_list) + "\n\n"
-            f"== 剧情节拍 story_beats（id（名字），按顺序） ==\n"
-            + ("\n".join(beat_list) if beat_list else "（无，请用场景id作为阶段标记）") + "\n\n"
-            f"请为每个 NPC 提取故事线，按要求输出 JSON。"
-        )
-        raw = self._llm(PASS_STORYLINE_SYSTEM, user, temperature=0.2,
-                        max_tokens=8192, json_mode=True)
-        result = self._parse_json(raw)
-        if not isinstance(result, dict):
-            print("[PARSER] NPC storylines: no valid result", flush=True)
-            return
-
         added = 0
-        for nid, data in result.items():
-            target = entities.get(nid)
-            if not isinstance(target, dict) or not isinstance(data, dict):
+        windows = list(_iter_text_windows(text))
+        for window_index, window in enumerate(windows, start=1):
+            print(
+                f"[PARSER] NPC storylines window {window_index}/{len(windows)}",
+                flush=True,
+            )
+            user = (
+                f"== 模组原文（第 {window_index}/{len(windows)} 段）==\n{window}\n\n"
+                f"== NPC 清单（id（名字，出现场景）） ==\n" + "\n".join(npc_list) + "\n\n"
+                f"== 剧情节拍 story_beats（id（名字），按顺序） ==\n"
+                + ("\n".join(beat_list) if beat_list else "（无，请用场景id作为阶段标记）") + "\n\n"
+                f"只提取当前原文段明确出现的 NPC 故事线，按要求输出 JSON。"
+            )
+            raw = self._llm(
+                PASS_STORYLINE_SYSTEM,
+                user,
+                temperature=0.1,
+                max_tokens=8192,
+                json_mode=True,
+            )
+            result = self._parse_json(raw)
+            if not isinstance(result, dict):
+                print(
+                    f"[PARSER] NPC storylines window {window_index}: no valid result",
+                    flush=True,
+                )
                 continue
-            arc = data.get("arc")
-            if isinstance(arc, list) and arc:
-                target["storyline"] = arc
-                added += 1
-            secret = data.get("secret")
-            if secret and isinstance(secret, str):
-                target["storyline_secret"] = secret
+
+            for nid, data in result.items():
+                target = entities.get(nid)
+                if not isinstance(target, dict) or not isinstance(data, dict):
+                    continue
+                arc = data.get("arc")
+                if isinstance(arc, list) and arc:
+                    existing = target.setdefault("storyline", [])
+                    known = {
+                        (step.get("beat", ""), step.get("does", ""))
+                        for step in existing if isinstance(step, dict)
+                    }
+                    for step in arc:
+                        if not isinstance(step, dict):
+                            continue
+                        key = (step.get("beat", ""), step.get("does", ""))
+                        if key not in known:
+                            existing.append(step)
+                            known.add(key)
+                            added += 1
+                secret = data.get("secret")
+                if secret and isinstance(secret, str) and not target.get("storyline_secret"):
+                    target["storyline_secret"] = secret
         print(f"[PARSER] NPC storylines: added arcs to {added} NPCs", flush=True)
 
     def pass_npc_style(self, world_book: dict) -> None:
@@ -912,6 +1043,14 @@ class ModuleParser:
         print("[PARSER] Pass 1.7: Binding source text...", flush=True)
         self.pass1_7_bind_source_text(pass1, text)
 
+        # Pass 1.8: closed-set coverage repair. The model may classify only
+        # source sections selected by code; names and descriptions remain verbatim.
+        print("[PARSER] Pass 1.8: Auditing scene coverage...", flush=True)
+        self.pass1_8_recover_scenes(pass1, text)
+
+        print("[PARSER] Pass 1.9: Recovering marked entities...", flush=True)
+        self.pass1_9_recover_marked_entities(pass1, text)
+
         # Pass 2: Global linking + story beat extraction
         print("[PARSER] Pass 2: Global linking + story beats...", flush=True)
         pass2 = self.pass2_link(pass1, overview)
@@ -925,12 +1064,19 @@ class ModuleParser:
         world_book.setdefault("description", overview.get("mystery", ""))
         world_book.setdefault("version", "0.1.0")
 
-        # Opening narration: verbatim from LLM extraction, fallback to regex
+        # Opening narration is player-facing and therefore must be traceable to
+        # the uploaded document. Pass 0 occasionally returns a polished summary
+        # despite being asked for a verbatim quote; never trust that as canon.
         opening = overview.get("opening", "")
-        if not opening:
+        opening_verified = _source_contains_text(text, opening)
+        if not opening_verified:
+            if opening:
+                print("[PARSER] Rejected ungrounded Pass 0 opening", flush=True)
             opening = _extract_opening(text)
+            opening_verified = bool(opening and _source_contains_text(text, opening))
         if opening:
             world_book["opening"] = opening
+        world_book["_opening_source_verified"] = opening_verified
 
         # starting_scene is already resolved by _assemble_world_book;
         # no further override needed here.
@@ -945,6 +1091,14 @@ class ModuleParser:
         pl_info = _extract_pl_info(text)
         if pl_info:
             world_book["pl_info"] = pl_info
+
+        # Some modules use an action-cost clock that is distinct from chat
+        # turns (for example actions worth 0/1/2 development rounds). Extract
+        # the explicit table and milestones in code so runtime progression does
+        # not depend on the narrator remembering arithmetic from prose.
+        action_clocks = _extract_action_clocks(text)
+        if action_clocks:
+            world_book["action_clocks"] = action_clocks
 
         # Pass 3.6: Game mechanics — extract dice/SAN check points from the
         # ORIGINAL text and merge into entity state machines (makes checks rollable).
@@ -988,6 +1142,71 @@ class ModuleParser:
 
 # ── Opening Text Extraction ──────────────────────────────────
 
+_PROVENANCE_COLLECTIONS = ("scenes", "npcs", "items", "clues", "events")
+
+
+def _iter_text_windows(
+    text: str,
+    window_chars: int = 28000,
+    overlap_chars: int = 1200,
+):
+    """Yield the entire module in bounded, overlapping analysis windows."""
+    if not text:
+        return
+    if window_chars <= overlap_chars:
+        raise ValueError("window_chars must be greater than overlap_chars")
+
+    start = 0
+    while start < len(text):
+        hard_end = min(len(text), start + window_chars)
+        end = hard_end
+        if hard_end < len(text):
+            boundary = text.rfind("\n\n", start + window_chars // 2, hard_end)
+            if boundary > start:
+                end = boundary
+        yield text[start:end]
+        if end >= len(text):
+            break
+        start = max(start + 1, end - overlap_chars)
+
+
+def _bind_chunk_provenance(result: dict, chunk: Chunk) -> None:
+    """Verify LLM quotes and attach an exact source excerpt when possible."""
+    if not isinstance(result, dict):
+        return
+
+    source = chunk.text
+    for collection in _PROVENANCE_COLLECTIONS:
+        entries = result.get(collection, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+
+            quote = entry.get("source_quote", "")
+            if not isinstance(quote, str):
+                quote = ""
+            quote = quote.strip()
+
+            if quote and quote in source:
+                entry["source_quote"] = quote
+                entry["source_verified"] = True
+            else:
+                entry.pop("source_quote", None)
+                entry["source_verified"] = False
+                name = str(entry.get("name", "")).strip()
+                if name:
+                    index = source.find(name)
+                    if index >= 0:
+                        start = max(0, index - 240)
+                        end = min(len(source), index + len(name) + 360)
+                        entry["source_quote"] = source[start:end].strip()
+                        entry["source_verified"] = True
+
+            entry["source_chunk"] = chunk.index
+
+
 _OPENING_PATTERNS = [
     re.compile(r'(?:导入|开场|开幕|开始|导入部分)[：:]\s*(.*?)(?=\n\n\n|\n[■★◆#【§]|\Z)', re.DOTALL),
     re.compile(r'(?:向玩家|给玩家|对PL)[朗读念讲述说](.*?)(?=\n\n\n|\n[■★◆#【§]|\Z)', re.DOTALL),
@@ -1004,6 +1223,115 @@ def _extract_opening(text: str) -> str:
             if len(block) > 30:
                 return block
     return ""
+
+
+def _source_contains_text(source: str, candidate: str) -> bool:
+    """Verify candidate prose against source while tolerating PDF line wrapping."""
+    if not source or not candidate or not isinstance(candidate, str):
+        return False
+    if candidate in source:
+        return True
+    normalize = lambda value: re.sub(r'\s+', ' ', value).strip()
+    normalized_candidate = normalize(candidate)
+    return len(normalized_candidate) >= 30 and normalized_candidate in normalize(source)
+
+
+def _extract_action_clocks(text: str) -> dict:
+    """Extract explicit Chinese action-cost clocks and milestone passages."""
+    milestone_pattern = re.compile(
+        r'◇\s*当\s*(?P<name>[^\n]{0,20}?轮次)\s*到达\s*'
+        r'[\[［【]?\s*(?P<at>\d+)\s*[\]］】]?\s*时'
+    )
+    milestone_matches = list(milestone_pattern.finditer(text or ""))
+    if not milestone_matches:
+        return {}
+
+    clock_name = milestone_matches[0].group("name").strip()
+    action_pattern = re.compile(
+        r'(?m)^□\s*(?P<label>[^\n（(]{1,30})[（(]\s*'
+        r'(?P<increment>\d+|/)\s*[）)]'
+    )
+    actions = []
+    known_triggers = {
+        "尝试站起": ["站起", "起身"],
+        "尝试开门": ["开门", "门把"],
+        "尝试冲水": ["冲水", "冲水按钮"],
+        "查看排气扇": ["排气扇"],
+        "查看读物架": ["读物架", "报纸", "杂志"],
+        "查看设备": ["查看设备", "手机", "手表"],
+        "沟通外界": ["沟通外界", "打电话", "发信息", "发送信息"],
+    }
+    for match in action_pattern.finditer(text):
+        if match.group("increment") == "/":
+            continue
+        label = match.group("label").strip()
+        base = re.sub(r'^(?:尝试|查看)', '', label).strip()
+        triggers = [label]
+        if base and base != label:
+            triggers.append(base)
+        triggers.extend(known_triggers.get(label, []))
+        actions.append({
+            "label": label,
+            "triggers": list(dict.fromkeys(t for t in triggers if t)),
+            "increment": int(match.group("increment")),
+            "source_quote": match.group(0).strip(),
+        })
+
+    outcome_actions = []
+    violence_match = re.search(
+        r'暴力行为.{0,900}?大失败\s*3\s*/\s*失败\s*0\s*/\s*'
+        r'成功[、,\s]*困难成功\s*/\s*1\s*/\s*'
+        r'极难成功\s*2\s*/\s*大成功\s*3',
+        text or "", flags=re.DOTALL)
+    if violence_match:
+        outcome_actions.append({
+            "label": "暴力行为",
+            "triggers": ["暴力", "攻击", "破坏", "砸", "踹", "撞", "撬", "射击", "开枪"],
+            "outcome_increments": {
+                "critical_failure": 3, "fumble": 3, "failure": 0,
+                "success": 1, "hard_success": 1,
+                "extreme_success": 2, "critical_success": 3,
+            },
+            "source_quote": violence_match.group(0)[-240:].strip(),
+        })
+
+    milestones = []
+    for index, match in enumerate(milestone_matches):
+        next_start = (milestone_matches[index + 1].start()
+                      if index + 1 < len(milestone_matches) else len(text))
+        structural = re.search(r'(?m)^■', text[match.end():next_start])
+        end = match.end() + structural.start() if structural else next_start
+        narration = text[match.end():end].strip()
+        # Keep enough canonical prose to narrate the event, without attaching
+        # an entire following chapter when PDF extraction has sparse headings.
+        narration = narration[:1800].strip()
+        # Parenthetical dice/SAN directions are KP-facing mechanics. They remain
+        # in source context, but must not be emitted as player-facing prose.
+        narration = re.sub(
+            r'[（(][^）)]*(?:检定|SAN|守密人|\bKP\b)[^）)]*[）)]',
+            '', narration, flags=re.IGNORECASE | re.DOTALL)
+        narration = re.sub(
+            r'(?m)^\s*[—－-]+\s*\d+\s*[—－-]+\s*$', '', narration).strip()
+        at = int(match.group("at"))
+        milestones.append({
+            "at": at,
+            "flag": f"action_clock_{at}",
+            "narration": narration,
+            "source_quote": match.group(0).strip(),
+        })
+
+    if not actions and not milestones:
+        return {}
+    return {
+        "development_round": {
+            "name": clock_name,
+            "initial": 0,
+            "default_increment": 0,
+            "actions": actions,
+            "outcome_actions": outcome_actions,
+            "milestones": milestones,
+        }
+    }
 
 
 # ── PL Information Extraction ─────────────────────────────────
@@ -1086,6 +1414,10 @@ def _dedup_scenes(all_scenes: list[dict]) -> dict[str, dict]:
                 ex["purpose"] = scene["purpose"]
             if scene.get("source_text") and not ex.get("source_text"):
                 ex["source_text"] = scene["source_text"]
+            for field in (
+                    "source_start", "source_section_number", "source_recovered"):
+                if scene.get(field) is not None and ex.get(field) is None:
+                    ex[field] = scene[field]
             existing_npcs = set(ex.get("npcs", []))
             for n in scene.get("npcs", []):
                 if n not in existing_npcs:
@@ -1113,6 +1445,7 @@ def _assemble_world_book(pass1_data: dict, pass2_result: dict, overview: dict) -
     for sid, gdata in scene_graph.items():
         if sid in scenes and isinstance(gdata, dict):
             scenes[sid]["exits"] = gdata.get("exits", {})
+    _apply_numbered_scene_edges(scenes)
 
     # Build flat entities dict: NPCs + items (type-tagged)
     entities: dict[str, dict] = {}
@@ -1329,6 +1662,7 @@ def _merge_npc_group(cid: str, cname: str, entities: list[dict],
     }
     seen_names = {_norm_name(cname)}
     all_scenes = []
+    source_quotes = []
 
     for ent in entities:
         norm = _norm_name(ent.get("name", ""))
@@ -1350,11 +1684,19 @@ def _merge_npc_group(cid: str, cname: str, entities: list[dict],
                 merged[field] = ent[field]
         if ent.get("states") and not merged.get("states"):
             merged["states"] = ent["states"]
+        quote = ent.get("source_quote", "")
+        if quote and quote not in source_quotes:
+            source_quotes.append(quote)
 
     if all_scenes:
         merged["scene"] = all_scenes[0]
         if len(all_scenes) > 1:
             merged["all_scenes"] = all_scenes
+    if source_quotes:
+        merged["source_quote"] = source_quotes[0]
+        if len(source_quotes) > 1:
+            merged["source_quotes"] = source_quotes
+        merged["source_verified"] = True
     if roster_entry and not merged.get("profession"):
         merged["profession"] = roster_entry.get("role", "")
     if not merged["aliases"]:
@@ -1376,20 +1718,219 @@ def _remap_scene_npcs(scenes: list[dict], npc_id_map: dict) -> list[dict]:
     return scenes
 
 
-_SEGMENT_MARKER = re.compile(r'^(?:■|★|◆|【|END[：:])')
+_SEGMENT_MARKER = re.compile(
+    r'^(?:■|★|◆|【|END[：:]|'
+    r'HO[123](?:\s|$|[：:])|'
+    r'(?:正文|导入|结局|第[一二三四五六七八九十0-9]+(?:日|幕|章|节)|'
+    r'主线|支线|分支|探索)(?:\s*$|[：:].*)|'
+    r'(?:LOCATION|SCENE|CHAPTER|PART)\s+'
+    r'(?:[A-Z0-9IVX]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)'
+    r'\s*[:.-]?)'
+    r'|^[A-Z][A-Z0-9’\'&(), -]{4,70}$'
+)
+
+_ENGLISH_SECTION_WORDS = frozenset({
+    "introduction", "background", "overview", "setup", "conclusion",
+    "aftermath", "rewards", "development", "beginning", "ending",
+})
+_ENGLISH_TITLE_CONNECTORS = frozenset({
+    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into",
+    "of", "on", "or", "the", "to", "versus", "with",
+})
+
+
+def _is_english_title_case_heading(value: str) -> bool:
+    """Conservatively recognize standalone English scenario subheadings."""
+    if (not (2 <= len(value) <= 70) or not re.match(r'[A-Z]', value)
+            or value.endswith("-")):
+        return False
+    if re.search(r'[.!?;,:]|\d|%|\b\d+[dD]\d+\b', value):
+        return False
+    if re.match(
+            r'^(?:Author|Editor|Layout|Cover|Interior|Cartography|Proofreading|'
+            r'Design|Character Sheet|Pre-generated|Copyright|Chaosium|'
+            r'Hit Points?|Rune Points?|Magic Points?|Movement Rate|Equipment|'
+            r'Weapons?|Skills?|Traits?|Passions?)\b',
+            value, flags=re.IGNORECASE):
+        return False
+    if value.casefold() in _ENGLISH_SECTION_WORDS:
+        return True
+    words = re.findall(r"[A-Za-z][A-Za-z’'\-]*", value)
+    if not (2 <= len(words) <= 9):
+        return False
+    if words[-1].casefold() in _ENGLISH_TITLE_CONNECTORS:
+        return False
+    significant = [word for word in words
+                   if word.casefold() not in _ENGLISH_TITLE_CONNECTORS]
+    return bool(significant) and all(word[0].isupper() for word in significant)
+
+_CHECK_LABEL_PARTS = frozenset({
+    "侦查", "聆听", "灵感", "幸运", "图书馆", "图书馆使用", "教育", "英语",
+    "艺术", "乔装", "交涉技能", "力量", "敏捷", "体质", "外貌", "意志",
+    "心理学", "密码学", "潜行", "导航", "攀爬", "闪避", "急救", "医学",
+    "神秘学", "克苏鲁神话", "会计", "话术", "说服", "恐吓", "魅惑",
+    "斗殴", "射击", "追踪", "职业模板", "职业模版",
+    "str", "con", "siz", "dex", "int", "pow", "app", "edu", "san",
+})
+
+
+def _is_bracket_check_line(stripped: str) -> bool:
+    """Distinguish `【skill】 result` from real bracketed event headings."""
+    match = re.match(r'^【([^】]+)】(.*)$', stripped)
+    if not match:
+        return False
+    label, suffix = match.groups()
+    # A bracket followed by prose is an inline check/result, not a boundary.
+    if suffix.strip().lstrip("：:").strip():
+        return True
+    parts = [part.strip().lower() for part in re.split(r'[/／、+]|\bor\b', label)]
+    return bool(parts) and all(
+        part in _CHECK_LABEL_PARTS
+        or re.fullmatch(r'(?:困难|极难)?(?:str|con|siz|dex|int|pow|app|edu)\*?\d*', part)
+        for part in parts
+    )
 
 
 def _split_text_segments(text: str) -> list[dict]:
     lines = text.split('\n')
+    stripped_lines = {line.strip() for line in lines if line.strip()}
+    line_counts = Counter(line.strip() for line in lines if line.strip())
+    toc_headings = {
+        match.group(1).strip().casefold()
+        for line in lines
+        if (match := re.match(
+            r'^\s*(.{2,70}?)\s*\.{2,}\s*\d+\s*$', line.strip()))
+    }
+    solo_references = {
+        int(value) for value in re.findall(
+            r'\b(?:go|turn|proceed)\s+to\s+(\d{1,3})\b', text,
+            flags=re.IGNORECASE)
+    }
+    solo_numbered = len(solo_references) >= 10
+
+    def neighboring_nonempty(index: int, direction: int) -> str:
+        cursor = index + direction
+        while 0 <= cursor < len(lines):
+            candidate = lines[cursor].strip()
+            if candidate:
+                return candidate
+            cursor += direction
+        return ""
+
+    numeric_section_indices = set()
+    if solo_numbered:
+        candidates: dict[int, list[int]] = {}
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if re.fullmatch(r'\d{1,3}', stripped):
+                value = int(stripped)
+                if 1 <= value <= max(solo_references):
+                    candidates.setdefault(value, []).append(index)
+        for indices in candidates.values():
+            def numeric_score(index: int) -> tuple[int, int]:
+                before = neighboring_nonempty(index, -1)
+                after = neighboring_nonempty(index, 1)
+                score = 0
+                if (len(after) >= 10 and re.search(r'[a-z]', after)
+                        and re.search(r'[A-Z]', after)):
+                    score += 6
+                if (len(before) >= 4 and before.upper() == before
+                        and re.search(r'[A-Z]', before)):
+                    score -= 5
+                if (len(after) >= 4 and after.upper() == after
+                        and re.search(r'[A-Z]', after)):
+                    score -= 5
+                return score, index
+            best = max(indices, key=numeric_score)
+            if numeric_score(best)[0] > 0:
+                numeric_section_indices.add(best)
+
+    def is_heading(line: str, index: int) -> bool:
+        stripped = line.strip()
+        numeric_solo_heading = index in numeric_section_indices
+        next_nonempty = neighboring_nonempty(index, 1)
+        english_scene_heading = bool(re.match(
+            r'^(?:location|scene|chapter|part)\s+'
+            r'(?:[a-z0-9ivx]+|one|two|three|four|five|six|seven|eight|nine|ten)'
+            r'\s*[:.-]?',
+            stripped, flags=re.IGNORECASE))
+        toc_heading = (
+            stripped.casefold() in toc_headings
+            or f"{stripped} {next_nonempty}".casefold() in toc_headings
+        )
+        title_case_heading = _is_english_title_case_heading(stripped)
+        if not (_SEGMENT_MARKER.match(stripped) or english_scene_heading
+                or numeric_solo_heading
+                or toc_heading or title_case_heading):
+            return False
+        if numeric_solo_heading:
+            return True
+        previous_nonempty = neighboring_nonempty(index, -1)
+        if (title_case_heading and re.fullmatch(r'\d{1,3}', previous_nonempty)
+                and index >= 2):
+            before_page_number = neighboring_nonempty(index - 1, -1)
+            if (len(before_page_number) >= 4
+                    and before_page_number.upper() == before_page_number
+                    and re.search(r'[A-Z]', before_page_number)):
+                return False
+        if (title_case_heading and (
+                previous_nonempty.casefold() in {
+                    "written by", "editing", "editor", "cover art", "interior art",
+                    "cartography", "layout", "book design", "character sheet",
+                }
+                or previous_nonempty.casefold().endswith(" by"))):
+            return False
+        if _is_bracket_check_line(stripped):
+            return False
+        # Dot-leader/page-number rows belong to the table of contents.
+        if re.search(r'\.{2,}\s*\d*\s*$', stripped):
+            return False
+        if re.fullmatch(r'HO[123]\d+', stripped, flags=re.IGNORECASE):
+            return False
+        if re.fullmatch(
+                r'(?:主线|支线|分支|探索|HO[123]).*\D\d{1,3}',
+                stripped, flags=re.IGNORECASE):
+            return False
+        # Contents entries can be extracted without dot leaders, for example
+        # `主线：委托16`, while the actual heading later appears without the
+        # page number. Only discard the numbered form when that exact base
+        # heading exists elsewhere in the document.
+        numbered = re.fullmatch(r'(.+?)(\d{1,3})', stripped)
+        if numbered and numbered.group(1).rstrip() in stripped_lines:
+            return False
+        # Long `HO2：...` lines are character speech, not an investigator
+        # handout/branch boundary. Real HO section labels are short names.
+        ho_suffix = re.match(r'^HO[123]\s*[：:](.+)$', stripped,
+                             flags=re.IGNORECASE)
+        if ho_suffix and (
+                len(ho_suffix.group(1).strip()) > 8
+                or re.search(r'[，。！？?!]', ho_suffix.group(1))):
+            return False
+        # Character sheets and monster stat blocks are often uppercase and fit
+        # the generic heading regex. They are content, not scene boundaries.
+        if len(re.findall(
+                r'\b(?:STR|CON|SIZ|DEX|INT|POW|APP|EDU)(?=\s|\d)',
+                stripped)) >= 2:
+            return False
+        # PDF extraction repeats the book title at the top of every page. Such
+        # running headers are not scene boundaries. Explicit numbered structural
+        # headings remain boundaries even if a contents page repeats them.
+        explicit = re.match(
+            r'^(?:■|★|◆|【|END[：:]|(?:LOCATION|SCENE|CHAPTER|PART)\s+)',
+            stripped,
+        ) or english_scene_heading
+        return bool(explicit or toc_heading or line_counts[stripped] <= 2)
+
     segments = []
     title = "(preamble)"
     current = []
     start = 0
     for i, line in enumerate(lines):
-        if _SEGMENT_MARKER.match(line.strip()) and current:
-            segments.append({"title": title,
-                             "text": "\n".join(current).strip(),
-                             "start": start})
+        if is_heading(line, i):
+            if current:
+                segments.append({"title": title,
+                                 "text": "\n".join(current).strip(),
+                                 "start": start})
             title = line.strip()
             current = [line]
             start = i
@@ -1400,6 +1941,256 @@ def _split_text_segments(text: str) -> list[dict]:
                          "text": "\n".join(current).strip(),
                          "start": start})
     return segments
+
+
+_NON_SCENE_HEADING_RE = re.compile(
+    r'(?:contents?|credits?|copyright|introduction|background|overview|setup|'
+    r'conclusion|aftermath|rewards?|development|appendix|handouts?|characters?|'
+    r'investigators?|keepers?|rules?|mechanics?|statistics?|monsters?|ending|'
+    r'目录|版权|前言|背景|概述|概要|真相|登场人物|人物介绍|角色卡|规则|机制|'
+    r'奖励|结局|后日谈|附录|手册|线索汇总|事件表)',
+    flags=re.IGNORECASE,
+)
+
+
+def _clean_scene_heading(title: str) -> str:
+    value = str(title or "").strip()
+    value = re.sub(r'^[■★◆]+\s*', '', value)
+    value = re.sub(r'^【\s*([^】]+)\s*】$', r'\1', value)
+    value = re.sub(
+        r'^(?:LOCATION|SCENE)\s+(?:[A-Z0-9IVX]+|ONE|TWO|THREE|FOUR|FIVE|'
+        r'SIX|SEVEN|EIGHT|NINE|TEN)\s*[:.\-]?\s*',
+        '', value, flags=re.IGNORECASE)
+    value = re.sub(r'^(?:场景|地点)\s*[：:]\s*', '', value)
+    return value.strip(' ：:.-')
+
+
+def _scene_coverage_candidates(original_text: str,
+                               existing_scenes: list[dict]) -> list[dict]:
+    """Return unmapped, source-grounded structural sections for LLM classification."""
+    bound_texts = {
+        str(scene.get("source_text", "")).strip()
+        for scene in existing_scenes
+        if str(scene.get("source_text", "")).strip()
+    }
+    known_names = {
+        _norm_name(scene.get("name", ""))
+        for scene in existing_scenes
+        if _norm_name(scene.get("name", ""))
+    }
+    candidates: list[dict] = []
+    for segment in _split_text_segments(original_text):
+        raw_title = str(segment.get("title", "")).strip()
+        source_text = str(segment.get("text", "")).strip()
+        numeric_node = bool(re.fullmatch(r'\d{1,3}', raw_title))
+        name = f"Section {raw_title}" if numeric_node else _clean_scene_heading(raw_title)
+        if raw_title == "(preamble)" or not (2 <= len(name) <= 80):
+            continue
+        if len(source_text) < 80 or source_text in bound_texts:
+            continue
+        if _NON_SCENE_HEADING_RE.search(name):
+            continue
+        normalized_title = _norm_name(name)
+        if normalized_title in known_names:
+            continue
+        if not numeric_node and not re.search(r'[A-Za-z\u4e00-\u9fff]', name):
+            continue
+        candidates.append({
+            "start": int(segment.get("start", 0)),
+            "name": name,
+            "text": source_text,
+            "kind_hint": "event" if numeric_node else "location",
+        })
+    return candidates
+
+
+def _recovered_scene_id(name: str, start: int, existing_ids: set[str]) -> str:
+    ascii_name = name.encode("ascii", "ignore").decode("ascii").lower()
+    slug = re.sub(r'[^a-z0-9]+', '_', ascii_name).strip('_')[:48]
+    base = slug or f"source_scene_{start}"
+    candidate = base
+    suffix = 2
+    while candidate in existing_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _apply_scene_coverage_repair(existing_scenes: list[dict],
+                                 candidates: list[dict],
+                                 proposal: object) -> list[dict]:
+    """Accept only candidate references; all player-facing content stays verbatim."""
+    additions = proposal.get("additions", []) if isinstance(proposal, dict) else []
+    by_start = {item["start"]: item for item in candidates}
+    existing_ids = {str(scene.get("id", "")) for scene in existing_scenes}
+    existing_names = {_norm_name(scene.get("name", "")) for scene in existing_scenes}
+    accepted: list[dict] = []
+    used_starts: set[int] = set()
+
+    for item in additions if isinstance(additions, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = int(item.get("candidate_start"))
+        except (TypeError, ValueError):
+            continue
+        candidate = by_start.get(start)
+        if not candidate or start in used_starts:
+            continue
+        name = candidate["name"]
+        if _norm_name(name) in existing_names:
+            continue
+        scene_id = _recovered_scene_id(name, start, existing_ids)
+        source_text = candidate["text"]
+        proposed_kind = str(item.get("kind", "")).strip().lower()
+        scene_kind = proposed_kind if proposed_kind in {"location", "event"} else candidate.get("kind_hint", "location")
+        accepted.append({
+            "id": scene_id,
+            "name": name,
+            "desc": source_text[:1000],
+            "purpose": "",
+            "type": scene_kind,
+            "source_text": source_text,
+            "source_quote": source_text[:300],
+            "source_start": start,
+            "source_section_number": (
+                int(name.removeprefix("Section "))
+                if re.fullmatch(r'Section \d{1,3}', name) else None
+            ),
+            "source_recovered": True,
+            "npcs": [],
+            "clues": [],
+            "exits": {},
+        })
+        used_starts.add(start)
+        existing_ids.add(scene_id)
+        existing_names.add(_norm_name(name))
+    return accepted
+
+
+def _apply_numbered_scene_edges(scenes: dict[str, dict]) -> None:
+    """Build solo-adventure node edges from explicit source cross-references."""
+    number_to_ids: dict[int, list[str]] = {}
+    for scene_id, scene in scenes.items():
+        if not isinstance(scene, dict):
+            continue
+        number = scene.get("source_section_number")
+        if isinstance(number, int):
+            number_to_ids.setdefault(number, []).append(scene_id)
+
+    reference_re = re.compile(
+        r'\b(?:go|turn|proceed)\s+to\s+(\d{1,3})\b|'
+        r'(?:转到|转至|前往|跳转至)\s*(\d{1,3})',
+        flags=re.IGNORECASE,
+    )
+    for scene in scenes.values():
+        if not isinstance(scene, dict) or not isinstance(
+                scene.get("source_section_number"), int):
+            continue
+        exits = scene.setdefault("exits", {})
+        if not isinstance(exits, dict):
+            exits = {}
+            scene["exits"] = exits
+        for match in reference_re.finditer(str(scene.get("source_text", ""))):
+            raw_number = match.group(1) or match.group(2)
+            target_ids = number_to_ids.get(int(raw_number), [])
+            if len(target_ids) == 1:
+                exits.setdefault(f"Section {raw_number}", target_ids[0])
+
+
+_SOURCE_ENTITY_MARKERS = (
+    ("npcs", "npc", re.compile(
+        r'^\s*👤\s*([^：:\n]{1,50}?)(?:\s*[：:]\s*(.*))?$')),
+    ("items", "item", re.compile(
+        r'^\s*📖\s*([^：:\n]{1,60}?)(?:\s*[：:]\s*(.*))?$')),
+)
+
+
+def _source_entity_id(kind: str, name: str, scene_id: str) -> str:
+    digest = hashlib.sha1(
+        f"{kind}\0{name}\0{scene_id}".encode("utf-8")).hexdigest()[:10]
+    return f"source_{kind}_{digest}"
+
+
+def _recover_source_marked_entities(pass1_data: dict,
+                                    original_text: str) -> dict[str, int]:
+    """Add only explicit icon-marked entities and bind them to source scenes."""
+    scenes = pass1_data.setdefault("scenes", [])
+    segments = _split_text_segments(original_text)
+    segment_starts = sorted(
+        int(segment.get("start", 0)) for segment in segments)
+    scene_by_start: dict[int, list[dict]] = {}
+    for scene in scenes:
+        starts = scene.get("source_starts", [])
+        if not isinstance(starts, list):
+            starts = []
+        if isinstance(scene.get("source_start"), int):
+            starts = [scene["source_start"], *starts]
+        for start in dict.fromkeys(starts):
+            if isinstance(start, int):
+                scene_by_start.setdefault(start, []).append(scene)
+
+    existing_names = {
+        collection: {
+            _norm_name(entity.get("name", ""))
+            for entity in pass1_data.setdefault(collection, [])
+            if _norm_name(entity.get("name", ""))
+        }
+        for collection in ("npcs", "items")
+    }
+    counts = {"npcs": 0, "items": 0}
+
+    for line_number, raw_line in enumerate(original_text.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        segment_start = max(
+            (start for start in segment_starts if start <= line_number),
+            default=-1,
+        )
+        scene_options = scene_by_start.get(segment_start, [])
+        if not scene_options:
+            continue
+        scene = scene_options[0]
+        scene_id = str(scene.get("id", ""))
+        if not scene_id:
+            continue
+
+        for collection, kind, pattern in _SOURCE_ENTITY_MARKERS:
+            match = pattern.match(line)
+            if not match:
+                continue
+            name = match.group(1).strip(' ・·•')
+            description = (match.group(2) or "").strip()
+            normalized = _norm_name(name)
+            if not normalized or normalized in existing_names[collection]:
+                break
+            entity = {
+                "id": _source_entity_id(kind, name, scene_id),
+                "type": kind,
+                "name": name,
+                "scene": scene_id,
+                "desc": description,
+                "description": description,
+                "source_quote": line,
+                "source_line": line_number,
+                "source_recovered": True,
+                "initial_state": "present" if kind == "npc" else "hidden",
+            }
+            if kind == "npc":
+                entity.update({
+                    "public_label": "",
+                    "appearance": description,
+                    "personality": "",
+                    "dialogue": {},
+                })
+            else:
+                entity["portable"] = True
+            pass1_data[collection].append(entity)
+            existing_names[collection].add(normalized)
+            counts[collection] += 1
+            break
+    return counts
 
 
 def _score_segment(scene_name: str, scene_desc: str, npc_ids: list[str],

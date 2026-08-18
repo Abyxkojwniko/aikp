@@ -36,6 +36,18 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_CONTEXT_CHARS = _positive_int_env("AIKP_MAX_CONTEXT_CHARS", 24000)
+MAX_SCENE_SOURCE_CHARS = _positive_int_env("AIKP_MAX_SCENE_SOURCE_CHARS", 6000)
+
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BACKEND_DIR)
 WORLD_BOOK_DIR = os.path.join(PROJECT_DIR, "models")

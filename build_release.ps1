@@ -138,7 +138,7 @@ Robo $stSrc (Join-Path $Stage 'Tavern\SillyTavern') `
 # root files needed to run
 $rootFiles = @('启动游戏.bat','停止游戏.bat','_aikp_backend.bat','_aikp_frontend.bat',
                '_aikp_setup.ps1','start.bat','start.ps1','.env.example',
-               'README.md','LICENSE','NOTICE')
+               'README.md','LICENSE','NOTICE','VERSION')
 foreach($f in $rootFiles){
     $src = Join-Path $Repo $f
     if(Test-Path $src){ Copy-Item $src (Join-Path $Stage $f) -Force }

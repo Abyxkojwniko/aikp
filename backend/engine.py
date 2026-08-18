@@ -3,8 +3,10 @@
 
 import json
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import TypedDict, Optional, Any
+from typing import TypedDict, Optional, Any, Callable, Iterator
 
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
@@ -12,7 +14,8 @@ from openai import OpenAI
 from dice import skill_check, coc_san_loss, resolve_check
 from config import (
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
-    GM_SYSTEM_PROMPT, WORLD_BOOK_DIR,
+    GM_SYSTEM_PROMPT, WORLD_BOOK_DIR, MAX_CONTEXT_CHARS,
+    MAX_SCENE_SOURCE_CHARS,
 )
 from models import Session, EntityMemory
 from state_manager import (
@@ -29,7 +32,23 @@ from gm_controller import check_story_beat, inject_controller_context
 from npc_context import build_scene_layer, build_npc_hit, keyword_match
 from npc_retrieval import retrieve as npc_retrieve
 from plot_pusher import generate_push
-from reference_resolver import lookup_known_reference, llm_resolve_reference, dialogue_keyword_match
+from reference_resolver import (
+    list_interactable_npcs,
+    lookup_known_reference,
+    reconcile_interaction_target,
+    record_entity_mention,
+)
+from action_system import (
+    legacy_state_matches_action, plan_action, validate_action,
+)
+from world_state import (
+    append_world_event, ensure_fact_state, list_interactable_objects,
+    reconcile_object_target, scene_entity_ids, sync_legacy_transition,
+)
+from scene_system import (
+    commit_scene_transition, ensure_scene_state, list_available_scenes,
+    reconcile_scene_target, scene_exit_records, selected_movement_target,
+)
 from card_parser import (
     looks_like_st_command, parse_st_command, build_player_state_patch,
     apply_patch, summarize_card,
@@ -38,9 +57,58 @@ from card_parser import (
 
 # ── Token Budget ──────────────────────────────────────────────────
 
-# Maximum context length in characters (~2000 tokens for CJK text).
-# assemble_context() trims low-priority content to stay within budget.
-MAX_CONTEXT_CHARS = 8000
+def _bounded_excerpt(text: str, limit: int, marker: str) -> str:
+    """Keep both ends of source text without cutting current-turn controls."""
+    if not text or len(text) <= limit:
+        return text
+    marker_text = f"\n... [{marker}] ...\n"
+    remaining = max(0, limit - len(marker_text))
+    head = remaining // 2
+    tail = remaining - head
+    return text[:head] + marker_text + text[-tail:]
+
+
+def _fit_context_budget(
+    parts: list[str],
+    shrinkable: list[tuple[str, int, str]],
+    max_chars: int = MAX_CONTEXT_CHARS,
+) -> str:
+    """Shrink low-priority blocks while preserving all control sections.
+
+    ``side`` is ``left`` for reference data and ``right`` for recent dialogue.
+    If mandatory facts alone exceed the target, return them intact instead of
+    silently deleting dice, movement, disclosure, or anti-hallucination rules.
+    """
+    fitted = list(parts)
+
+    for original, minimum, side in shrinkable:
+        rendered = "\n".join(fitted)
+        excess = len(rendered) - max_chars
+        if excess <= 0 or not original:
+            continue
+
+        keep = max(minimum, len(original) - excess - 80)
+        if keep >= len(original):
+            continue
+
+        if side == "right":
+            replacement = "... [older context omitted]\n" + original[-keep:]
+        else:
+            replacement = original[:keep] + "\n... [low-priority context omitted]"
+
+        for index, part in enumerate(fitted):
+            if part == original:
+                fitted[index] = replacement
+                break
+
+    rendered = "\n".join(fitted)
+    if len(rendered) > max_chars:
+        print(
+            f"[ENGINE] Mandatory grounded context exceeds soft budget: "
+            f"{len(rendered)} > {max_chars}; preserving controls",
+            flush=True,
+        )
+    return rendered
 
 
 # ── Caches ─────────────────────────────────────────────────────
@@ -49,6 +117,116 @@ _world_cache: dict[str, dict] = {}
 _scene_index_cache: dict[str, dict] = {}
 _entity_index_cache: dict[str, dict] = {}
 _session_cache: dict[str, Session] = {}
+
+NarrationProvider = Callable[[dict], str]
+_narration_provider: ContextVar[Optional[NarrationProvider]] = ContextVar(
+    "aikp_narration_provider", default=None)
+ActionPlannerProvider = Callable[[str], str]
+_action_planner_provider: ContextVar[Optional[ActionPlannerProvider]] = ContextVar(
+    "aikp_action_planner_provider", default=None)
+
+
+@contextmanager
+def narration_provider(provider: NarrationProvider) -> Iterator[None]:
+    """Temporarily replace only narration model calls for offline evaluation.
+
+    The supplied text still passes through every deterministic redaction,
+    movement, dice, trust, logging, and persistence step in the normal engine.
+    ContextVar keeps concurrent requests isolated.
+    """
+    token = _narration_provider.set(provider)
+    try:
+        yield
+    finally:
+        _narration_provider.reset(token)
+
+
+@contextmanager
+def action_planner_provider(provider: ActionPlannerProvider) -> Iterator[None]:
+    """Override semantic action planning without replacing narration."""
+    token = _action_planner_provider.set(provider)
+    try:
+        yield
+    finally:
+        _action_planner_provider.reset(token)
+
+
+def _action_planner(api_key: str) -> Optional[ActionPlannerProvider]:
+    provider = _action_planner_provider.get()
+    if provider is not None:
+        return provider
+    # Offline replay intentionally exercises deterministic planning. Its fake
+    # key must never create an external API client.
+    if (_narration_provider.get() is not None or not api_key
+            or api_key.startswith("manual-provider")):
+        return None
+
+    def call(prompt: str) -> str:
+        try:
+            client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+            response = client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a closed-world RPG action linker. Return only "
+                        "the requested JSON and never invent an entity id.")},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                max_tokens=300,
+                stream=False,
+            )
+            return response.choices[0].message.content or ""
+        except Exception as exc:
+            print(f"[ENGINE] Action planner failed: {exc}", flush=True)
+            return ""
+    return call
+
+
+def _generate_narration(*, messages: list[dict], api_key: str,
+                        temperature: float, max_tokens: int,
+                        kind: str, metadata: Optional[dict] = None) -> str:
+    """Call the configured narration source and return plain response text."""
+    provider = _narration_provider.get()
+    if provider is not None:
+        return str(provider({
+            "kind": kind,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "metadata": metadata or {},
+        }) or "")
+
+    client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+    response = client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=False,
+    )
+    return response.choices[0].message.content or ""
+
+
+def _write_eval_trace(chat_id: str, turn: int, payload: dict) -> None:
+    trace_dir = os.environ.get("AIKP_TRACE_DIR", "").strip()
+    if not trace_dir:
+        return
+    try:
+        target_dir = Path(trace_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        safe_chat_id = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_" for ch in chat_id
+        )[:80]
+        path = target_dir / f"{safe_chat_id}-turn-{turn:03d}.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception as e:
+        print(f"[ENGINE] Failed to write eval trace: {e}", flush=True)
 
 
 def invalidate_world_cache(model: str = None):
@@ -175,6 +353,7 @@ class GMState(TypedDict, total=False):
     scene_entities: list[str]          # entity IDs in current scene
     matched_entity: Optional[dict]      # {id, current_state, state_def}
     movement_target: Optional[str]      # target scene ID if moving
+    _requested_scene_target: str        # clicked, validated destination for this turn
 
     # Dice
     dice_result: Optional[dict]
@@ -201,6 +380,17 @@ class GMState(TypedDict, total=False):
     _san_result: Optional[dict]
     _entity_not_found: Optional[str]  # set by assemble; read by narrate for code-denial
     _pending_roll: bool               # set by judge when a check awaits the player's roll
+    _hidden_entity_action: str        # deterministic undiscovered-object block
+    _blocked_scene_move: str          # deterministic scene-graph block
+    _npc_selection_required: bool     # dialogue cannot proceed without UI target
+    _available_npc_count: int         # selects the correct deterministic denial
+    _trust_signal: int                # stripped narration marker for post-turn update
+    _clock_events: list[dict]         # action-clock changes and crossed milestones
+    _npc_target_became_unavailable: bool
+    action_proposal: dict              # AI/deterministic semantic interpretation
+    action_resolution: dict            # validator decision and proposed events
+    _action_events: list[dict]          # committed authoritative events
+    _action_block: str                  # deterministic validation denial
 
 
 # ── KP Global Knowledge ──────────────────────────────────────
@@ -330,6 +520,11 @@ _NPC_INTERACT_PATTERNS = [
     _re.compile(r'(?:问|询问|质问|盘问)\s*(.+?)\s*(?:关于|的|了|$)'),
     _re.compile(r'(?:和|跟|找)\s*(.+?)\s*(?:说|讲|聊)'),
     _re.compile(r'(?:叫|喊|呼唤)\s*(.+?)$'),
+    _re.compile(
+        r'(?:talk\s+to|speak\s+to|ask|question|interrogate|call)\s+'
+        r'(.+?)(?:\s+about\b|\s+whether\b|\s+if\b|$)',
+        _re.IGNORECASE,
+    ),
 ]
 
 
@@ -482,7 +677,8 @@ def _build_disclosure_table(session: dict, scene_entity_ids: list,
     )
 
 
-def _unlock_names_player_knows(player_input: str, session: dict) -> None:
+def _unlock_names_player_knows(player_input: str, session: dict,
+                               allowed_names: set[str] | None = None) -> None:
     """If the player refers to an NPC by their real name or surname, the player
     demonstrably KNOWS that name — flip disclosure.name on, so the KP stops
     redacting it to '那个人' (which produced garbage like '那个那个人人' when the
@@ -491,6 +687,8 @@ def _unlock_names_player_knows(player_input: str, session: dict) -> None:
         return
     for name, st in session.get("npc_states", {}).items():
         if not name or len(name) < 2 or not isinstance(st, dict):
+            continue
+        if allowed_names is not None and name not in allowed_names:
             continue
         disc = st.setdefault("dynamic", {}).setdefault("disclosure", {})
         if disc.get("name"):
@@ -517,6 +715,16 @@ _SELF_INTRO_PREFIXES = ("我是", "我叫", "叫我", "我的名字是", "我的
                         "鄙人", "在下", "本人是", "我乃", "称呼我为", "唤我")
 
 
+def _english_self_introduction(text: str, name: str) -> bool:
+    """Recognize common English self-introductions for a canonical NPC name."""
+    return bool(_re.search(
+        rf"\b(?:I\s+am|I'm|my\s+name\s+is|call\s+me)\s+"
+        rf"{_re.escape(name)}(?=\b|[\s,.;:!?'”’])",
+        text,
+        _re.IGNORECASE,
+    ))
+
+
 def _redact_unrevealed_names(text: str, session: dict, entity_index: dict) -> str:
     """Hard backstop (rules over prompts): replace any UNREVEALED NPC real name
     in KP output with a description, so a prompt slip never leaks a name the
@@ -538,7 +746,7 @@ def _redact_unrevealed_names(text: str, session: dict, entity_index: dict) -> st
         # Self-introduction in this narration → the NPC told the player their
         # name. Unlock it and leave it intact (natural reveal, not a leak).
         if any(f"{p}{name}" in text or f"{p}“{name}”" in text or f"{p}「{name}」" in text
-               for p in _SELF_INTRO_PREFIXES):
+               for p in _SELF_INTRO_PREFIXES) or _english_self_introduction(text, name):
             disc["name"] = True
             print(f"[ENGINE] Disclosure: NPC self-introduced → unlock '{name}'", flush=True)
             continue
@@ -565,6 +773,75 @@ def _redact_unrevealed_names(text: str, session: dict, entity_index: dict) -> st
     text = _re.sub(r'(那个人)(?:\1)+', r'\1', text)
     text = _re.sub(r'(的人){2,}', '的人', text)
     return text
+
+
+def _redact_unrevealed_entities(text: str, session: dict, world: dict) -> str:
+    """Remove hidden entity names from generated player-facing text.
+
+    This is a deterministic last line of defense. It cannot understand every
+    paraphrase, but it prevents the common failure where the model copies an
+    undiscovered clue or item name straight out of KP context.
+    """
+    if not text:
+        return text
+    from npc_context import entity_is_player_visible
+
+    hidden = []
+    for eid, entity in world.get("entities", {}).items():
+        if not isinstance(entity, dict):
+            continue
+        if entity_is_player_visible(eid, world, session):
+            continue
+        name = str(entity.get("name", "")).strip()
+        # Knowledge and possession are separate. A quest item may be physically
+        # hidden while its name is stated in the public opening premise.
+        if name and name in str(world.get("opening", "")):
+            continue
+        if len(name) >= 2:
+            hidden.append((name, entity.get("type", "")))
+
+    replacements = {
+        "clue": "尚未发现的线索",
+        "item": "尚未发现的物件",
+        "door": "尚未发现的入口",
+        "container": "尚未发现的容器",
+        "npc": "尚未现身的人",
+    }
+    for name, etype in sorted(hidden, key=lambda row: len(row[0]), reverse=True):
+        text = text.replace(name, replacements.get(etype, "尚未发现的事物"))
+    return text
+
+
+_HIDDEN_ENTITY_ACTIONS = (
+    "拿", "拿起", "拾起", "捡", "捡起", "取", "取出", "掏出", "使用",
+    "用", "打开", "阅读", "读", "带走", "装进", "偷", "藏起", "触碰",
+    "摸", "检查", "查看", "调查", "搜索", "搜查", "攻击", "破坏",
+    "pick up", "take", "use", "open", "read", "steal", "touch",
+    "inspect", "examine", "search", "attack", "break",
+)
+
+
+def _find_hidden_entity_action(player_input: str, session: dict,
+                               world: dict) -> str:
+    """Find a named but undiscovered module entity the player tries to use.
+
+    The response deliberately does not confirm whether the guessed object will
+    exist later; it only establishes that the investigator has not found it.
+    """
+    normalized = (player_input or "").lower()
+    if not normalized or not any(v in normalized for v in _HIDDEN_ENTITY_ACTIONS):
+        return ""
+    from npc_context import entity_is_player_visible
+
+    candidates = []
+    for eid, entity in world.get("entities", {}).items():
+        if not isinstance(entity, dict) or entity.get("type") == "npc":
+            continue
+        name = str(entity.get("name", "")).strip()
+        if (name and name.lower() in normalized
+                and not entity_is_player_visible(eid, world, session)):
+            candidates.append(name)
+    return max(candidates, key=len) if candidates else ""
 
 
 def _extract_arrival_traits(session: dict, scene_id: str, scene_name: str,
@@ -608,7 +885,6 @@ def _extract_arrival_traits(session: dict, scene_id: str, scene_name: str,
 def _exit_targets(current_scene: dict, world: dict) -> list[tuple[str, str]]:
     """Return [(scene_id, scene_name), ...] for scenes connected to the current one."""
     scenes = world.get("scenes", {})
-    exits = current_scene.get("exits", {})
     out = []
     seen = set()
 
@@ -626,12 +902,8 @@ def _exit_targets(current_scene: dict, world: dict) -> list[tuple[str, str]]:
                 seen.add(rid)
                 out.append((rid, scenes[rid].get("name", rid)))
 
-    if isinstance(exits, dict):
-        for _kw, target in exits.items():
-            _add(target)
-    elif isinstance(exits, list):
-        for target in exits:
-            _add(target)
+    for record in scene_exit_records(current_scene, world):
+        _add(record["scene_id"])
     return out
 
 
@@ -647,17 +919,11 @@ def _exit_labels(current_scene: dict, world: dict) -> list[tuple[str, set]]:
     where narration uses just the room. Returns [(scene_id, {labels}), ...]."""
     scenes = world.get("scenes", {})
     cur_name = current_scene.get("name", "")
-    exits = current_scene.get("exits", {})
-    pairs = exits.items() if isinstance(exits, dict) else [("", t) for t in (exits or [])]
     out = []
-    for kw, target in pairs:
-        sd = scenes.get(target)
-        if not isinstance(sd, dict):
-            tid = next((sid for sid, s in scenes.items()
-                        if isinstance(s, dict) and s.get("name") == target), None)
-            if not tid:
-                continue
-            target, sd = tid, scenes[tid]
+    for record in scene_exit_records(current_scene, world):
+        kw = record.get("keyword", "")
+        target = record["scene_id"]
+        sd = scenes.get(target, {})
         name = sd.get("name", target)
         labels = {name}
         kw_short = _MOVE_VERB_PREFIX.sub("", kw or "").strip()
@@ -673,23 +939,81 @@ def _exit_labels(current_scene: dict, world: dict) -> list[tuple[str, set]]:
     return out
 
 
-def _build_exits_block(current_scene: dict, world: dict) -> str:
+def _build_exits_block(current_scene: dict, world: dict,
+                       session: Optional[dict] = None) -> str:
     """Tell the KP which scenes connect to here, so the KP (not keyword code)
     decides when to move the party onward and emits 〔前往：X〕. Scenes are a
     linear/connected graph; the KP guides players to the next one when the story
     is ready to advance."""
-    targets = _exit_targets(current_scene, world)
-    if not targets:
+    if session is None:
+        targets = _exit_targets(current_scene, world)
+        roster = [{"id": sid, "label": name, "exit_label": ""}
+                  for sid, name in targets]
+        selected = ""
+    else:
+        roster = list_available_scenes(session, world)
+        selected = str(session.get("selected_scene_id") or "")
+    if not roster:
         return ""
     lines = ["=== 可前往的相邻场景（KP用来引导推进，玩家想走/剧情该推进时带他们去）==="]
-    for tid, name in targets:
-        lines.append(f"  · {name}（id: {tid}）")
+    for item in roster:
+        tid = item["id"]
+        name = item["label"]
+        marker = "，玩家已选择" if tid == selected else ""
+        lines.append(f"  · {name}（id: {tid}{marker}）")
     lines.append(
         "当玩家明确要前往某处、或剧情自然该推进到下一场景时，由你（KP）决定移动："
         "正常叙述这段移动/抵达，并在回复**最后单独一行**输出 〔前往：场景id或场景名〕。"
         "只在真的发生场景转移时输出；在原地探索/对话不要输出。一次最多一个。"
     )
     return "\n".join(lines)
+
+
+_PLAYER_MOVE_INTENT = (
+    "前往", "去", "走向", "走进", "进入", "离开", "出发", "上山", "下山",
+    "往上", "往前", "往里", "继续前进", "继续走", "继续爬", "沿着", "穿过",
+    "返回", "回到", "动身", "启程", "前进", "go to", "enter", "head to",
+    "walk to", "return to", "travel to",
+)
+
+_ENGLISH_MOVE_INTENT_RE = _re.compile(
+    r"\b(?:go|ride|walk|run|sail|travel|head|return|proceed|move|leave|"
+    r"enter|cross|climb|continue|journey)\b",
+    _re.IGNORECASE,
+)
+
+
+def _has_player_move_intent(player_input: str) -> bool:
+    normalized = (player_input or "").lower()
+    return (any(word in normalized for word in _PLAYER_MOVE_INTENT)
+            or bool(_ENGLISH_MOVE_INTENT_RE.search(normalized)))
+
+
+def _find_unavailable_scene_move(player_input: str, current_scene_id: str,
+                                 world: dict, session: Optional[dict] = None) -> str:
+    """Return a named module scene when the player tries to skip the scene graph."""
+    normalized = (player_input or "").lower()
+    if not _has_player_move_intent(normalized):
+        return ""
+    scenes = world.get("scenes", {})
+    current = scenes.get(current_scene_id, {})
+    allowed = (
+        {item["id"] for item in list_available_scenes(session, world)}
+        if session is not None
+        else {sid for sid, _name in _exit_targets(current, world)}
+    )
+    candidates = []
+    for sid, scene in scenes.items():
+        if sid == current_scene_id or sid in allowed or not isinstance(scene, dict):
+            continue
+        # Scene ids are internal implementation details and often ordinary
+        # words ("return", "road", "fight"). Matching them in player prose
+        # creates false skip blocks, so only player-facing names are eligible.
+        names = [str(scene.get("name", "")).strip()]
+        for name in names:
+            if len(name) >= 2 and name.lower() in normalized:
+                candidates.append(name)
+    return max(candidates, key=len) if candidates else ""
 
 
 def _maybe_apply_movement(state: "GMState", content: str) -> str:
@@ -705,22 +1029,34 @@ def _maybe_apply_movement(state: "GMState", content: str) -> str:
     world = state["world"]
     scenes = world.get("scenes", {})
     current_scene = state.get("current_scene", {})
+    session = state.get("session", {})
+    roster = list_available_scenes(session, world) if session else []
+    allowed_ids = ({item["id"] for item in roster}
+                   if roster else {sid for sid, _name in _exit_targets(current_scene, world)})
+    requested = str(state.get("_requested_scene_target") or "")
+
+    # A clicked target is a validated player decision. The narrator supplies
+    # prose, but cannot silently redirect it to another destination.
+    if requested and requested in allowed_ids:
+        content = _re.sub(r'\s*〔\s*前往\s*[:：].*?〕\s*', '', content).strip()
+        state["movement_target"] = requested
+        print(f"[ENGINE] Explicit scene target: {requested}", flush=True)
+        return content
 
     m = _re.search(r'〔\s*前往\s*[:：]\s*(.+?)\s*〕', content)
     if m:
         raw = m.group(1).strip()
         content = _re.sub(r'〔\s*前往\s*[:：].*?〕', '', content).strip()
         target_id = ""
-        if raw in scenes:
+        if raw in allowed_ids:
             target_id = raw
         else:
             for tid, labels in _exit_labels(current_scene, world):
+                if tid not in allowed_ids:
+                    continue
                 if raw == tid or any(l == raw or l in raw or raw in l for l in labels):
                     target_id = tid
                     break
-            if not target_id:
-                target_id = next((sid for sid, s in scenes.items()
-                                  if isinstance(s, dict) and s.get("name") == raw), "")
         if target_id:
             state["movement_target"] = target_id
             print(f"[ENGINE] KP movement marker: '{raw}' → {target_id}", flush=True)
@@ -729,17 +1065,16 @@ def _maybe_apply_movement(state: "GMState", content: str) -> str:
         return content
 
     # No marker — backstop. Only when the player expressed movement intent.
-    _MOVE_INTENT = ("前往", "去", "走向", "走进", "进入", "离开", "出发", "上山",
-                    "下山", "往上", "往前", "往里", "继续前进", "继续走", "继续爬",
-                    "往上爬", "沿着", "穿过", "返回", "回到", "动身", "启程", "前进")
-    pi = state.get("player_input", "") or ""
-    if not any(k in pi for k in _MOVE_INTENT):
+    pi = (state.get("player_input", "") or "").lower()
+    if not _has_player_move_intent(pi):
         return content
     # Did the KP narrate arriving at exactly one connected scene? Match on the
     # distinctive room label, not the full prefixed name (narration says "会客厅",
     # the scene is "黎明公馆会客厅").
     hits = []
     for tid, labels in _exit_labels(current_scene, world):
+        if tid not in allowed_ids:
+            continue
         # Only ≥3-char labels are safe to substring-match against free prose;
         # 2-char labels collide with ordinary narration and would falsely fire a
         # move. (They're still used for the explicit 〔前往：X〕 marker above,
@@ -752,6 +1087,59 @@ def _maybe_apply_movement(state: "GMState", content: str) -> str:
         state["movement_target"] = hits[0]
         print(f"[ENGINE] Movement backstop (narration named '{hits[0]}', no marker)", flush=True)
     return content
+
+
+_NARRATED_ARRIVAL_RE = _re.compile(
+    r'(?:来到|抵达|到达|进入了|走进了|身处|现在在|已经在)|'
+    r'\b(?:arriv(?:e|ed|es)|reach(?:ed|es)?|enter(?:ed|s)?|'
+    r'now\s+in|inside\s+(?:the|a|an)?)\b',
+    flags=_re.IGNORECASE,
+)
+
+
+def _reject_uncommitted_movement(state: "GMState", content: str) -> str:
+    """Prevent prose from claiming arrival when no legal transition committed."""
+    if (state.get("movement_target")
+            or not _has_player_move_intent(state.get("player_input", ""))
+            or not _NARRATED_ARRIVAL_RE.search(content or "")):
+        return content
+    print("[ENGINE] Rejected narration-only scene transition", flush=True)
+    return "未能把这个目的地对应到当前可达场景，请从可前往场景中选择，或明确说明要走哪条出口。"
+
+
+_UNCOMMITTED_MUTATION_RE = _re.compile(
+    r'(?:烧毁|烧成灰|焚毁|炸毁|爆炸摧毁|摧毁|毁掉|彻底破坏|'
+    r'当场死亡|全部死亡|所有人.{0,8}(?:死了|死亡|被杀)|杀死了|被杀死|'
+    r'从世界中消失)|'
+    r'\b(?:burn(?:s|ed)?\s+down|blow(?:s|n)?\s+up|destroy(?:s|ed)?|'
+    r'demolish(?:es|ed)?|is\s+killed|are\s+killed|'
+    r'(?:everyone|everybody|all\s+(?:of\s+)?(?:them|the\s+people))\s+'
+    r'(?:is|are)\s+dead)\b',
+    flags=_re.IGNORECASE,
+)
+
+
+def _has_committed_world_mutation(state: "GMState") -> bool:
+    if state.get("_narration_override"):
+        return True
+    mutation_events = {
+        "entity_damaged", "entity_removed", "item_consumed",
+        "object_opened", "object_closed", "object_unlocked", "object_locked",
+    }
+    if any(event.get("type") in mutation_events
+           for event in state.get("_action_events", [])):
+        return True
+    changes = state.get("turn_summary", {}).get("entity_state_changes", {})
+    return bool(changes)
+
+
+def _reject_uncommitted_world_mutation(state: "GMState", content: str) -> str:
+    """Discard catastrophic state claims that have no authoritative event."""
+    if (not _UNCOMMITTED_MUTATION_RE.search(content or "")
+            or _has_committed_world_mutation(state)):
+        return content
+    print("[ENGINE] Rejected narration-only world mutation", flush=True)
+    return "眼前没有发生足以改变场景、人物或物品状态的已确认事件。"
 
 
 def _maybe_arm_dynamic_check(state: "GMState", content: str) -> str:
@@ -773,30 +1161,25 @@ def _maybe_arm_dynamic_check(state: "GMState", content: str) -> str:
     # Attributes are percentile (CoC 7e) — no ×5. Untrained floor, capped at 95.
     effective = sv if sv > 0 else 15
     effective = min(max(effective, 15), 95)
-    session["pending_check"] = {
+    pending_check = {
         "entity_id": "", "state": "", "skill": skill,
         "skill_value": sv, "effective": effective, "dc": 12,
         "san_check": "", "rule_system": rule_system,
         "scene": ps.get("current_scene", ""), "dynamic": True,
+        "player_action": state.get("player_input", ""),
     }
+    outcome_action = _find_outcome_clock_action(
+        state.get("player_input", ""), state.get("world", {}))
+    if outcome_action:
+        pending_check.update({
+            "_outcome_clock_id": outcome_action["clock_id"],
+            "_outcome_clock_name": outcome_action["clock_name"],
+            "_outcome_clock_action": outcome_action["action"],
+            "_outcome_clock_increments": outcome_action["outcome_increments"],
+        })
+    session["pending_check"] = pending_check
     print(f"[ENGINE] Dynamic check armed by LLM: {skill} (effective {effective})", flush=True)
     return content
-
-
-def _record_nickname(session: dict, eid: str, nickname: str,
-                     entity_index: dict) -> None:
-    """Persist a player-coined nickname onto the matched NPC's dynamic state.
-
-    Mutates session in place; run_gm_turn's post-turn save_session persists it.
-    """
-    from npc_state import add_nickname
-    from npc_context import _find_npc_state
-    name = entity_index.get(eid, {}).get("name", eid)
-    npc_states = session.get("npc_states", {})
-    st = _find_npc_state(name, npc_states)
-    if st is not None:
-        if add_nickname(st.setdefault("dynamic", {}), nickname):
-            print(f"[ENGINE] Nickname cached: '{nickname}' → {name}", flush=True)
 
 
 # Words that signal the "target" is NOT a person — game state, meta commands, or
@@ -818,7 +1201,8 @@ def _is_person_target(target: str) -> bool:
     """Is this extracted target plausibly a PERSON reference (vs a state/meta
     question or garbage fragment)? Conservative gate before any hard denial."""
     t = (target or "").strip()
-    if not (2 <= len(t) <= 12):
+    max_len = 40 if _re.search(r'[A-Za-z]', t) else 12
+    if not (2 <= len(t) <= max_len):
         return False
     if t in _BARE_QUESTION_WORDS or t in _GROUP_WORDS:
         return False
@@ -858,19 +1242,238 @@ def _extract_interaction_target(user_text: str) -> str:
     return ""
 
 
+_ENGLISH_DIALOGUE_INTENT_RE = _re.compile(
+    r'\b(?:ask(?:s|ed|ing)?|tell(?:s|ing)?|told|say(?:s|ing)?|said|'
+    r'talk(?:s|ed|ing)?|speak(?:s|ing)?|spoke|spoken|'
+    r'question(?:s|ed|ing)?|interrogat(?:e|es|ed|ing)|'
+    r'repl(?:y|ies|ied|ying)|answer(?:s|ed|ing)?|greet(?:s|ed|ing)?|'
+    r'hello|hi|goodbye|thank(?:s|ed|ing)?|apologi[sz](?:e|es|ed|ing)|'
+    r'warn(?:s|ed|ing)?|persuad(?:e|es|ed|ing)|order(?:s|ed|ing)?)\b',
+    _re.IGNORECASE,
+)
+_CHINESE_DIALOGUE_PHRASE_RE = _re.compile(
+    r'说话|交谈|聊天|打招呼|搭话|搭讪|交流|自我介绍|'
+    r'你好|您好|再见|道谢|道歉'
+)
+_CHINESE_DIALOGUE_VERB_RE = _re.compile(
+    r'^(?:我|我们)?(?:想|要|继续|上前|走过去|过去|去|转身|回头)?'
+    r'(?:向|对|跟|同)?(?:他|她|他们|她们|那个人|这个人)?'
+    r'(?:呼喊|追问|询问|质问|盘问|请教|告诉|回应|问|说|讲|叫|喊|'
+    r'招呼|安慰|劝说|命令|警告|威胁|感谢)'
+)
+_CHINESE_ADDRESSED_DIALOGUE_RE = _re.compile(
+    r'^(?:我|我们)?(?:想|要|继续|上前|走过去|过去|去|转身|回头)?'
+    r'(?:找|向|对|跟|同|和|朝)[^，。！？]{1,30}'
+    r'(?:说话|交谈|聊天|打招呼|搭话|呼喊|追问|询问|质问|盘问|'
+    r'请教|告诉|回应|问|说|讲|聊|喊|招呼|安慰|劝说|命令|警告|'
+    r'威胁|感谢)'
+)
+
+
+def _is_dialogue_intent(player_input: str) -> bool:
+    if not player_input:
+        return False
+    text = player_input.strip()
+    if _ENGLISH_DIALOGUE_INTENT_RE.search(text):
+        return True
+    if _CHINESE_DIALOGUE_PHRASE_RE.search(text):
+        return True
+    if _CHINESE_DIALOGUE_VERB_RE.search(text):
+        return True
+    if _CHINESE_ADDRESSED_DIALOGUE_RE.search(text):
+        return True
+    return bool(_re.search(r'[“「『\"]\s*[^”」』\"]{1,120}[”」』\"]', text))
+
+
+def _known_absent_npc(target: str, scene_entity_ids: list[str],
+                      entity_index: dict[str, dict], world: dict) -> str:
+    """Resolve an exact module NPC reference that is not physically present."""
+    needle = _re.sub(r'\s+', '', (target or "")).lower()
+    if not needle:
+        return ""
+    present = set(scene_entity_ids)
+    for eid, entity in world.get("entities", {}).items():
+        if not isinstance(entity, dict) or entity.get("type") != "npc" or eid in present:
+            continue
+        forms = [entity.get("name", ""), eid, *(entity.get("aliases", []) or [])]
+        for form in forms:
+            normalized = _re.sub(r'\s+', '', str(form)).lower()
+            if normalized and normalized == needle:
+                return eid
+    return ""
+
+
 def _scene_entities_with_companions(scene_id: str, scene_index: dict,
-                                    session: dict, entity_index: dict) -> list[str]:
+                                    session: dict, entity_index: dict,
+                                    world: dict) -> list[str]:
     """Entities physically in the scene PLUS the player's travelling companions.
 
     The climbing party (尾金/四间管/山登) moves with the player; the world book's
     static all_scenes can't enumerate every intermediate scene they pass through,
     so companions (recorded on scene transition) are always considered present.
     This is what lets cross-scene references to a companion resolve anywhere."""
-    here = list(get_entities_in_scene(scene_id, scene_index))
+    here = list(scene_entity_ids(session, world, scene_index, scene_id))
     for eid in session.get("companions", []):
         if eid not in here and entity_index.get(eid, {}).get("type") == "npc":
             here.append(eid)
     return here
+
+
+def _advance_action_clocks(player_input: str, session: dict,
+                           world: dict) -> list[dict]:
+    """Advance module-defined clocks from explicit player action costs."""
+    normalized = (player_input or "").lower()
+    events = []
+    clocks = session.setdefault("clocks", {})
+    flags = session.setdefault("flags", [])
+
+    for clock_id, definition in world.get("action_clocks", {}).items():
+        if not isinstance(definition, dict):
+            continue
+        old_value = int(clocks.get(clock_id, definition.get("initial", 0)))
+        increment = int(definition.get("default_increment", 0))
+        matched_action = ""
+        matches = []
+        for action in definition.get("actions", []):
+            if not isinstance(action, dict):
+                continue
+            for trigger in action.get("triggers", []):
+                trigger = str(trigger).strip().lower()
+                if trigger and trigger in normalized:
+                    matches.append((len(trigger), action))
+                    break
+        if matches:
+            _length, action = max(matches, key=lambda row: row[0])
+            increment = int(action.get("increment", 0))
+            matched_action = str(action.get("label", ""))
+
+        new_value = max(0, old_value + increment)
+        clocks[clock_id] = new_value
+        crossed = []
+        for milestone in definition.get("milestones", []):
+            if not isinstance(milestone, dict):
+                continue
+            at = int(milestone.get("at", 0))
+            flag = str(milestone.get("flag") or f"{clock_id}_{at}")
+            if old_value < at <= new_value and flag not in flags:
+                flags.append(flag)
+                crossed.append({
+                    "at": at,
+                    "flag": flag,
+                    "narration": str(milestone.get("narration", "")).strip(),
+                })
+        if increment or crossed:
+            events.append({
+                "clock_id": clock_id,
+                "name": definition.get("name", clock_id),
+                "old": old_value,
+                "new": new_value,
+                "increment": increment,
+                "action": matched_action,
+                "milestones": crossed,
+            })
+    return events
+
+
+def _find_outcome_clock_action(player_input: str, world: dict) -> dict:
+    """Return a roll-dependent clock action matched by the player's wording."""
+    normalized = (player_input or "").lower()
+    matches = []
+    for clock_id, definition in world.get("action_clocks", {}).items():
+        if not isinstance(definition, dict):
+            continue
+        for action in definition.get("outcome_actions", []):
+            if not isinstance(action, dict):
+                continue
+            for trigger in action.get("triggers", []):
+                trigger = str(trigger).strip().lower()
+                if trigger and trigger in normalized:
+                    matches.append((len(trigger), clock_id, definition, action))
+                    break
+    if not matches:
+        return {}
+    _length, clock_id, definition, action = max(matches, key=lambda row: row[0])
+    return {
+        "clock_id": clock_id,
+        "clock_name": definition.get("name", clock_id),
+        "action": str(action.get("label", "")),
+        "outcome_increments": dict(action.get("outcome_increments", {})),
+    }
+
+
+def _apply_pending_clock_outcome(session: dict, world: dict, pending: dict,
+                                 verdict: str) -> dict:
+    """Apply a roll-dependent clock cost after the player has actually rolled."""
+    clock_id = pending.get("_outcome_clock_id", "")
+    if not clock_id:
+        return {}
+    definition = world.get("action_clocks", {}).get(clock_id, {})
+    increments = pending.get("_outcome_clock_increments", {})
+    increment = int(increments.get(verdict, increments.get("default", 0)))
+    clocks = session.setdefault("clocks", {})
+    flags = session.setdefault("flags", [])
+    old_value = int(clocks.get(clock_id, definition.get("initial", 0)))
+    new_value = max(0, old_value + increment)
+    clocks[clock_id] = new_value
+    crossed = []
+    for milestone in definition.get("milestones", []):
+        if not isinstance(milestone, dict):
+            continue
+        at = int(milestone.get("at", 0))
+        flag = str(milestone.get("flag") or f"{clock_id}_{at}")
+        if old_value < at <= new_value and flag not in flags:
+            flags.append(flag)
+            crossed.append({
+                "at": at,
+                "flag": flag,
+                "narration": str(milestone.get("narration", "")).strip(),
+            })
+    return {
+        "clock_id": clock_id,
+        "name": definition.get("name", pending.get("_outcome_clock_name", clock_id)),
+        "old": old_value,
+        "new": new_value,
+        "increment": increment,
+        "action": pending.get("_outcome_clock_action", ""),
+        "milestones": crossed,
+    }
+
+
+def _clock_context_block(world: dict, session: dict,
+                         events: list[dict]) -> str:
+    definitions = world.get("action_clocks", {})
+    if not definitions:
+        return ""
+    lines = ["=== DETERMINISTIC ACTION CLOCKS ==="]
+    for clock_id, definition in definitions.items():
+        value = session.get("clocks", {}).get(
+            clock_id, definition.get("initial", 0))
+        lines.append(f"{definition.get('name', clock_id)}: {value}")
+    for event in events:
+        lines.append(
+            f"This action changed {event['name']}: "
+            f"{event['old']} -> {event['new']} (cost {event['increment']}).")
+        for milestone in event.get("milestones", []):
+            lines.append(
+                f"MILESTONE {milestone['at']} TRIGGERED THIS TURN. "
+                "The engine will prepend its canonical passage. Continue from "
+                "that event without repeating, delaying, or contradicting it.")
+            if milestone.get("narration"):
+                lines.append(milestone["narration"])
+    return "\n".join(lines)
+
+
+def _prepend_clock_milestones(state: GMState, response: str) -> str:
+    passages = [
+        milestone["narration"]
+        for event in state.get("_clock_events", [])
+        for milestone in event.get("milestones", [])
+        if milestone.get("narration")
+    ]
+    if not passages:
+        return response
+    prefix = "\n\n".join(passages)
+    return f"{prefix}\n\n{response}" if response else prefix
 
 
 # ── Node: Parse Input ─────────────────────────────────────────
@@ -891,13 +1494,107 @@ def parse_input(state: GMState) -> GMState:
             break
     state["player_input"] = user_text.strip()
     inp = state["player_input"].lower()
+    ensure_fact_state(session, world)
+    ensure_scene_state(session, world)
+    state["_clock_events"] = _advance_action_clocks(
+        state["player_input"], session, world)
+
+    # A player may guess a real module object before discovering it (often from
+    # prior knowledge of the scenario) and phrase the guess as an accomplished
+    # action. Block that in code instead of asking the narrator to resist the
+    # false premise while the secret object is visible in its KP context.
+    state["_hidden_entity_action"] = _find_hidden_entity_action(
+        state["player_input"], session, world)
 
     # Load current scene
     scene_id = ps.get("current_scene", "")
     scenes = world.get("scenes", {})
     state["current_scene"] = scenes.get(scene_id, {})
+    state["_blocked_scene_move"] = _find_unavailable_scene_move(
+        state["player_input"], scene_id, world, session)
     state["scene_entities"] = _scene_entities_with_companions(
-        scene_id, scene_index, session, entity_index)
+        scene_id, scene_index, session, entity_index, world)
+
+    scene_roster = list_available_scenes(session, world)
+    reconcile_scene_target(session, scene_roster)
+    state["_requested_scene_target"] = selected_movement_target(
+        state["player_input"], session, world,
+        _has_player_move_intent(state["player_input"]),
+    )
+
+    object_roster = list_interactable_objects(
+        session, world, scene_index, entity_index)
+    reconcile_object_target(session, object_roster)
+    if _is_dialogue_intent(state["player_input"]):
+        proposal = {
+            "intent": "none", "target_id": "", "tool_id": "",
+            "confidence": 1.0, "ambiguous": False,
+            "source": "dialogue_intent", "candidate_ids": [],
+            "player_input": state["player_input"],
+        }
+    else:
+        proposal = plan_action(
+            state["player_input"], session, world, scene_index, entity_index,
+            ai_planner=_action_planner(state.get("api_key", "")),
+        )
+    resolution = validate_action(proposal, session, world)
+    if (not proposal.get("target_id")
+            and resolution.get("status") == "ambiguous"
+            and _has_player_move_intent(state["player_input"])):
+        resolution = {"status": "passthrough", "events": []}
+    if (proposal.get("intent") == "break"
+            and not proposal.get("target_id")
+            and resolution.get("status") == "ambiguous"):
+        # Some authored branches use an aggressive choice itself as an exit
+        # trigger (for example, "attack the ducks").  That phrase is an
+        # authoritative, currently reachable action candidate even when the
+        # scenario did not model the group as an individual object.  Let the
+        # narrator interpret it, while movement validation still limits the
+        # result to the exposed adjacent scene.
+        lowered_input = state["player_input"].casefold()
+        input_words = set(_re.findall(r"[a-z0-9]+", lowered_input))
+
+        def _matches_authored_trigger(value: str) -> bool:
+            trigger = value.strip().casefold()
+            if not trigger:
+                return False
+            if trigger in lowered_input:
+                return True
+            if not trigger.isascii():
+                return False
+            ignored = {"a", "an", "the", "to", "at", "in", "on", "with"}
+            trigger_words = {
+                word for word in _re.findall(r"[a-z0-9]+", trigger)
+                if word not in ignored
+            }
+            return len(trigger_words) >= 2 and trigger_words <= input_words
+
+        authored_trigger = next((
+            str(item.get("exit_label", "")).strip()
+            for item in scene_roster
+            if _matches_authored_trigger(
+                str(item.get("exit_label", "")))
+        ), "")
+        if authored_trigger:
+            resolution = {
+                "status": "passthrough",
+                "events": [],
+                "authoritative_exit_trigger": authored_trigger,
+            }
+        elif _find_outcome_clock_action(state["player_input"], world):
+            # A module-defined roll-dependent action is already a closed rule
+            # boundary.  It may be narrated and armed as a check without an
+            # object entity, but its outcome is still committed by roll_check.
+            resolution = {
+                "status": "passthrough",
+                "events": [],
+                "authoritative_clock_action": True,
+            }
+    state["action_proposal"] = proposal
+    state["action_resolution"] = resolution
+    state["_action_block"] = (
+        str(resolution.get("message", ""))
+        if resolution.get("status") in {"blocked", "ambiguous"} else "")
 
     # ── Check 大幸运 (luck token) ──
     if "大幸运" in inp and ps.get("luck_tokens", 0) > 0:
@@ -917,6 +1614,32 @@ def parse_input(state: GMState) -> GMState:
     cooldowns = session.get("entity_states_cooldown", {})
     current_turn = session.get("current_turn", 0)
     entities = world.get("entities", {})
+
+    target_id = str(proposal.get("target_id", ""))
+    if target_id:
+        entity = entities.get(target_id, {})
+        current_state = entity_states.get(
+            target_id, entity.get("initial_state", "default"))
+        if legacy_state_matches_action(
+                entity, current_state, proposal, state["player_input"]):
+            state["matched_entity"] = {
+                "id": target_id,
+                "current_state": current_state,
+                "state_def": entity.get("states", {}).get(current_state, {}),
+            }
+            resolution["defer_to_legacy"] = True
+            resolution["status"] = "accepted"
+            state["_action_block"] = ""
+            print(
+                f"[ENGINE] Action target uses legacy rule: {target_id} "
+                f"(state={current_state}, intent={proposal.get('intent')})",
+                flush=True,
+            )
+            return state
+        # A closed-world target was resolved, so do not let a legacy substring
+        # trigger silently switch the action to another object in the scene.
+        state["matched_entity"] = None
+        return state
 
     for eid in state["scene_entities"]:
         entity = entities.get(eid)
@@ -943,6 +1666,10 @@ def parse_input(state: GMState) -> GMState:
                 "current_state": current_state,
                 "state_def": state_def,
             }
+            if proposal.get("intent") == "break":
+                resolution["defer_to_legacy"] = True
+                resolution["status"] = "accepted"
+                state["_action_block"] = ""
             print(f"[ENGINE] Entity matched: {eid} (state={current_state}, kw='{matched_kw}')", flush=True)
             return state
 
@@ -960,6 +1687,7 @@ def parse_input(state: GMState) -> GMState:
 _SEARCH_KWS = frozenset({
     "搜查", "搜索", "翻找", "翻阅", "翻开", "搜寻", "探查", "搜身",
     "调查", "查找", "寻找",
+    "search", "investigate", "look for", "rummage", "inspect for",
 })
 
 # English → Chinese skill name mapping for world-book clue checks
@@ -1036,6 +1764,7 @@ def _resolve_clue_skill(check_str: str, ps: dict, rule_system: str):
 
 def _try_arm_scene_clue(state: "GMState", inp: str) -> None:
     """If player is searching and the scene has undiscovered clues, arm the first one."""
+    inp = (inp or "").lower()
     if not any(kw in inp for kw in _SEARCH_KWS):
         return
     session = state["session"]
@@ -1071,6 +1800,7 @@ def _try_arm_scene_clue(state: "GMState", inp: str) -> None:
             "dynamic": False,
             "_scene_clue_id": cid,
         }
+        state["_pending_roll"] = True
         print(f"[ENGINE] Scene clue armed: {cid} → {display} DC{dc}", flush=True)
         break
 
@@ -1257,6 +1987,10 @@ def resolve_entity(state: GMState) -> GMState:
             session.setdefault("flags", []).append(flag)
             if flag not in turn_summary["new_flags"]:
                 turn_summary["new_flags"].append(flag)
+        legacy_events = sync_legacy_transition(
+            session, world, eid, current_state, new_state)
+        if legacy_events:
+            state.setdefault("_action_events", []).extend(legacy_events)
 
     # Award luck token on critical success
     dice = state.get("dice_result")
@@ -1268,6 +2002,46 @@ def resolve_entity(state: GMState) -> GMState:
 
     # Store narration override in state
     state["_narration_override"] = narration_override
+    return state
+
+
+def resolve_action(state: GMState) -> GMState:
+    """Commit validated generic object actions as authoritative events."""
+    resolution = state.get("action_resolution", {})
+    state.setdefault("_action_events", [])
+    if (resolution.get("status") != "accepted"
+            or resolution.get("defer_to_legacy")
+            or state.get("_pending_roll")):
+        return state
+
+    session = state["session"]
+    world = state["world"]
+    summary = state.setdefault("turn_summary", {})
+    summary.setdefault("entity_state_changes", {})
+    summary.setdefault("npc_changes", {})
+    summary.setdefault("new_flags", [])
+    summary.setdefault("items_obtained", [])
+    summary.setdefault("items_used", [])
+    entities = world.get("entities", {})
+
+    for event in resolution.get("events", []):
+        payload = dict(event)
+        payload.setdefault("source", state.get("action_proposal", {}).get(
+            "source", "validated_action"))
+        payload.setdefault("player_action", state.get("player_input", ""))
+        eid = str(payload.get("entity_id", ""))
+        old_state = str(session.get("entity_states", {}).get(eid, "default"))
+        committed = append_world_event(session, world, payload)
+        state["_action_events"].append(committed)
+        new_state = str(session.get("entity_states", {}).get(eid, old_state))
+        if old_state != new_state:
+            summary["entity_state_changes"][eid] = f"{old_state}→{new_state}"
+        name = str(entities.get(eid, {}).get("name", eid))
+        if committed.get("type") == "item_picked_up":
+            summary["items_obtained"].append(name)
+        elif committed.get("type") == "item_used":
+            summary["items_used"].append(name)
+
     return state
 
 
@@ -1290,6 +2064,11 @@ def assemble_context(state: GMState) -> GMState:
     current_scene_id = session["player_state"].get("current_scene", "")
     scene_entities = state["scene_entities"]
     player_input = state.get("player_input", "")
+    from npc_context import entity_is_player_visible
+    reference_entities = [
+        eid for eid in scene_entities
+        if entity_is_player_visible(eid, world, session)
+    ]
 
     # Meta/out-of-character spoiler request → strip secret-bearing context this
     # turn (nothing to leak) and add a hard in-character refusal below.
@@ -1302,7 +2081,8 @@ def assemble_context(state: GMState) -> GMState:
     controller_ctx = inject_controller_context(controller_result)
 
     # ── Layer 1: SCENE ──
-    scene_layer = build_scene_layer(current_scene_id, world, scene_index, entity_index)
+    scene_layer = build_scene_layer(
+        current_scene_id, world, scene_index, entity_index, session)
     state_snapshot = compute_state_snapshot(session, world, scene_index, entity_index)
     state["state_snapshot"] = state_snapshot
 
@@ -1310,70 +2090,41 @@ def assemble_context(state: GMState) -> GMState:
     from npc_context import build_story_layer
     story_layer = build_story_layer(session)
 
-    # ── Layer 3: NPC_HIT (reference resolution cascade) ──
-    # ① O(1) deterministic: exact name/id, then player-coined nicknames.
-    matched_npc_ids = lookup_known_reference(
-        player_input, scene_entities, entity_index, session)
-
-    interaction_target = _extract_interaction_target(player_input)
-
-    # Broader trigger: any person-referencing word in input, not just explicit
-    # interaction patterns. "那个说不要命的人" has no verb but has "那个".
-    _PERSON_REF_KWS = {"那个", "这个", "那位", "这位", "那人", "这人",
-                       "刚才那", "之前那", "谁", "哪个", "哪位", "他", "她"}
-    npc_ids_in_scene = [e for e in scene_entities
-                        if entity_index.get(e, {}).get("type") == "npc"]
-    has_person_ref = bool(interaction_target) or (
-        npc_ids_in_scene and any(kw in player_input for kw in _PERSON_REF_KWS)
-    )
-
-    # ②a Deterministic dialogue match (rules over prompts) — if the player
-    #    refers to an NPC by what they SAID ("说不要命的"), match the module's
-    #    actual dialogue text directly, before any LLM guessing.
-    if not matched_npc_ids and has_person_ref:
-        kw_eid = dialogue_keyword_match(
-            player_input, scene_entities, entity_index, world)
-        if kw_eid:
-            matched_npc_ids = [kw_eid]
-            print(f"[ENGINE] Ref by-dialogue: '{interaction_target or player_input[:20]}'"
-                  f" → {kw_eid}", flush=True)
-
-    # ②b Closed-world LLM sub-query with full context.
-    #    Gets conversation history + scene text so it can resolve cross-scene
-    #    references ("那个说不要命的人") even without explicit verb patterns.
-    if not matched_npc_ids and has_person_ref:
-        _scene_data = world.get("scenes", {}).get(current_scene_id, {})
-        _scene_text = (_scene_data.get("source_text", "")
-                       or _scene_data.get("desc", "")
-                       or _scene_data.get("description", ""))
-        _recent = get_recent_conversation(session, raw_turns=8)
-        resolve_target = interaction_target or player_input
-        res = llm_resolve_reference(
-            resolve_target, player_input, scene_entities,
-            entity_index, world, session, api_key,
-            DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
-            recent_conversation=_recent,
-            scene_text=_scene_text,
+    # ── Layer 3: explicit NPC interaction target ──
+    interactable_npcs = list_interactable_npcs(
+        session, world, scene_index, entity_index)
+    npc_ids_in_scene = [item["id"] for item in interactable_npcs]
+    stale_npc_id = session.get("selected_npc_id")
+    if reconcile_interaction_target(session, interactable_npcs):
+        state["_npc_target_became_unavailable"] = True
+        print(
+            f"[ENGINE] Selected NPC became unavailable -> cleared: {stale_npc_id}",
+            flush=True,
         )
-        if res.get("npc_id"):
-            eid = res["npc_id"]
-            matched_npc_ids = [eid]
-            if res.get("persistent") and interaction_target:
-                _record_nickname(session, eid, interaction_target, entity_index)
-            print(f"[ENGINE] Ref resolved: '{resolve_target[:30]}' → {eid} "
-                  f"(persistent={res.get('persistent')}, {res.get('reason')})",
-                  flush=True)
-        elif interaction_target:
-            # Only hard-deny when the player explicitly targeted someone by name/desc
-            # and code confirmed they're not here. Pure descriptive refs ("那个")
-            # without a match just fall through to the narration LLM with full context.
-            state["_entity_not_found"] = interaction_target
-            print(f"[ENGINE] Ref denied: '{interaction_target}' not in scene "
-                  f"({res.get('reason')})", flush=True)
+    selected_npc_id = session.get("selected_npc_id")
+
+    dialogue_intent = _is_dialogue_intent(player_input)
+    matched_npc_ids = [selected_npc_id] if selected_npc_id else []
+    state["_available_npc_count"] = len(npc_ids_in_scene)
+
+    if dialogue_intent and not selected_npc_id:
+        state["_npc_selection_required"] = True
+
+    # Non-dialogue references may still use deterministic exact aliases and
+    # observed traits. No LLM reference-resolution call is made.
+    if not matched_npc_ids and not dialogue_intent:
+        matched_npc_ids = lookup_known_reference(
+            player_input, reference_entities, entity_index, session, world)
+
+    if matched_npc_ids:
+        record_entity_mention(
+            session, matched_npc_ids[0], label=player_input, entity_type="npc")
 
     # A player who types an NPC's real name/surname knows it → unlock disclosure
     # so the KP stops redacting a name the player is actively using.
-    _unlock_names_player_knows(player_input, session)
+    allowed_names = {
+        entity_index.get(eid, {}).get("name", "") for eid in matched_npc_ids}
+    _unlock_names_player_knows(player_input, session, allowed_names)
 
     state["_matched_npc_ids"] = matched_npc_ids
     npc_hit_layer = build_npc_hit(matched_npc_ids, session, entity_index) if matched_npc_ids else ""
@@ -1394,7 +2145,11 @@ def assemble_context(state: GMState) -> GMState:
                     rag_lines = ["=== RELEVANT WORLD INFO ==="]
                     for r in rag_results:
                         meta = r.get("metadata", {})
-                        rag_lines.append(f"  [{meta.get('type', '?')}] {meta.get('name', r.get('id', '?'))}: {r.get('document', '')[:200]}")
+                        rag_lines.append(
+                            f"  [source:{r.get('id', '?')} | {meta.get('type', '?')}] "
+                            f"{meta.get('name', r.get('id', '?'))}: "
+                            f"{r.get('document', '')[:700]}"
+                        )
                     retrieval_layer = "\n".join(rag_lines)
         except Exception as e:
             print(f"[ENGINE] RAG error: {e}", flush=True)
@@ -1414,10 +2169,12 @@ def assemble_context(state: GMState) -> GMState:
     # ── Assemble all layers ──
     parts = []
     parts.append(f"## Module: {world.get('name', 'Unknown')}")
-    parts.append(world.get("description", ""))
+    module_description = world.get("description", "")
+    parts.append(module_description)
 
     # L0.5: KP GLOBAL KNOWLEDGE — everything the KP knows (full module roster).
     # On a spoiler/meta request, omit it so the LLM has no solution to leak.
+    kp_knowledge = ""
     if not spoiler_req:
         kp_knowledge = _build_kp_knowledge(world, entity_index, current_scene_id)
         if kp_knowledge:
@@ -1446,12 +2203,66 @@ def assemble_context(state: GMState) -> GMState:
     # L1: SCENE (current scene — what the player can interact with NOW)
     current_scene_data = world.get("scenes", {}).get(current_scene_id, {})
     full_scene_desc = current_scene_data.get("desc", "") or current_scene_data.get("description", "")
+    scene_source = (
+        current_scene_data.get("source_text", "")
+        or current_scene_data.get("source_quote", "")
+    )
     parts.append("")
     parts.append(scene_layer)
     if full_scene_desc and full_scene_desc not in scene_layer:
         parts.append(f"\n{full_scene_desc}")
+    if scene_source:
+        source_excerpt = _bounded_excerpt(
+            scene_source,
+            MAX_SCENE_SOURCE_CHARS,
+            "middle of canonical scene source omitted",
+        )
+        parts.append("")
+        parts.append(
+            "=== CANONICAL CURRENT-SCENE SOURCE ===\n"
+            "This is the authoritative module text for factual grounding. "
+            "Do not add people, objects, clues, causes, or outcomes absent from "
+            "this source or deterministic state. KP-only facts remain secret "
+            "until their reveal conditions are satisfied.\n"
+            + source_excerpt
+        )
     parts.append("")
     parts.append(state_snapshot)
+
+    proposal = state.get("action_proposal", {})
+    resolution = state.get("action_resolution", {})
+    target_id = str(proposal.get("target_id", ""))
+    if target_id and resolution.get("status") == "accepted":
+        target = world.get("entities", {}).get(target_id, {})
+        action_lines = [
+            "=== VALIDATED PLAYER ACTION (AUTHORITATIVE) ===",
+            f"Intent: {proposal.get('intent', 'none')}",
+            f"Target id: {target_id}",
+            f"Target name: {target.get('name', target_id)}",
+            "The target id and physical preconditions were validated by code. "
+            "Do not switch targets or contradict committed facts.",
+        ]
+        committed = state.get("_action_events", [])
+        if committed:
+            action_lines.append(
+                "Committed events: " + json.dumps(
+                    committed, ensure_ascii=False, separators=(",", ":")))
+            action_lines.append(
+                "Narrate these events as already successful. Do not add another "
+                "item, clue, injury, location change, or state mutation.")
+        elif resolution.get("requires_adjudication"):
+            action_lines.append(
+                "No outcome has been committed. Judge only the immediate attempt "
+                "from canonical scene facts. If uncertainty matters, request one "
+                "check with the existing marker; do not declare an unearned result.")
+        parts.append("")
+        parts.append("\n".join(action_lines))
+
+    clock_block = _clock_context_block(
+        world, session, state.get("_clock_events", []))
+    if clock_block:
+        parts.append("")
+        parts.append(clock_block)
 
     # PL information (player-facing rules, if any)
     pl_info = world.get("pl_info", "") or world.get("player_info", "") or world.get("special_rules", "")
@@ -1475,6 +2286,16 @@ def assemble_context(state: GMState) -> GMState:
         parts.append(story_layer)
 
     # L3: NPC_HIT (only when entity was found)
+    if selected_npc_id and matched_npc_ids:
+        selected_name = entity_index.get(selected_npc_id, {}).get("name", selected_npc_id)
+        parts.append("")
+        parts.append(
+            "=== ACTIVE NPC TARGET (CODE-SELECTED, HIGHEST PRIORITY) ===\n"
+            f"The frontend selection fixes the interaction target to entity id "
+            f"{selected_npc_id!r}, canonical NPC {selected_name!r}. "
+            "Any dialogue in this turn is addressed to this NPC only. Never infer "
+            "or switch to another NPC from pronouns, descriptions, or conversation history."
+        )
     if npc_hit_layer and not not_found:
         parts.append("")
         parts.append("=== NPC CONTEXT ===")
@@ -1630,9 +2451,10 @@ def assemble_context(state: GMState) -> GMState:
         parts.append("")
         parts.append(
             f"=== 上一步检定结果（请据此叙述）===\n"
+            f"玩家当时尝试：{_lcr.get('player_action') or '未记录'}\n"
             f"玩家刚完成〈{_lcr.get('skill')}〉检定，结果：{_lcr.get('verdict_cn')}（{_ok}）。"
-            f"成功就给出相应的发现/进展，失败就描述没察觉到/没成功；"
-            f"不要凭空捏造模组里没有的关键线索。"
+            f"只裁定这项已声明动作的直接结果。动态检定没有绑定模组线索：即使成功，也不得"
+            f"新增人物、物品、线索、地点、原因或幕后真相；失败也不得用新事件补偿玩家。"
         )
 
     # Disclosure table — KP knows everything, may only tell the player what's
@@ -1662,7 +2484,7 @@ def assemble_context(state: GMState) -> GMState:
 
     # Available exits — let the KP decide movement (LLM-driven, not keyword code).
     _exits_blk = _build_exits_block(
-        world.get("scenes", {}).get(current_scene_id, {}), world)
+        world.get("scenes", {}).get(current_scene_id, {}), world, session)
     if _exits_blk:
         parts.append("")
         parts.append(_exits_blk)
@@ -1671,12 +2493,17 @@ def assemble_context(state: GMState) -> GMState:
         # commit the transition via the 〔前往〕 marker so narration & state don't
         # desync. This is NOT keyword-based destination selection — the KP chooses
         # which connected scene fits.
-        _MOVE_INTENT = ("前往", "去", "走向", "走进", "进入", "离开", "出发",
-                        "上山", "下山", "往上", "往前", "往里", "继续前进",
-                        "继续走", "继续爬", "往上爬", "沿着", "穿过", "返回",
-                        "回到", "动身", "启程", "赶路", "前进")
-        _pi_move = state.get("player_input", "") or ""
-        if any(k in _pi_move for k in _MOVE_INTENT):
+        _pi_move = (state.get("player_input", "") or "").lower()
+        if _has_player_move_intent(_pi_move):
+            _selected_destination = state.get("_requested_scene_target", "")
+            if _selected_destination:
+                _selected_name = world.get("scenes", {}).get(
+                    _selected_destination, {}).get("name", _selected_destination)
+                parts.append(
+                    f"【玩家已选择目的地】{_selected_name}"
+                    f"（id: {_selected_destination}）。这是服务器验证过的玩家决定。"
+                    "请叙述前往和抵达过程，不得改去其他场景；无需替玩家重新选择。"
+                )
             parts.append(
                 "【移动提示·重要】玩家这次明确想往别处走（进入/离开/前往某处）。"
                 "请把他的去向对应到上面列出的某个相邻场景——名字不必字面相同，按语义"
@@ -1708,19 +2535,17 @@ def assemble_context(state: GMState) -> GMState:
         "End with an implicit invitation for the player to act, without suggesting specific actions."
     )
 
-    state["context_prompt"] = "\n".join(parts)
-
-    # Trim context if it exceeds the token budget.
-    if len(state["context_prompt"]) > MAX_CONTEXT_CHARS:
-        conv = state.get("conversation_block", "")
-        excess = len(state["context_prompt"]) - MAX_CONTEXT_CHARS
-        if conv and len(conv) > excess + 200:
-            trim_len = max(200, len(conv) - excess - 100)
-            trimmed = conv[:trim_len] + "\n... [trimmed for length]"
-            state["conversation_block"] = trimmed
-            state["context_prompt"] = state["context_prompt"].replace(conv, trimmed, 1)
-        if len(state["context_prompt"]) > MAX_CONTEXT_CHARS:
-            state["context_prompt"] = state["context_prompt"][:MAX_CONTEXT_CHARS - 80] + "\n... [context trimmed to fit budget]"
+    state["context_prompt"] = _fit_context_budget(
+        parts,
+        [
+            (module_description, 200, "left"),
+            (kp_knowledge, 500, "left"),
+            (storyline_block, 800, "left"),
+            (retrieval_layer, 500, "left"),
+            (story_layer, 500, "left"),
+            (state.get("conversation_block", ""), 1200, "right"),
+        ],
+    )
 
     return state
 
@@ -1732,6 +2557,20 @@ def narrate(state: GMState) -> GMState:
     inp = state["player_input"]
     stream_flag = state.get("stream", False)
 
+    if state.get("_npc_selection_required"):
+        count = state.get("_available_npc_count", 0)
+        if count == 0:
+            response = "当前没有可交谈的在场人物。"
+        elif state.get("_npc_target_became_unavailable"):
+            response = "刚才选择的人物当前无法交谈，请重新选择一名在场人物。"
+        else:
+            response = "请先选择一名在场人物作为交谈对象。"
+        response = _prepend_clock_milestones(state, response)
+        if stream_flag:
+            state["gm_stream"] = _wrap_quick_stream(response)
+        state["gm_response"] = response
+        return state
+
     # ── Hard constraint: entity not found → code response, no LLM ──
     not_found = state.get("_entity_not_found", "")
     if not_found:
@@ -1741,9 +2580,11 @@ def narrate(state: GMState) -> GMState:
         # Strip scene-name suffixes like "（开场）" and don't echo the raw target.
         scene_name = _re.sub(r'[（(][^）)]*[）)]', '', scene.get("name", "四周")).strip() or "四周"
         present = []
+        from npc_context import entity_is_player_visible
         for eid in state.get("scene_entities", []):
             ei = state["entity_index"].get(eid, {})
-            if ei.get("type") == "npc":
+            if (ei.get("type") == "npc"
+                    and entity_is_player_visible(eid, state["world"], session)):
                 present.append(ei.get("name", eid))
         response = f"你环顾{scene_name}，并没有看到你要找的人。"
         if present:
@@ -1753,25 +2594,57 @@ def narrate(state: GMState) -> GMState:
         response = _redact_unrevealed_names(response, session, state["entity_index"])
         print(f"[ENGINE] Hard block: '{not_found}' not found, "
               f"code-generated response", flush=True)
+        response = _prepend_clock_milestones(state, response)
+        if stream_flag:
+            state["gm_stream"] = _wrap_quick_stream(response)
+        state["gm_response"] = response
+        return state
+
+    hidden_action = state.get("_hidden_entity_action", "")
+    if hidden_action:
+        response = "你目前并没有发现或持有这样的东西，因此无法执行这个动作。"
+        response = _prepend_clock_milestones(state, response)
+        if stream_flag:
+            state["gm_stream"] = _wrap_quick_stream(response)
+        state["gm_response"] = response
+        return state
+
+    action_block = state.get("_action_block", "")
+    if action_block:
+        response = _prepend_clock_milestones(state, action_block)
+        if stream_flag:
+            state["gm_stream"] = _wrap_quick_stream(response)
+        state["gm_response"] = response
+        return state
+
+    blocked_move = state.get("_blocked_scene_move", "")
+    if blocked_move:
+        response = "从当前位置看不到通往那里的可行路径；你不能直接越过中间区域抵达那里。"
+        response = _prepend_clock_milestones(state, response)
         if stream_flag:
             state["gm_stream"] = _wrap_quick_stream(response)
         state["gm_response"] = response
         return state
 
     try:
-        c = OpenAI(api_key=state["api_key"], base_url=DEEPSEEK_BASE_URL)
-        # Always generate whole (stream=False) so we can redact unrevealed names
-        # BEFORE anything reaches the player; re-wrap as a quick stream if needed.
-        resp = c.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+        # Always generate whole text so unrevealed names can be redacted before
+        # anything reaches the player; re-wrap as a quick stream if needed.
+        content = _generate_narration(
             messages=[
                 {"role": "system", "content": GM_SYSTEM_PROMPT},
                 {"role": "system", "content": ctx},
                 {"role": "user", "content": inp},
             ],
+            api_key=state["api_key"],
             temperature=0.5,
             max_tokens=1024,
-            stream=False,
+            kind="turn",
+            metadata={
+                "chat_id": state.get("chat_id", ""),
+                "model": state.get("model", ""),
+                "scene": state.get("session", {}).get(
+                    "player_state", {}).get("current_scene", ""),
+            },
         )
     except Exception as e:
         print(f"[ENGINE] DeepSeek API error: {e}", flush=True)
@@ -1781,13 +2654,15 @@ def narrate(state: GMState) -> GMState:
             state["gm_stream"] = _wrap_quick_stream(error_msg)
         return state
 
-    content = resp.choices[0].message.content or ""
     # Hard backstop (rules over prompts): redact any unrevealed NPC real name the
     # LLM may have slipped, before it reaches the player.
+    content = _redact_unrevealed_entities(content, state["session"], state["world"])
     content = _redact_unrevealed_names(content, state["session"], state["entity_index"])
     # KP-driven movement: if the KP narrated advancing to a connected scene, it
     # emits 〔前往：X〕 — apply it (run_gm_turn does the transition) and strip marker.
     content = _maybe_apply_movement(state, content)
+    content = _reject_uncommitted_movement(state, content)
+    content = _reject_uncommitted_world_mutation(state, content)
     # Dynamic check: the LLM may request a skill check for an uncertain action the
     # module didn't pre-define — arm it (player rolls next) and strip the marker.
     content = _maybe_arm_dynamic_check(state, content)
@@ -1796,6 +2671,7 @@ def narrate(state: GMState) -> GMState:
     state["_trust_signal"] = int(_trust_match.group(1)) if _trust_match else 0
     if _trust_match:
         content = _re.sub(r'\s*〔信任\+\d+〕\s*$', '', content, flags=_re.MULTILINE).rstrip()
+    content = _prepend_clock_milestones(state, content)
     state["gm_response"] = content
     if stream_flag:
         state["gm_stream"] = _wrap_quick_stream(content)
@@ -1815,13 +2691,15 @@ workflow = StateGraph(GMState)
 workflow.add_node("parse", parse_input)
 workflow.add_node("judge", judge)
 workflow.add_node("resolve", resolve_entity)
+workflow.add_node("resolve_action", resolve_action)
 workflow.add_node("assemble", assemble_context)
 workflow.add_node("narrate", narrate)
 
 workflow.set_entry_point("parse")
 workflow.add_conditional_edges("parse", _route_after_parse, {END: END, "judge": "judge"})
 workflow.add_edge("judge", "resolve")
-workflow.add_edge("resolve", "assemble")
+workflow.add_edge("resolve", "resolve_action")
+workflow.add_edge("resolve_action", "assemble")
 workflow.add_edge("assemble", "narrate")
 workflow.add_edge("narrate", END)
 
@@ -1926,6 +2804,18 @@ def run_gm_turn(
         "_luck_consumed": False,
         "_narration_override": None,
         "_san_result": None,
+        "_hidden_entity_action": "",
+        "_blocked_scene_move": "",
+        "_npc_selection_required": False,
+        "_available_npc_count": 0,
+        "_trust_signal": 0,
+        "_clock_events": [],
+        "_npc_target_became_unavailable": False,
+        "action_proposal": {},
+        "action_resolution": {},
+        "_action_events": [],
+        "_action_block": "",
+        "_requested_scene_target": "",
     }
 
     # ── Opening narration ──
@@ -2017,19 +2907,23 @@ def run_gm_turn(
             )
 
         try:
-            c = OpenAI(api_key=effective_key, base_url=DEEPSEEK_BASE_URL)
-            # Generate whole (stream=False) so unrevealed names can be redacted
-            # before the opening reaches the player; re-wrap as a quick stream.
-            resp = c.chat.completions.create(
-                model=DEEPSEEK_MODEL,
+            # Generate whole text so unrevealed names can be redacted before the
+            # opening reaches the player; re-wrap as a quick stream if needed.
+            opening = _generate_narration(
                 messages=[
                     {"role": "system", "content": GM_SYSTEM_PROMPT},
                     {"role": "system", "content": opening_ctx},
                     {"role": "user", "content": messages[-1].get("content", "开始游戏") if messages else "开始游戏"},
                 ],
+                api_key=effective_key,
                 temperature=0.3,
                 max_tokens=1024,
-                stream=False,
+                kind="opening",
+                metadata={
+                    "chat_id": chat_id,
+                    "model": model,
+                    "scene": first_scene_id,
+                },
             )
         except Exception as e:
             print(f"[ENGINE] Opening narration error: {e}", flush=True)
@@ -2041,14 +2935,36 @@ def run_gm_turn(
                 return _wrap_quick_stream(opening)
             return opening
 
-        opening = resp.choices[0].message.content or scene_desc or scene_name
+        opening = opening or scene_desc or scene_name
+        opening = _redact_unrevealed_entities(opening, session, world)
         opening = _redact_unrevealed_names(opening, session, entity_index)
+        _write_eval_trace(
+            chat_id,
+            1,
+            {
+                "kind": "opening",
+                "model": model,
+                "scene": first_scene_id,
+                "player_input": last_user_msg,
+                "context_prompt": opening_ctx,
+                "gm_response": opening,
+            },
+        )
         write_turn_log(session=session, turn=1, scene=first_scene_id,
                        player_input="[game start]", gm_response=opening)
         save_session(session)
         if stream:
             return _wrap_quick_stream(opening)
         return opening
+
+    # A pending player roll is an unresolved action. Do not let a second chat
+    # action overwrite it, advance clocks, move scenes, or consume a narration
+    # response. The dice endpoint is the only valid continuation.
+    if session.get("pending_check"):
+        response = "请先完成当前待定检定，再进行新的行动。"
+        if stream:
+            return _wrap_quick_stream(response)
+        return response
 
     # ── Run LangGraph ──
     # Movement detection and entity matching both happen inside parse_input node.
@@ -2057,12 +2973,30 @@ def run_gm_turn(
     print(f"[ENGINE] Running LangGraph for turn (scene={session['player_state'].get('current_scene', '')})", flush=True)
     result = gm_agent.invoke(state)
     print(f"[ENGINE] LangGraph done: gm_response_len={len(result.get('gm_response', ''))}, movement={result.get('movement_target')}", flush=True)
+    _write_eval_trace(
+        chat_id,
+        session.get("current_turn", 0) + 1,
+        {
+            "kind": "turn",
+            "model": model,
+            "scene": session.get("player_state", {}).get("current_scene", ""),
+            "player_input": result.get("player_input", ""),
+            "context_prompt": result.get("context_prompt", ""),
+            "gm_response": result.get("gm_response", ""),
+            "movement_target": result.get("movement_target"),
+            "dice_result": result.get("dice_result"),
+            "matched_npc_ids": result.get("_matched_npc_ids", []),
+            "action_proposal": result.get("action_proposal", {}),
+            "action_resolution": result.get("action_resolution", {}),
+            "world_events": result.get("_action_events", []),
+        },
+    )
 
     # ── Handle scene transition (KP-driven via 〔前往：X〕, applied in narrate) ──
     movement_target = result.get("movement_target")
     if movement_target and movement_target in world.get("scenes", {}):
         old_scene = session["player_state"].get("current_scene", "")
-        session["player_state"]["current_scene"] = movement_target
+        commit_scene_transition(session, world, movement_target)
         new_scene = world["scenes"][movement_target]
         scene_name = new_scene.get("name", movement_target)
         scene_desc = new_scene.get("desc", "") or new_scene.get("description", "")
@@ -2095,6 +3029,24 @@ def run_gm_turn(
                 _comp.append(_eid)
                 print(f"[ENGINE] Companion joined (narration shows following): {_eid}", flush=True)
 
+        # An explicit NPC selection is scoped to physical presence. Keep it for
+        # a companion who actually followed; otherwise clear it immediately so
+        # later pronouns cannot address someone left in the previous scene.
+        _selected = session.get("selected_npc_id")
+        if _selected:
+            _roster = list_interactable_npcs(
+                session, world, scene_index, entity_index)
+            if reconcile_interaction_target(session, _roster):
+                print(f"[ENGINE] NPC target cleared on scene transition: {_selected}", flush=True)
+        _selected_object = session.get("selected_object_id")
+        if _selected_object:
+            _objects = list_interactable_objects(
+                session, world, scene_index, entity_index)
+            if reconcile_object_target(session, _objects):
+                print(
+                    f"[ENGINE] Object target cleared on scene transition: "
+                    f"{_selected_object}", flush=True)
+
         msgs = [m for m in messages]
         user_text = next((m.get("content", "") for m in reversed(msgs) if m.get("role") == "user"), "")
 
@@ -2105,6 +3057,7 @@ def run_gm_turn(
         if not kp_narration:
             _clean_dest = _re.sub(r'[（(][^）)]*[）)]', '', scene_name).strip() or scene_name
             kp_narration = f"你们来到了{_clean_dest}。\n\n{scene_desc}"
+        kp_narration = _redact_unrevealed_entities(kp_narration, session, world)
         kp_narration = _redact_unrevealed_names(kp_narration, session, entity_index)
 
         write_turn_log(
@@ -2114,6 +3067,7 @@ def run_gm_turn(
             player_input=user_text,
             gm_response=kp_narration,
             scene_transition=movement_target,
+            world_events=result.get("_action_events", []),
         )
 
         # Compress story from the scene we're leaving
@@ -2131,7 +3085,7 @@ def run_gm_turn(
         _extract_arrival_traits(session, movement_target, scene_name, scene_desc,
                                 "", scene_index, entity_index, world, effective_key)
 
-        session["current_turn"] = session.get("current_turn", 0) + 1
+        # write_turn_log already advances current_turn to this movement turn.
         save_session(session)
         print(f"[ENGINE] Scene transition: {old_scene} → {movement_target}", flush=True)
 
@@ -2165,6 +3119,7 @@ def run_gm_turn(
         new_flags=turn_summary.get("new_flags"),
         items_obtained=turn_summary.get("items_obtained"),
         items_used=turn_summary.get("items_used"),
+        world_events=result.get("_action_events", []),
     )
 
     # Extract entity memories from this turn
@@ -2177,13 +3132,15 @@ def run_gm_turn(
     # Prefer the NPC IDs already resolved in assemble_context (uses full reference
     # resolution including aliases/descriptors). Fall back to keyword_match only
     # if the graph didn't propagate the field.
-    matched_npc_ids = result.get("_matched_npc_ids") or []
-    if not matched_npc_ids:
+    matched_npc_ids = result.get("_matched_npc_ids")
+    if matched_npc_ids is None:
         player_input_text = result.get("player_input", "")
         current_scene_eids = get_entities_in_scene(
             session["player_state"].get("current_scene", ""), scene_index
         )
         matched_npc_ids = keyword_match(player_input_text, current_scene_eids, entity_index)
+    else:
+        matched_npc_ids = list(matched_npc_ids)
     if matched_npc_ids:
         from npc_state import add_interaction
         npc_states = session.get("npc_states", {})

@@ -22,6 +22,7 @@ class TurnLog(TypedDict, total=False):
     items_obtained: list[str]
     items_used: list[str]
     scene_transition: Optional[str]      # None if no movement
+    world_events: list[dict]             # validated fact events committed this turn
 
 
 # ── Entity Memory ──────────────────────────────────────────────
@@ -93,6 +94,19 @@ class Session(TypedDict, total=False):
     completed_beats: list[str]           # beat IDs already completed
     unlocked_scenes: list[str]           # scenes explicitly unlocked by beat progression
     companions: list[str]                # NPC entity ids currently travelling with the player
+    selected_npc_id: Optional[str]       # explicit frontend-selected dialogue target
+    player_aliases: dict[str, str]       # normalized player label -> stable entity id
+    entity_mentions: list[dict]          # discourse history, independent from NPC state
+    conversation_focus: dict[str, str]   # entity type -> focused entity id
+    clocks: dict[str, int]               # module-defined action clocks
+    entity_facts: dict[str, dict]         # orthogonal location/knowledge/condition facts
+    world_events: list[dict]              # immutable authoritative event log
+    world_event_seq: int                  # monotonic event sequence
+    inventory_entity_ids: list[str]       # stable ids; player_state.inventory is display-only
+    selected_object_id: Optional[str]     # optional frontend-selected object target
+    discovered_scene_ids: list[str]       # player-known scenes, including visible exits
+    visited_scene_ids: list[str]          # scenes the player has physically entered
+    selected_scene_id: Optional[str]      # explicit frontend-selected reachable destination
 
 
 # ── Entity State Definition (world book level) ─────────────────
@@ -269,4 +283,17 @@ def create_session(chat_id: str, model: str) -> Session:
         completed_beats=[],
         unlocked_scenes=[],
         companions=[],
+        selected_npc_id=None,
+        player_aliases={},
+        entity_mentions=[],
+        conversation_focus={},
+        clocks={},
+        entity_facts={},
+        world_events=[],
+        world_event_seq=0,
+        inventory_entity_ids=[],
+        selected_object_id=None,
+        discovered_scene_ids=[],
+        visited_scene_ids=[],
+        selected_scene_id=None,
     )

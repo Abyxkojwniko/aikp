@@ -6,7 +6,7 @@ import { getMessageTimeStamp } from '../../RossAscends-mods.js';
 // eventSource, event_types, saveSettingsDebounced accessed via getContext() to avoid
 // circular dependency with script.js which would break slash command registration.
 
-console.log('[AIKP] Extension v2.0.0 loaded');
+console.log('[AIKP] Extension v2.3.0 loaded');
 
 // -- Slash Commands --
 // ST slash command callbacks MUST call sendSystemMessage() / toastr to display
@@ -119,7 +119,7 @@ SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             const total = d20 + sv;
             const verdict = d20 === 20 ? 'CRITICAL SUCCESS!' :
                 d20 === 1 ? 'CRITICAL FAILURE!' :
-                total >= dc ? 'SUCCESS' : 'FAILURE';
+                    total >= dc ? 'SUCCESS' : 'FAILURE';
             return sysMsg(`${skill} check: d20=${d20} + ${sv} = ${total} (DC=${dc}) -> ${verdict}`);
         } catch (e) { return sysMsg('Error: ' + e.message); }
     },
@@ -148,9 +148,43 @@ SlashCommandParser.addCommandObject(SlashCommand.fromProps({
 }));
 
 // -- Constants -------------------------------------------------
-const BACKEND_URL = 'http://localhost:8001';
+const BACKEND_CANDIDATES = ['http://localhost:8001', 'http://localhost:8002'];
+let BACKEND_URL = BACKEND_CANDIDATES[0];
 let _cachedChatId = null;
 let _aikpActive = false;
+
+async function selectBackend() {
+    let firstHealthy = '';
+    let guardedBackend = '';
+    let sceneBackend = '';
+    for (const candidate of BACKEND_CANDIDATES) {
+        try {
+            const response = await fetch(`${candidate}/health`);
+            if (!response.ok) continue;
+            firstHealthy ||= candidate;
+            const health = await response.json();
+            if ((health.features || []).includes('explicit_scene_target')) {
+                sceneBackend = candidate;
+                break;
+            }
+            if ((health.features || []).includes('npc_lifecycle_guard')) {
+                guardedBackend ||= candidate;
+            }
+        } catch (_) {
+            // Try the next local port.
+        }
+    }
+    BACKEND_URL = sceneBackend || guardedBackend || firstHealthy || BACKEND_URL;
+
+    const configuredUrl = String($('#custom_api_url_text').val() || '');
+    const isKnownAikpUrl = configuredUrl.includes(':8001') ||
+        configuredUrl.includes(':8002');
+    if (isKnownAikpUrl && configuredUrl !== BACKEND_URL) {
+        $('#custom_api_url_text').val(BACKEND_URL).trigger('input');
+    }
+    _aikpActive = false;
+    return BACKEND_URL;
+}
 
 // -- AIKP Mode Detection --------------------------------------
 
@@ -160,7 +194,8 @@ function isAikpMode() {
         const url = $('#custom_api_url_text').val() || '';
         const source = $('#chat_completion_source').val() || '';
         _aikpActive = source === 'custom' &&
-            (url.includes('localhost:8001') || url.includes('127.0.0.1:8001'));
+            (url.includes('localhost:8002') || url.includes('127.0.0.1:8002') ||
+                url.includes('localhost:8001') || url.includes('127.0.0.1:8001'));
     } catch (_) {
         _aikpActive = false;
     }
@@ -176,7 +211,9 @@ async function getChatId() {
     try {
         const sel = ($('#custom_model_id').val() || $('#model_custom_select').val() || '').trim();
         if (sel) return `${sel}-session`;
-    } catch (_) {}
+    } catch (_) {
+        // Fall through to the cached or default id.
+    }
     if (_cachedChatId) return _cachedChatId;
     try {
         const r = await fetch(`${BACKEND_URL}/v1/models`);
@@ -202,6 +239,223 @@ async function fetchWorlds() {
         if (r.ok) return await r.json();
     } catch (e) { console.error('[AIKP] fetchWorlds:', e.message); }
     return [];
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll('\'', '&#039;');
+}
+
+async function fetchNpcRoster() {
+    try {
+        const chatId = await getChatId();
+        const r = await fetch(`${BACKEND_URL}/api/session/${encodeURIComponent(chatId)}/npcs`);
+        if (r.ok) return await r.json();
+    } catch (e) { console.error('[AIKP] fetchNpcRoster:', e.message); }
+    return null;
+}
+
+async function setNpcTarget(npcId) {
+    try {
+        const chatId = await getChatId();
+        const r = await fetch(`${BACKEND_URL}/api/session/${encodeURIComponent(chatId)}/npc-target`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ npc_id: npcId || null }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || 'NPC selection failed');
+        renderNpcRoster({ selected_npc_id: data.selected_npc_id, npcs: data.npcs || [] });
+    } catch (e) {
+        toastr.error(e.message, 'AIKP');
+        updateNpcRoster();
+    }
+}
+
+async function fetchObjectRoster() {
+    try {
+        const chatId = await getChatId();
+        const r = await fetch(`${BACKEND_URL}/api/session/${encodeURIComponent(chatId)}/objects`);
+        if (r.ok) return await r.json();
+    } catch (e) { console.error('[AIKP] fetchObjectRoster:', e.message); }
+    return null;
+}
+
+async function setObjectTarget(objectId) {
+    try {
+        const chatId = await getChatId();
+        const r = await fetch(`${BACKEND_URL}/api/session/${encodeURIComponent(chatId)}/object-target`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ object_id: objectId || null }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || 'Object selection failed');
+        renderObjectRoster({
+            selected_object_id: data.selected_object_id,
+            objects: data.objects || [],
+        });
+    } catch (e) {
+        toastr.error(e.message, 'AIKP');
+        updateObjectRoster();
+    }
+}
+
+async function fetchSceneRoster() {
+    try {
+        const chatId = await getChatId();
+        const r = await fetch(`${BACKEND_URL}/api/session/${encodeURIComponent(chatId)}/scenes`);
+        if (r.ok) return await r.json();
+    } catch (e) { console.error('[AIKP] fetchSceneRoster:', e.message); }
+    return null;
+}
+
+async function setSceneTarget(sceneId) {
+    try {
+        const chatId = await getChatId();
+        const r = await fetch(`${BACKEND_URL}/api/session/${encodeURIComponent(chatId)}/scene-target`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scene_id: sceneId || null }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || 'Scene selection failed');
+        renderSceneRoster({
+            selected_scene_id: data.selected_scene_id,
+            scenes: data.scenes || [],
+        });
+    } catch (e) {
+        toastr.error(e.message, 'AIKP');
+        updateSceneRoster();
+    }
+}
+
+function renderSceneRoster(data) {
+    const panel = $('#aikp_scene_roster');
+    const list = $('#aikp_scene_list');
+    if (!panel.length || !list.length) return;
+    const scenes = data?.scenes || [];
+    const selected = data?.selected_scene_id || null;
+    if (!scenes.length) {
+        list.html('<div class="aikp-npc-empty">当前没有可见出口</div>');
+    } else {
+        list.html(scenes.map(scene => {
+            const active = scene.id === selected;
+            const suffix = scene.visited ? ' · 曾到访' : '';
+            const title = scene.exit_label || scene.label;
+            return `<button type="button" class="aikp-npc-option aikp-scene-option${active ? ' active' : ''}" data-scene-id="${escapeHtml(scene.id)}" aria-pressed="${active}" title="${escapeHtml(title)}">
+                <i class="fa-solid ${active ? 'fa-location-dot' : (scene.visited ? 'fa-arrow-rotate-left' : 'fa-route')}"></i>
+                <span>${escapeHtml(scene.label)}${suffix}</span>
+            </button>`;
+        }).join(''));
+    }
+    $('#aikp_scene_clear').prop('disabled', !selected);
+    panel.toggle(isAikpMode());
+}
+
+async function updateSceneRoster() {
+    const panel = $('#aikp_scene_roster');
+    if (!isAikpMode()) {
+        panel.hide();
+        return;
+    }
+    const roster = await fetchSceneRoster();
+    if (roster) {
+        renderSceneRoster(roster);
+    } else {
+        renderSceneRoster({ selected_scene_id: null, scenes: [] });
+        panel.hide();
+    }
+}
+
+function renderObjectRoster(data) {
+    const panel = $('#aikp_object_roster');
+    const list = $('#aikp_object_list');
+    if (!panel.length || !list.length) return;
+    const objects = data?.objects || [];
+    const selected = data?.selected_object_id || null;
+    const icons = {
+        door: 'fa-door-open',
+        container: 'fa-box-open',
+        clue: 'fa-magnifying-glass',
+        document: 'fa-file-lines',
+        item: 'fa-cube',
+    };
+    if (!objects.length) {
+        list.html('<div class="aikp-npc-empty">当前没有可交互对象</div>');
+    } else {
+        list.html(objects.map(object => {
+            const active = object.id === selected;
+            const carried = object.location?.kind === 'inventory';
+            const icon = active ? 'fa-hand-pointer' : (icons[object.type] || 'fa-cube');
+            const title = (object.capabilities || []).join(', ');
+            return `<button type="button" class="aikp-npc-option aikp-object-option${active ? ' active' : ''}" data-object-id="${escapeHtml(object.id)}" aria-pressed="${active}" title="${escapeHtml(title)}">
+                <i class="fa-solid ${icon}"></i>
+                <span>${escapeHtml(object.label)}${carried ? ' · 背包' : ''}</span>
+            </button>`;
+        }).join(''));
+    }
+    $('#aikp_object_clear').prop('disabled', !selected);
+    panel.toggle(isAikpMode());
+}
+
+async function updateObjectRoster() {
+    const panel = $('#aikp_object_roster');
+    if (!isAikpMode()) {
+        panel.hide();
+        return;
+    }
+    const roster = await fetchObjectRoster();
+    if (roster) {
+        renderObjectRoster(roster);
+    } else {
+        renderObjectRoster({ selected_object_id: null, objects: [] });
+        panel.hide();
+    }
+}
+
+function renderNpcRoster(data) {
+    const panel = $('#aikp_npc_roster');
+    const list = $('#aikp_npc_list');
+    if (!panel.length || !list.length) return;
+    const npcs = data?.npcs || [];
+    const selected = data?.selected_npc_id || null;
+    if (!npcs.length) {
+        list.html('<div class="aikp-npc-empty">当前没有可交谈人物</div>');
+    } else {
+        list.html(npcs.map(npc => {
+            const active = npc.id === selected;
+            return `<button type="button" class="aikp-npc-option${active ? ' active' : ''}" data-npc-id="${escapeHtml(npc.id)}" aria-pressed="${active}">
+                <i class="fa-solid ${active ? 'fa-comment-dots' : 'fa-user'}"></i>
+                <span>${escapeHtml(npc.label)}</span>
+            </button>`;
+        }).join(''));
+    }
+    $('#aikp_npc_clear').prop('disabled', !selected);
+    panel.toggle(isAikpMode());
+}
+
+async function updateNpcRoster() {
+    const panel = $('#aikp_npc_roster');
+    if (!isAikpMode()) {
+        panel.hide();
+        $('#aikp_object_roster').hide();
+        $('#aikp_scene_roster').hide();
+        return;
+    }
+    const roster = await fetchNpcRoster();
+    if (roster) {
+        renderNpcRoster(roster);
+    } else {
+        renderNpcRoster({ selected_npc_id: null, npcs: [] });
+        panel.hide();
+    }
+    await updateObjectRoster();
+    await updateSceneRoster();
 }
 
 // -- Refresh ST Model List -------------------------------------
@@ -264,9 +518,22 @@ function onPromptReady(data) {
 // -- Top Bar State Display -------------------------------------
 
 async function updateStatusBar() {
-    if (!isAikpMode()) return;
+    if (!isAikpMode()) {
+        $('#aikp_npc_roster').hide();
+        $('#aikp_object_roster').hide();
+        $('#aikp_scene_roster').hide();
+        return;
+    }
     const session = await fetchSession();
-    if (!session) return;
+    if (!session) {
+        renderNpcRoster({ selected_npc_id: null, npcs: [] });
+        renderObjectRoster({ selected_object_id: null, objects: [] });
+        renderSceneRoster({ selected_scene_id: null, scenes: [] });
+        $('#aikp_npc_roster').hide();
+        $('#aikp_object_roster').hide();
+        $('#aikp_scene_roster').hide();
+        return;
+    }
     const ps = session.player_state || {};
     const sceneName = ps.current_scene_name || ps.current_scene || '?';
     const name = ps.name || '调查员';
@@ -305,6 +572,7 @@ async function updateStatusBar() {
             dice.attr('title', '掷骰（现在没有待掷的检定）').removeClass('aikp-dice-active');
         }
     }
+    await updateNpcRoster();
 }
 
 // Player clicks the dice → backend rolls the pending check and returns the result.
@@ -357,7 +625,7 @@ async function renderWorldPanel() {
 }
 
 // Expose global functions for button onclick handlers
-window._aikp_selectWorld = function(worldId) {
+window._aikp_selectWorld = function (worldId) {
     try {
         $('#custom_model_id').val(worldId).trigger('input');
         $('#model_custom_select').val(worldId).trigger('change');
@@ -368,7 +636,7 @@ window._aikp_selectWorld = function(worldId) {
     }
 };
 
-window._aikp_deleteWorld = async function(worldId) {
+window._aikp_deleteWorld = async function (worldId) {
     if (!confirm(`Delete world book "${worldId}"? This cannot be undone.`)) return;
     try {
         const r = await fetch(`${BACKEND_URL}/api/worlds/${worldId}`, { method: 'DELETE' });
@@ -414,7 +682,7 @@ async function uploadModule(file) {
                 toastr.error(
                     'No extractable text found in PDF. If this is a scanned document, try converting to text first.',
                     'AIKP',
-                    { timeOut: 8000 }
+                    { timeOut: 8000 },
                 );
                 return;
             }
@@ -498,14 +766,16 @@ async function pollParse(uploadId, filename) {
                     toastr.success(
                         `"${d.world_name}" ready! (${d.scene_count} scenes, ${d.entity_count} entities)`,
                         'AIKP',
-                        { timeOut: 10000 }
+                        { timeOut: 10000 },
                     );
                     // Auto-switch to new world book
                     try {
                         $('#custom_model_id').val(d.world_name).trigger('input');
                         $('#model_custom_select').val(d.world_name).trigger('change');
                         _cachedChatId = null;
-                    } catch (_) {}
+                    } catch (_) {
+                        // Model selectors vary across SillyTavern versions.
+                    }
                     refreshModelList();
                     renderWorldPanel();
                     resolve();
@@ -643,6 +913,63 @@ function renderUploadUI() {
     const diceButton = $('<div id="aikp_dice_button" title="掷骰（轮到检定时会高亮）">🎲</div>');
     $(document.body).append(diceButton);
     diceButton.on('click', rollPendingCheck);
+
+    const npcRoster = $(`
+        <section id="aikp_npc_roster" aria-label="交谈对象" style="display:none">
+            <div class="aikp-npc-header">
+                <span><i class="fa-solid fa-comments"></i> 交谈对象</span>
+                <button type="button" id="aikp_npc_clear" class="aikp-icon-button" title="取消选择" aria-label="取消选择" disabled>
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+            <div id="aikp_npc_list" class="aikp-npc-list"></div>
+        </section>
+    `);
+    $(document.body).append(npcRoster);
+    npcRoster.on('click', '.aikp-npc-option', function () {
+        const id = String($(this).data('npc-id') || '');
+        const isActive = $(this).hasClass('active');
+        setNpcTarget(isActive ? null : id);
+    });
+    $('#aikp_npc_clear').on('click', () => setNpcTarget(null));
+
+    const objectRoster = $(`
+        <section id="aikp_object_roster" aria-label="可交互对象" style="display:none">
+            <div class="aikp-npc-header">
+                <span><i class="fa-solid fa-shapes"></i> 可交互对象</span>
+                <button type="button" id="aikp_object_clear" class="aikp-icon-button" title="取消选择" aria-label="取消选择" disabled>
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+            <div id="aikp_object_list" class="aikp-npc-list"></div>
+        </section>
+    `);
+    $(document.body).append(objectRoster);
+    objectRoster.on('click', '.aikp-object-option', function () {
+        const id = String($(this).data('object-id') || '');
+        const isActive = $(this).hasClass('active');
+        setObjectTarget(isActive ? null : id);
+    });
+    $('#aikp_object_clear').on('click', () => setObjectTarget(null));
+
+    const sceneRoster = $(`
+        <section id="aikp_scene_roster" aria-label="可前往场景" style="display:none">
+            <div class="aikp-npc-header">
+                <span><i class="fa-solid fa-map-location-dot"></i> 可前往场景</span>
+                <button type="button" id="aikp_scene_clear" class="aikp-icon-button" title="取消选择" aria-label="取消选择" disabled>
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+            <div id="aikp_scene_list" class="aikp-npc-list"></div>
+        </section>
+    `);
+    $(document.body).append(sceneRoster);
+    sceneRoster.on('click', '.aikp-scene-option', function () {
+        const id = String($(this).data('scene-id') || '');
+        const isActive = $(this).hasClass('active');
+        setSceneTarget(isActive ? null : id);
+    });
+    $('#aikp_scene_clear').on('click', () => setSceneTarget(null));
     statusToggle.on('click', async () => {
         if (statusPanel.is(':visible')) {
             statusPanel.hide();
@@ -656,18 +983,27 @@ function renderUploadUI() {
 
     // Initial load
     renderWorldPanel();
+    updateNpcRoster();
 }
 
 // -- Extension Init --------------------------------------------
 
 export function init() {
-    console.log('[AIKP] init() - AIKP GM Engine v2.0.0');
+    console.log('[AIKP] init() - AIKP GM Engine v2.3.0');
 
     // Initialize settings
     extension_settings.aikp = extension_settings.aikp || {};
     if (extension_settings.aikp.guideEnabled === undefined) {
         extension_settings.aikp.guideEnabled = true;
     }
+
+    // Prefer a backend that advertises the lifecycle guard. This keeps 8001 as
+    // the portable default while allowing a current process on 8002 to replace
+    // a stale desktop-hosted 8001 automatically.
+    selectBackend().then(() => {
+        handleConflicts();
+        updateNpcRoster();
+    });
 
     // Handle conflicting extensions
     handleConflicts();
@@ -679,6 +1015,7 @@ export function init() {
     ctx.eventSource.on(ctx.eventTypes.CHATCOMPLETION_SOURCE_CHANGED, () => {
         _aikpActive = false; // Re-evaluate on next isAikpMode() call
         handleConflicts();
+        updateNpcRoster();
     });
     ctx.eventSource.on(ctx.eventTypes.CHAT_CHANGED, () => {
         _cachedChatId = null;
@@ -699,7 +1036,9 @@ export function init() {
             console.log('[AIKP] Removing old Data Bank monkey-patch');
             attachments.push = Array.prototype.push;
         }
-    } catch (_) {}
+    } catch (_) {
+        // Older SillyTavern versions may not expose attachment settings.
+    }
 
     console.log('[AIKP] Ready');
 }

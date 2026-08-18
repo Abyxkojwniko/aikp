@@ -75,6 +75,7 @@ def write_turn_log(
     items_obtained: Optional[list] = None,
     items_used: Optional[list] = None,
     scene_transition: Optional[str] = None,
+    world_events: Optional[list] = None,
 ) -> TurnLog:
     entry: TurnLog = TurnLog(
         turn=turn,
@@ -89,6 +90,7 @@ def write_turn_log(
         items_obtained=items_obtained or [],
         items_used=items_used or [],
         scene_transition=scene_transition,
+        world_events=world_events or [],
     )
     session.setdefault("turn_log", []).append(entry)
     session["current_turn"] = turn
@@ -164,13 +166,24 @@ def compute_state_snapshot(
         f"Inventory: {', '.join(ps.get('inventory', [])) or 'empty'}"
     )
     lines.append(f"Plot phase: {plot_phase}")
+    for clock_id, value in session.get("clocks", {}).items():
+        definition = world.get("action_clocks", {}).get(clock_id, {})
+        lines.append(f"{definition.get('name', clock_id)}: {value}")
 
-    # Entities in current scene
-    scene_entity_ids = scene_index.get(current_scene_id, [])
-    if scene_entity_ids:
+    # Player-visible entities in the current scene. Hidden clues still exist in
+    # deterministic state and KP-only source context, but naming them here leaks
+    # their existence before a successful search/check.
+    from npc_context import entity_is_player_visible
+    from world_state import scene_entity_ids
+    visible_entity_ids = [
+        eid for eid in scene_entity_ids(
+            session, world, scene_index, current_scene_id)
+        if entity_is_player_visible(eid, world, session)
+    ]
+    if visible_entity_ids:
         lines.append("")
-        lines.append("Entities here:")
-        for eid in scene_entity_ids:
+        lines.append("Player-visible entities here:")
+        for eid in visible_entity_ids:
             einfo = entity_index.get(eid, {})
             etype = einfo.get("type", "?")
             ename = einfo.get("name", eid)
@@ -457,6 +470,22 @@ def initialize_session_from_world(session: Session, world: dict) -> Session:
     # Initialize entity states to their initial_state
     for eid, entity in entities.items():
         session["entity_states"][eid] = entity.get("initial_state", "default")
+
+    from world_state import ensure_fact_state
+    ensure_fact_state(session, world)
+    session["discovered_scene_ids"] = []
+    session["visited_scene_ids"] = []
+    session["selected_scene_id"] = None
+    from scene_system import ensure_scene_state
+    ensure_scene_state(session, world)
+
+    # Module clocks are separate from chat turns. Their increments are driven
+    # by explicit action-cost tables in the world book.
+    session["clocks"] = {
+        clock_id: int(clock.get("initial", 0))
+        for clock_id, clock in world.get("action_clocks", {}).items()
+        if isinstance(clock, dict)
+    }
 
     # Build NPC states from world book entities (merge same-name NPCs)
     session["npc_states"] = merge_npcs(world)

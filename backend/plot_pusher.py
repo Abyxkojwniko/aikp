@@ -99,16 +99,15 @@ def generate_push(session: dict, scene_index: dict[str, list[str]],
             if topic not in revealed and trust >= trust_req:
                 return f"{name}似乎欲言又止，瞥了{data.get('hint_text', '你')}一眼。"
 
-    # Priority 2: Undiscovered entity
+    # Priority 2: Undiscovered entity. Never name it: the nudge should prompt a
+    # search, not perform the discovery or tell the narration model what to leak.
     entity_states = session.get("entity_states", {})
     other_ids = [eid for eid in scene_entities
                  if entity_index.get(eid, {}).get("type") != "npc"]
     for eid in other_ids:
         state = entity_states.get(eid, "default")
         if state in ("default", "hidden", "present", "unknown"):
-            einfo = entity_index.get(eid, {})
-            name = einfo.get("name", eid)
-            return f"你注意到{name}似乎有什么不同寻常之处。"
+            return "环境里似乎还有尚未留意到的细节；只给出不指向具体物件的感官暗示。"
 
     # Priority 3: Suggest scene transition
     scenes = world.get("scenes", {})
@@ -116,11 +115,11 @@ def generate_push(session: dict, scene_index: dict[str, list[str]],
     exits = scene.get("exits", {})
     if isinstance(exits, dict) and exits:
         exit_names = list(exits.keys())
-        return f"天色不早了。或许该{exit_names[0]}了。"
+        return f"若当前调查确实停滞，可用场景内已有动静自然提醒玩家留意「{exit_names[0]}」方向。"
     elif isinstance(exits, list) and exits:
         ts = scenes.get(exits[0], {})
         target_name = ts.get("name", exits[0])
-        return f"天色不早了。或许该前往{target_name}了。"
+        return f"若当前调查确实停滞，可用场景内已有动静自然提醒玩家留意「{target_name}」方向。"
 
     return ""
 

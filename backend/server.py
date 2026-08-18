@@ -112,6 +112,18 @@ class ChatCompletionResponse(BaseModel):
     usage: Usage = Usage()
 
 
+class NpcTargetRequest(BaseModel):
+    npc_id: Optional[str] = None
+
+
+class ObjectTargetRequest(BaseModel):
+    object_id: Optional[str] = None
+
+
+class SceneTargetRequest(BaseModel):
+    scene_id: Optional[str] = None
+
+
 @app.get("/v1/models")
 def list_models():
     models = []
@@ -218,7 +230,24 @@ async def chat_completions(req: ChatCompletionRequest, fast_request: Request):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "features": [
+            "explicit_npc_target",
+            "npc_lifecycle_guard",
+            "deterministic_action_clock",
+            "roll_outcome_clock",
+            "pending_roll_guard",
+            "fact_event_world_state",
+            "explicit_object_target",
+            "closed_world_action_planner",
+            "explicit_scene_target",
+            "source_grounded_scene_recovery",
+            "source_marker_entity_recovery",
+            "committed_world_mutation_guard",
+            "authored_aggressive_branch",
+        ],
+    }
 
 
 @app.get("/api/worlds")
@@ -352,11 +381,185 @@ def get_session(chat_id: str):
             ps = session.get("player_state")
             if model and isinstance(ps, dict):
                 world = load_world(model)
+                from world_state import ensure_fact_state
+                ensure_fact_state(session, world)
+                from scene_system import ensure_scene_state
+                ensure_scene_state(session, world)
                 sid = ps.get("current_scene", "")
                 ps["current_scene_name"] = world.get("scenes", {}).get(sid, {}).get("name", sid)
         except Exception:
             pass
         return session
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+def _npc_roster_context(chat_id: str):
+    from engine import get_indices, load_world
+
+    session = load_session(chat_id)
+    model = session.get("model", "")
+    if not model:
+        return session, {}, {}, {}
+    world = load_world(model)
+    scene_index, entity_index = get_indices(model)
+    return session, world, scene_index, entity_index
+
+
+@app.get("/api/session/{chat_id}/npcs")
+def get_interactable_npcs(chat_id: str):
+    """Return only player-visible NPCs that may be selected in this scene."""
+    from reference_resolver import (
+        list_interactable_npcs, reconcile_interaction_target)
+
+    try:
+        session, world, scene_index, entity_index = _npc_roster_context(chat_id)
+        roster = list_interactable_npcs(
+            session, world, scene_index, entity_index) if world else []
+        if reconcile_interaction_target(session, roster):
+            from state_manager import save_session
+            save_session(session)
+            try:
+                from engine import _session_cache
+                _session_cache[chat_id] = session
+            except Exception:
+                pass
+        return {
+            "scene_id": session.get("player_state", {}).get("current_scene", ""),
+            "selected_npc_id": session.get("selected_npc_id"),
+            "npcs": roster,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/session/{chat_id}/npc-target")
+def set_interaction_target(chat_id: str, req: NpcTargetRequest):
+    """Select a stable NPC id after server-side presence/visibility validation."""
+    from reference_resolver import list_interactable_npcs, select_interaction_target
+    from state_manager import save_session
+
+    try:
+        session, world, scene_index, entity_index = _npc_roster_context(chat_id)
+        if not world and req.npc_id:
+            raise ValueError("No active world for this session")
+        result = select_interaction_target(
+            session, req.npc_id, world, scene_index, entity_index)
+        save_session(session)
+        try:
+            from engine import _session_cache
+            _session_cache[chat_id] = session
+        except Exception:
+            pass
+        result["npcs"] = list_interactable_npcs(
+            session, world, scene_index, entity_index) if world else []
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/session/{chat_id}/objects")
+def get_interactable_objects(chat_id: str):
+    """Return visible scene objects and objects carried by the player."""
+    from world_state import list_interactable_objects, reconcile_object_target
+
+    try:
+        session, world, scene_index, entity_index = _npc_roster_context(chat_id)
+        roster = list_interactable_objects(
+            session, world, scene_index, entity_index) if world else []
+        if reconcile_object_target(session, roster):
+            from state_manager import save_session
+            save_session(session)
+            try:
+                from engine import _session_cache
+                _session_cache[chat_id] = session
+            except Exception:
+                pass
+        return {
+            "scene_id": session.get("player_state", {}).get("current_scene", ""),
+            "selected_object_id": session.get("selected_object_id"),
+            "objects": roster,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/session/{chat_id}/object-target")
+def set_object_target(chat_id: str, req: ObjectTargetRequest):
+    """Select an optional stable object id after validating accessibility."""
+    from state_manager import save_session
+    from world_state import list_interactable_objects, select_object_target
+
+    try:
+        session, world, scene_index, entity_index = _npc_roster_context(chat_id)
+        if not world and req.object_id:
+            raise ValueError("No active world for this session")
+        result = select_object_target(
+            session, req.object_id, world, scene_index, entity_index)
+        save_session(session)
+        try:
+            from engine import _session_cache
+            _session_cache[chat_id] = session
+        except Exception:
+            pass
+        result["objects"] = list_interactable_objects(
+            session, world, scene_index, entity_index) if world else []
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/session/{chat_id}/scenes")
+def get_available_scenes(chat_id: str):
+    """Return only destinations reachable from the current scene."""
+    from scene_system import list_available_scenes, reconcile_scene_target
+
+    try:
+        session, world, _scene_index, _entity_index = _npc_roster_context(chat_id)
+        roster = list_available_scenes(session, world) if world else []
+        reconcile_scene_target(session, roster)
+        from state_manager import save_session
+        save_session(session)
+        try:
+            from engine import _session_cache
+            _session_cache[chat_id] = session
+        except Exception:
+            pass
+        return {
+            "current_scene_id": session.get("player_state", {}).get(
+                "current_scene", ""),
+            "selected_scene_id": session.get("selected_scene_id"),
+            "scenes": roster,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/session/{chat_id}/scene-target")
+def set_scene_target(chat_id: str, req: SceneTargetRequest):
+    """Select a stable destination after validating current reachability."""
+    from scene_system import list_available_scenes, select_scene_target
+    from state_manager import save_session
+
+    try:
+        session, world, _scene_index, _entity_index = _npc_roster_context(chat_id)
+        if not world and req.scene_id:
+            raise ValueError("No active world for this session")
+        result = select_scene_target(session, req.scene_id, world)
+        save_session(session)
+        try:
+            from engine import _session_cache
+            _session_cache[chat_id] = session
+        except Exception:
+            pass
+        result["scenes"] = list_available_scenes(session, world) if world else []
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -391,7 +594,7 @@ def roll_check(chat_id: str):
     pending check, and return the roll for the UI to show."""
     from state_manager import load_session, save_session
     from dice import resolve_check, coc_skill_check, coc_san_loss
-    from engine import load_world
+    from engine import _apply_pending_clock_outcome, load_world
 
     session = load_session(chat_id)
     pc = session.get("pending_check")
@@ -420,6 +623,17 @@ def roll_check(chat_id: str):
             "verdict": r.get("verdict"),
             "verdict_cn": _VERDICT_CN.get(r.get("verdict", ""), r.get("verdict", "")),
         }
+        clock_event = _apply_pending_clock_outcome(
+            session, world, pc, r.get("verdict", ""))
+        if clock_event:
+            out["clock"] = clock_event
+            narration.append(
+                f"【{clock_event['name']}】{clock_event['old']} → "
+                f"{clock_event['new']}（本次消耗 {clock_event['increment']}）。")
+            narration.extend(
+                milestone["narration"]
+                for milestone in clock_event.get("milestones", [])
+                if milestone.get("narration"))
         if pc.get("_scene_clue_id"):
             # Scene clue check: on success → reveal clue description
             clue_id = pc["_scene_clue_id"]
@@ -427,7 +641,15 @@ def roll_check(chat_id: str):
             clues = world.get("scenes", {}).get(scene_id, {}).get("clues", [])
             clue = next((c for c in clues if c.get("id") == clue_id), {})
             if r.get("success"):
-                session.setdefault("discovered_clues", []).append(clue_id)
+                discovered = session.setdefault("discovered_clues", [])
+                if clue_id not in discovered:
+                    discovered.append(clue_id)
+                if clue_id in world.get("entities", {}):
+                    from world_state import append_world_event
+                    append_world_event(session, world, {
+                        "type": "entity_discovered", "entity_id": clue_id,
+                        "source": "scene_clue_roll",
+                    })
                 clue_desc = clue.get("desc", "")
                 narration.append(f"〈{pc.get('skill')}〉检定：{out['check']['verdict_cn']}。")
                 if clue_desc:
@@ -441,13 +663,19 @@ def roll_check(chat_id: str):
             session["_last_check_result"] = {
                 "skill": pc.get("skill"), "success": r.get("success"),
                 "verdict": r.get("verdict"), "verdict_cn": out["check"]["verdict_cn"],
+                "player_action": pc.get("player_action", ""),
             }
             narration.append(f"〈{pc.get('skill')}〉检定：{out['check']['verdict_cn']}。")
         else:
             tr = state_def.get("on_pass" if r.get("success") else "on_fail", {})
             nxt = tr.get("to_state")
             if nxt:
-                session.setdefault("entity_states", {})[pc["entity_id"]] = nxt
+                old = session.setdefault("entity_states", {}).get(
+                    pc["entity_id"], pc.get("state", "default"))
+                session["entity_states"][pc["entity_id"]] = nxt
+                from world_state import sync_legacy_transition
+                sync_legacy_transition(
+                    session, world, pc["entity_id"], old, nxt)
             if tr.get("narration"):
                 narration.append(tr["narration"])
         print(f"[ENGINE] Player rolled {pc['skill']}: roll={out['check']['roll']} "
@@ -470,7 +698,11 @@ def roll_check(chat_id: str):
         tr = state_def.get("on_pass") or state_def.get("on_trigger") or {}
         nxt = tr.get("to_state")
         if nxt:
-            session.setdefault("entity_states", {})[pc["entity_id"]] = nxt
+            old = session.setdefault("entity_states", {}).get(
+                pc["entity_id"], pc.get("state", "default"))
+            session["entity_states"][pc["entity_id"]] = nxt
+            from world_state import sync_legacy_transition
+            sync_legacy_transition(session, world, pc["entity_id"], old, nxt)
 
     session["pending_check"] = None
     save_session(session)

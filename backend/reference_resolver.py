@@ -6,17 +6,15 @@ The hard problem: players refer to NPCs by name ("尾金星杉"), by description
 Static parser-time aliases can never cover the last three — they are produced
 at play time.
 
-Design (closed-world, code-constrains-LLM — see CLAUDE.md invariants):
+Primary design (explicit UI selection):
 
-    player reference X
-      ① O(1) lookup   name / entity-id / player-coined nickname   (lookup_known_reference)
-      ② miss + intent → closed-world LLM sub-query                (llm_resolve_reference)
-            returns one of the REAL scene NPCs, or null
-      ③ null          → caller treats as "not found" (code denial, no narration LLM)
+    current visible NPC roster → player clicks one stable entity id
+      → server validates presence/visibility → session.selected_npc_id
+      → all dialogue binds to that id until clear/switch/scene departure
 
-The LLM sub-query is a *separate* structured call, NOT a paragraph injected into
-the narration prompt. Its output schema only permits {one of the real NPCs | null},
-so inventing a new character is structurally impossible — unlike open narration.
+Deterministic alias/trait resolution remains for non-dialogue compatibility. The
+legacy closed-world LLM helper remains available for old integrations, but the
+runtime dialogue path does not call it.
 """
 
 from __future__ import annotations
@@ -25,6 +23,281 @@ import json
 import re
 
 from npc_context import keyword_match
+
+
+_NON_INTERACTABLE_NPC_STATES = frozenset({
+    "dead", "deceased", "killed", "absent", "departed", "missing",
+    "disappeared", "vanished", "unconscious", "incapacitated", "disabled",
+    "removed", "死亡", "已死亡", "离场", "离开", "失踪", "消失", "已消失",
+    "昏迷", "失去意识", "无法行动",
+})
+
+
+def normalize_reference(value: str) -> str:
+    """Normalize a player-facing reference without destroying CJK content."""
+    return re.sub(r'[\s\W_]+', '', (value or '').lower(), flags=re.UNICODE)
+
+
+def bind_player_alias(session: dict, alias: str, entity_id: str) -> bool:
+    """Bind a player-coined label to a stable entity id."""
+    key = normalize_reference(alias)
+    if len(key) < 2 or not entity_id:
+        return False
+    aliases = session.setdefault("player_aliases", {})
+    if aliases.get(key) == entity_id:
+        return False
+    aliases[key] = entity_id
+    return True
+
+
+def record_entity_mention(session: dict, entity_id: str, label: str = "",
+                          entity_type: str = "npc", turn: int | None = None) -> None:
+    """Record discourse focus separately from mutable NPC gameplay state."""
+    if not entity_id:
+        return
+    turn = session.get("current_turn", 0) if turn is None else turn
+    mentions = session.setdefault("entity_mentions", [])
+    entry = {
+        "entity_id": entity_id,
+        "entity_type": entity_type,
+        "turn": turn,
+        "label": (label or "")[:80],
+    }
+    if not mentions or any(
+        mentions[-1].get(k) != entry[k] for k in ("entity_id", "turn", "label")
+    ):
+        mentions.append(entry)
+        del mentions[:-100]
+    session.setdefault("conversation_focus", {})[entity_type] = entity_id
+
+
+def _known_forms(eid: str, entity: dict, session: dict) -> list[tuple[str, int, str]]:
+    """Return (form, score, reason) for deterministic reference matching."""
+    forms = [
+        (entity.get("name", ""), 100, "canonical_name"),
+        (eid, 100, "entity_id"),
+    ]
+    forms.extend((alias, 92, "module_alias")
+                 for alias in (entity.get("aliases", []) or []))
+    role = re.sub(r'[（(][^）)]*[）)]', '', entity.get("profession", "") or "").strip()
+    if role:
+        forms.append((role, 82, "role"))
+
+    name = entity.get("name", eid)
+    npc_state = session.get("npc_states", {}).get(name, {})
+    dynamic = npc_state.get("dynamic", {}) if isinstance(npc_state, dict) else {}
+    forms.extend((nick, 108, "legacy_player_alias")
+                 for nick in dynamic.get("nicknames", []))
+    forms.extend((trait, 78, "observed_trait")
+                 for trait in dynamic.get("traits", []))
+    return forms
+
+
+def resolve_known_reference(player_input: str, candidate_entity_ids: list[str],
+                            entity_index: dict[str, dict], world: dict,
+                            session: dict, entity_type: str = "npc") -> dict:
+    """Resolve a reference to one visible candidate, or report ambiguity.
+
+    This function resolves identity only. It does not decide what the entity can
+    do, where it moves, or which state transition occurs.
+    """
+    normalized_input = normalize_reference(player_input)
+    candidates = [
+        eid for eid in candidate_entity_ids
+        if entity_index.get(eid, {}).get("type") == entity_type
+    ]
+    if not normalized_input or not candidates:
+        return {"entity_id": None, "ambiguous": [], "reason": "no_candidates"}
+
+    scores: dict[str, tuple[int, str]] = {}
+    player_aliases = session.get("player_aliases", {})
+    for alias, eid in player_aliases.items():
+        if eid in candidates and alias and alias in normalized_input:
+            scores[eid] = (120 + min(len(alias), 20), "player_alias")
+
+    entities = world.get("entities", {})
+    for eid in candidates:
+        entity = entities.get(eid, {})
+        for raw, base, reason in _known_forms(eid, entity, session):
+            form = normalize_reference(str(raw))
+            min_len = 3 if re.search(r'[a-z]', form) else 2
+            if len(form) >= min_len and form in normalized_input:
+                score = base + min(len(form), 20)
+                if score > scores.get(eid, (0, ""))[0]:
+                    scores[eid] = (score, reason)
+
+    # Pronouns and discourse references resolve only through recorded focus and
+    # only when that focused entity remains in the visible candidate set.
+    discourse_words = (
+        "他", "她", "那个人", "那位", "刚才那个", "刚才那位", "之前那个人",
+        "him", "her", "that person", "the one from before",
+    )
+    if any(word in player_input.lower() for word in discourse_words):
+        focus = session.get("conversation_focus", {}).get(entity_type)
+        if focus in candidates and focus not in scores:
+            scores[focus] = (70, "conversation_focus")
+
+    if not scores:
+        return {"entity_id": None, "ambiguous": [], "reason": "no_match"}
+
+    best = max(score for score, _reason in scores.values())
+    winners = sorted(eid for eid, (score, _reason) in scores.items() if score == best)
+    if len(winners) != 1:
+        return {"entity_id": None, "ambiguous": winners, "reason": "tie"}
+    winner = winners[0]
+    return {
+        "entity_id": winner,
+        "ambiguous": [],
+        "reason": scores[winner][1],
+        "score": best,
+    }
+
+
+def _observed_narration(session: dict) -> str:
+    """Recent GM text that was actually shown to the player."""
+    shown = []
+    for turn in session.get("turn_log", [])[-20:]:
+        shown.append(str(turn.get("gm_response", "")))
+    return "\n".join(shown)
+
+
+def _grounded_observable_label(value: str, canonical_name: str,
+                               observed_text: str) -> str:
+    """Accept only non-name labels that occur in player-observable prose."""
+    label = str(value or "").strip()
+    normalized = normalize_reference(label)
+    canonical = normalize_reference(canonical_name)
+    if not normalized or (canonical and canonical in normalized):
+        return ""
+    if normalized not in normalize_reference(observed_text):
+        return ""
+    return label[:80]
+
+
+def _public_npc_label(eid: str, entity: dict,
+                      session: dict) -> tuple[str, bool]:
+    """Return a player-safe roster label and whether the true name is known."""
+    from npc_context import _find_npc_state
+
+    name = entity.get("name", eid)
+    state = _find_npc_state(name, session.get("npc_states", {})) or {}
+    dynamic = state.get("dynamic", {})
+    disclosure = dynamic.get("disclosure", {})
+    if disclosure.get("name"):
+        return name, True
+
+    observed_text = _observed_narration(session)
+    public_label = _grounded_observable_label(
+        entity.get("public_label", ""), name, observed_text)
+    if public_label:
+        return public_label, False
+    traits = [
+        grounded for trait in dynamic.get("traits", [])
+        if (grounded := _grounded_observable_label(trait, name, observed_text))
+    ]
+    if traits:
+        return traits[0], False
+    return "在场人物", False
+
+
+def npc_is_interactable(eid: str, world: dict, session: dict) -> bool:
+    """Return whether a visible NPC is currently capable of conversation."""
+    entity = world.get("entities", {}).get(eid, {})
+    raw_state = session.get("entity_states", {}).get(
+        eid, entity.get("initial_state", "present"))
+    state = str(raw_state or "present").strip().lower()
+    if state in _NON_INTERACTABLE_NPC_STATES:
+        return False
+    # Parser/model-authored world books sometimes qualify lifecycle states as
+    # dead_body, npc-dead, or 已死亡_尸体. Match whole ASCII tokens so "undead"
+    # is not mistaken for "dead", while still accepting common qualified forms.
+    ascii_tokens = set(re.findall(r'[a-z]+', state))
+    if ascii_tokens.intersection(_NON_INTERACTABLE_NPC_STATES):
+        return False
+    return not any(marker in state for marker in (
+        "死亡", "已死亡", "离场", "失踪", "消失", "昏迷", "失去意识", "无法行动"))
+
+
+def list_interactable_npcs(session: dict, world: dict,
+                           scene_index: dict[str, list[str]],
+                           entity_index: dict[str, dict]) -> list[dict]:
+    """Build the closed roster the frontend may offer as dialogue targets."""
+    from npc_context import entity_is_player_visible
+
+    scene_id = session.get("player_state", {}).get("current_scene", "")
+    from world_state import scene_entity_ids
+    candidates = scene_entity_ids(session, world, scene_index, scene_id)
+    for eid in session.get("companions", []):
+        if eid not in candidates:
+            candidates.append(eid)
+
+    roster = []
+    seen = set()
+    entities = world.get("entities", {})
+    for eid in candidates:
+        entity = entities.get(eid, {})
+        if (not isinstance(entity, dict) or entity.get("type") != "npc"
+                or eid in seen
+                or not entity_is_player_visible(eid, world, session)
+                or not npc_is_interactable(eid, world, session)):
+            continue
+        seen.add(eid)
+        label, known_name = _public_npc_label(eid, entity, session)
+        roster.append({
+            "id": eid,
+            "label": label,
+            "known_name": known_name,
+            "selected": eid == session.get("selected_npc_id"),
+        })
+
+    # Duplicate generic roles still need distinct clickable labels. Use only
+    # already-observed traits; otherwise number the roster entries without
+    # inventing appearance details.
+    counts: dict[str, int] = {}
+    for item in roster:
+        counts[item["label"]] = counts.get(item["label"], 0) + 1
+    ordinals: dict[str, int] = {}
+    for item in roster:
+        label = item["label"]
+        if counts[label] > 1:
+            ordinals[label] = ordinals.get(label, 0) + 1
+            item["label"] = f"{label} {ordinals[label]}"
+    return roster
+
+
+def reconcile_interaction_target(session: dict, roster: list[dict]) -> bool:
+    """Clear a selected NPC that is no longer in the authoritative roster.
+
+    This is deliberately based on the already-filtered roster, so death,
+    unconsciousness, departure, concealment, and scene movement all invalidate
+    a stale selection through the same rule.
+    """
+    selected = session.get("selected_npc_id")
+    if not selected or selected in {item["id"] for item in roster}:
+        return False
+    session["selected_npc_id"] = None
+    focus = session.setdefault("conversation_focus", {})
+    if focus.get("npc") == selected:
+        focus.pop("npc", None)
+    return True
+
+
+def select_interaction_target(session: dict, npc_id: str | None, world: dict,
+                              scene_index: dict[str, list[str]],
+                              entity_index: dict[str, dict]) -> dict:
+    """Select or clear a dialogue target after validating the closed roster."""
+    if not npc_id:
+        session["selected_npc_id"] = None
+        session.setdefault("conversation_focus", {}).pop("npc", None)
+        return {"selected_npc_id": None}
+
+    roster = list_interactable_npcs(session, world, scene_index, entity_index)
+    allowed = {item["id"] for item in roster}
+    if npc_id not in allowed:
+        raise ValueError("NPC is not available for conversation in the current scene")
+    session["selected_npc_id"] = npc_id
+    record_entity_mention(session, npc_id, entity_type="npc")
+    return {"selected_npc_id": npc_id}
 
 
 # ── O(1) known-reference lookup (name / id / nickname) ─────────
@@ -47,12 +320,17 @@ def _name_to_scene_eid(name: str, scene_entity_ids: list[str],
 
 def lookup_known_reference(player_input: str, scene_entity_ids: list[str],
                            entity_index: dict[str, dict],
-                           session: dict) -> list[str]:
+                           session: dict, world: dict | None = None) -> list[str]:
     """Deterministic O(1) resolution: exact name/id, then player-coined nicknames.
 
     Returns matched NPC entity ids (possibly several). No LLM, no fuzzy guessing.
     """
-    # 1. exact name / entity-id (existing behavior)
+    if world is not None:
+        result = resolve_known_reference(
+            player_input, scene_entity_ids, entity_index, world, session)
+        return [result["entity_id"]] if result.get("entity_id") else []
+
+    # Legacy compatibility for callers that do not have the world book.
     ids = keyword_match(player_input, scene_entity_ids, entity_index)
     if ids:
         return ids
