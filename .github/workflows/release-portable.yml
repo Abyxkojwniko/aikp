@@ -1,0 +1,65 @@
+name: Release portable Windows bundle
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install archive tooling
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+      - name: Download verified portable runtime
+        run: |
+          mkdir -p dist stage
+          curl -fL --retry 8 --retry-all-errors \
+            -o dist/AIKP-Portable-v0.1.0-win64.zip \
+            https://github.com/Abyxkojwniko/aikp/releases/download/v0.1.0/AIKP-Portable-v0.1.0-win64.zip
+          echo "c179bd0538a7d19f4dcc7238fc4ffe9a459be23bb58e5fe9977bc87265d5333b  dist/AIKP-Portable-v0.1.0-win64.zip" \
+            | sha256sum -c -
+          7z x -bso0 -bsp0 -ostage dist/AIKP-Portable-v0.1.0-win64.zip
+
+      - name: Overlay current AIKP source
+        run: |
+          cp backend/*.py backend/requirements.txt stage/AIKP/backend/
+          rm -f stage/AIKP/backend/_server.log
+          cp Tavern/SillyTavern/public/scripts/extensions/aikp/index.js \
+             Tavern/SillyTavern/public/scripts/extensions/aikp/style.css \
+             Tavern/SillyTavern/public/scripts/extensions/aikp/manifest.json \
+             stage/AIKP/Tavern/SillyTavern/public/scripts/extensions/aikp/
+          cp .env.example README.md LICENSE NOTICE VERSION \
+             启动游戏.bat 停止游戏.bat _aikp_backend.bat \
+             _aikp_frontend.bat _aikp_setup.ps1 start.bat start.ps1 \
+             stage/AIKP/
+          test "$(cat stage/AIKP/VERSION)" = "${GITHUB_REF_NAME}"
+          test "$(find stage/AIKP/models -mindepth 1 -maxdepth 1 | wc -l)" = "1"
+          test ! -e stage/AIKP/.env
+          test ! -e stage/AIKP/backend/_server.log
+
+      - name: Build and verify release archive
+        run: |
+          archive="AIKP-Portable-${GITHUB_REF_NAME}-win64.zip"
+          cd stage
+          7z a -tzip -mx=5 -mmt=on "../dist/${archive}" AIKP
+          cd ../dist
+          7z t -bso0 "${archive}"
+          sha256sum "${archive}" > "${archive}.sha256"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="AIKP-Portable-${GITHUB_REF_NAME}-win64.zip"
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/${archive}" "dist/${archive}.sha256" \
+            --title "AIKP ${GITHUB_REF_NAME} - 便携整合包" \
+            --generate-notes
