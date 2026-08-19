@@ -30,6 +30,26 @@ jobs:
 
       - name: Overlay current AIKP source
         run: |
+          rm -rf stage/AIKP/backend/sessions \
+                 stage/AIKP/backend/uploads \
+                 stage/AIKP/backend/world_book \
+                 stage/AIKP/backend/_chroma \
+                 stage/AIKP/models \
+                 stage/AIKP/evals \
+                 stage/AIKP/tests \
+                 stage/AIKP/docs \
+                 stage/AIKP/Tavern/SillyTavern/tests \
+                 stage/AIKP/Tavern/SillyTavern/data \
+                 stage/AIKP/Tavern/SillyTavern/backups \
+                 stage/AIKP/Tavern/SillyTavern/cache \
+                 stage/AIKP/Tavern/SillyTavern/thumbnails \
+                 stage/AIKP/Tavern/SillyTavern/dist \
+                 stage/AIKP/Tavern/SillyTavern/config.yaml
+          mkdir -p stage/AIKP/backend/sessions \
+                   stage/AIKP/backend/uploads \
+                   stage/AIKP/backend/world_book \
+                   stage/AIKP/models
+          touch stage/AIKP/models/.gitkeep
           cp backend/*.py backend/requirements.txt stage/AIKP/backend/
           rm -f stage/AIKP/backend/_server.log
           cp Tavern/SillyTavern/public/scripts/extensions/aikp/index.js \
@@ -40,10 +60,36 @@ jobs:
              启动游戏.bat 停止游戏.bat _aikp_backend.bat \
              _aikp_frontend.bat _aikp_setup.ps1 start.bat start.ps1 \
              stage/AIKP/
+          find stage/AIKP -type f -name '*.log' -delete
           test "$(cat stage/AIKP/VERSION)" = "${GITHUB_REF_NAME}"
           test "$(find stage/AIKP/models -mindepth 1 -maxdepth 1 | wc -l)" = "1"
           test ! -e stage/AIKP/.env
           test ! -e stage/AIKP/backend/_server.log
+          test ! -e stage/AIKP/backend/_chroma
+          test ! -e stage/AIKP/evals
+          test ! -e stage/AIKP/tests
+          test ! -e stage/AIKP/docs
+          test ! -e stage/AIKP/Tavern/SillyTavern/tests
+          test ! -e stage/AIKP/Tavern/SillyTavern/data
+          test ! -e stage/AIKP/Tavern/SillyTavern/backups
+          test ! -e stage/AIKP/Tavern/SillyTavern/cache
+          test ! -e stage/AIKP/Tavern/SillyTavern/thumbnails
+          test ! -e stage/AIKP/Tavern/SillyTavern/dist
+          test ! -e stage/AIKP/Tavern/SillyTavern/config.yaml
+          test -z "$(find stage/AIKP -type f -name '.env' -print -quit)"
+          test -z "$(find stage/AIKP -type f -name '*.log' -print -quit)"
+          test "$(find stage/AIKP/backend/sessions stage/AIKP/backend/uploads \
+                        stage/AIKP/backend/world_book -type f | wc -l)" = "0"
+          test -z "$(find stage/AIKP -type f \( \
+            -iname '*.pdf' -o -iname '*.doc' -o -iname '*.docx' \
+            -o -iname '*.epub' -o -iname '*.mobi' \
+            -o -iname '*.7z' -o -iname '*.rar' \) -print -quit)"
+          test -z "$(find stage/AIKP -type f -iname '*.zip' \
+            ! -path 'stage/AIKP/tools/python/python*.zip' -print -quit)"
+          test -z "$(find stage/AIKP \
+            -path 'stage/AIKP/tools' -prune -o \
+            -path 'stage/AIKP/Tavern/SillyTavern/node_modules' -prune -o \
+            -type d \( -name tests -o -name evals \) -print -quit)"
 
       - name: Build and verify release archive
         run: |

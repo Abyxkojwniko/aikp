@@ -11,7 +11,7 @@ from typing import TypedDict, Optional, Any, Callable, Iterator
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
-from dice import skill_check, coc_san_loss, resolve_check
+from dice import skill_check, coc_san_loss, resolve_check, is_percentile_system
 from config import (
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
     GM_SYSTEM_PROMPT, WORLD_BOOK_DIR, MAX_CONTEXT_CHARS,
@@ -39,7 +39,8 @@ from reference_resolver import (
     record_entity_mention,
 )
 from action_system import (
-    legacy_state_matches_action, plan_action, validate_action,
+    legacy_action_requirements, legacy_state_matches_action, plan_action,
+    validate_action,
 )
 from world_state import (
     append_world_event, ensure_fact_state, list_interactable_objects,
@@ -677,6 +678,31 @@ def _build_disclosure_table(session: dict, scene_entity_ids: list,
     )
 
 
+def _english_surname(name: str) -> str:
+    parts = name.split()
+    if len(parts) < 2 or parts[0].lower() in {"the", "a", "an"}:
+        return ""
+    # Territorial styles are not surnames. Treating the final token in
+    # "King Uriens of Gorre" as a short personal name corrupts unrelated
+    # place and faction references such as "Knights of Gorre".
+    if "of" in {part.casefold().strip(".,") for part in parts[1:-1]}:
+        return ""
+    surname = parts[-1].strip("'\"")
+    return surname if len(surname) >= 3 and surname.isalpha() else ""
+
+
+def _npc_name_forms(name: str, *, include_english_surname: bool = True) -> list[str]:
+    """Return canonical references whose disclosure must move together."""
+    forms = [name]
+    if len(name) >= 3 and not _re.search(r"[A-Za-z.]", name):
+        forms.append(name[:2])
+    elif include_english_surname:
+        surname = _english_surname(name)
+        if surname:
+            forms.append(surname)
+    return list(dict.fromkeys(forms))
+
+
 def _unlock_names_player_knows(player_input: str, session: dict,
                                allowed_names: set[str] | None = None) -> None:
     """If the player refers to an NPC by their real name or surname, the player
@@ -685,6 +711,12 @@ def _unlock_names_player_knows(player_input: str, session: dict,
     player kept naming someone the disclosure table still thought was hidden)."""
     if not player_input:
         return
+    surname_counts: dict[str, int] = {}
+    for known_name in session.get("npc_states", {}):
+        surname = _english_surname(str(known_name))
+        if surname:
+            surname_counts[surname.casefold()] = (
+                surname_counts.get(surname.casefold(), 0) + 1)
     for name, st in session.get("npc_states", {}).items():
         if not name or len(name) < 2 or not isinstance(st, dict):
             continue
@@ -693,8 +725,14 @@ def _unlock_names_player_knows(player_input: str, session: dict,
         disc = st.setdefault("dynamic", {}).setdefault("disclosure", {})
         if disc.get("name"):
             continue
-        forms = [name] + ([name[:2]] if len(name) >= 3 else [])
-        if any(f in player_input for f in forms):
+        surname = _english_surname(name)
+        forms = _npc_name_forms(
+            name,
+            include_english_surname=bool(
+                surname and surname_counts.get(surname.casefold()) == 1),
+        )
+        if any(_re.search(rf"(?<!\w){_re.escape(f)}(?!\w)", player_input,
+                          _re.IGNORECASE) for f in forms):
             disc["name"] = True
             print(f"[ENGINE] Disclosure: player used name → unlock '{name}'", flush=True)
 
@@ -725,7 +763,35 @@ def _english_self_introduction(text: str, name: str) -> bool:
     ))
 
 
-def _redact_unrevealed_names(text: str, session: dict, entity_index: dict) -> str:
+def _surname_is_public(surname: str, session: dict, world: dict | None) -> bool:
+    """Return whether a surname is already part of player-visible canon."""
+    if not surname or not isinstance(world, dict):
+        return False
+    public_texts = [
+        str(world.get("opening", "")),
+        str(world.get("description", "")),
+    ]
+    visible_scene_ids = {
+        *session.get("visited_scene_ids", []),
+        *session.get("discovered_scene_ids", []),
+    }
+    scenes = world.get("scenes", {})
+    for scene_id in visible_scene_ids:
+        scene = scenes.get(scene_id, {})
+        if not isinstance(scene, dict):
+            continue
+        public_texts.append(str(scene.get("name", "")))
+        if scene_id in session.get("visited_scene_ids", []):
+            exits = scene.get("exits", {})
+            if isinstance(exits, dict):
+                public_texts.extend(str(label) for label in exits)
+    pattern = rf"(?<!\w){_re.escape(surname)}(?!\w)"
+    return any(_re.search(pattern, value, _re.IGNORECASE)
+               for value in public_texts if value)
+
+
+def _redact_unrevealed_names(text: str, session: dict, entity_index: dict,
+                             world: dict | None = None) -> str:
     """Hard backstop (rules over prompts): replace any UNREVEALED NPC real name
     in KP output with a description, so a prompt slip never leaks a name the
     player hasn't earned. KP still gets the name in context for understanding.
@@ -736,6 +802,12 @@ def _redact_unrevealed_names(text: str, session: dict, entity_index: dict) -> st
     if not text:
         return text
     npc_states = session.get("npc_states", {})
+    surname_counts: dict[str, int] = {}
+    for known_name in npc_states:
+        surname = _english_surname(str(known_name))
+        if surname:
+            surname_counts[surname.casefold()] = (
+                surname_counts.get(surname.casefold(), 0) + 1)
     for name, st in npc_states.items():
         if not name or len(name) < 2:
             continue
@@ -751,21 +823,48 @@ def _redact_unrevealed_names(text: str, session: dict, entity_index: dict) -> st
             print(f"[ENGINE] Disclosure: NPC self-introduced → unlock '{name}'", flush=True)
             continue
         traits = dyn.get("traits", [])
-        desc = (traits[0] + "的人") if traits else "那个人"
+        public_labels = [
+            str(entity.get("public_label", "")).strip()
+            for entity in entity_index.values()
+            if (isinstance(entity, dict)
+                and str(entity.get("name", "")) == name
+                and str(entity.get("public_label", "")).strip())
+        ]
+        desc = (
+            public_labels[0] if public_labels
+            else (traits[0] + "的人") if traits else "那个人"
+        )
         # Redact the full name AND the surname prefix — a slip like the short
         # "尾金" (from 尾金星杉) would otherwise leak past full-name matching.
-        forms = [name]
-        if len(name) >= 3 and not _re.search(r'[A-Za-z.]', name):
-            forms.append(name[:2])  # CJK surname (尾金星杉→尾金); skip "Mrs.L" etc.
+        surname = _english_surname(name)
+        forms = _npc_name_forms(
+            name,
+            include_english_surname=bool(
+                surname and surname_counts.get(surname.casefold()) == 1),
+        )
         for form in forms:
-            if form not in text:
+            if (form == surname and form != name
+                    and _surname_is_public(form, session, world)):
+                continue
+            latin_form = bool(_re.search(r"[A-Za-z]", form))
+            pattern = (
+                rf"(?<!\w){_re.escape(form)}(?!\w)"
+                if latin_form else _re.escape(form)
+            )
+            if not _re.search(pattern, text, _re.IGNORECASE if latin_form else 0):
                 continue
             # Title + name → keep just the title (it already identifies them).
             for title in _ROLE_TITLES:
                 text = text.replace(f"{title}{form}", title)
             # Collapse "真名——描述" / "真名（…）" / "真名：" patterns to avoid dupes.
-            text = _re.sub(rf'{_re.escape(form)}\s*[—－·:：、,，]+\s*', desc + "，", text)
-            text = text.replace(form, desc)
+            text = _re.sub(
+                pattern + r'\s*[—－·:：、,，]+\s*', desc + "，", text,
+                flags=_re.IGNORECASE if latin_form else 0,
+            )
+            text = _re.sub(
+                pattern, desc, text,
+                flags=_re.IGNORECASE if latin_form else 0,
+            )
     # Clean up artifacts from substitution so redaction never reads broken:
     #   "那个人人"→"那个人", "那个那个"→"那个", repeated "那个人", "的人的人"→"的人".
     text = _re.sub(r'那个人(?=人)', '那个', text)   # 那个人人 → 那个人
@@ -974,11 +1073,15 @@ _PLAYER_MOVE_INTENT = (
     "往上", "往前", "往里", "继续前进", "继续走", "继续爬", "沿着", "穿过",
     "返回", "回到", "动身", "启程", "前进", "go to", "enter", "head to",
     "walk to", "return to", "travel to",
+    "teleport", "warp to", "jump to", "传送", "瞬移",
 )
 
 _ENGLISH_MOVE_INTENT_RE = _re.compile(
     r"\b(?:go|ride|walk|run|sail|travel|head|return|proceed|move|leave|"
-    r"enter|cross|climb|continue|journey)\b",
+    r"enter|cross|climb|continue|journey|teleport|warp|jump)\b|"
+    r"\btake\b.{0,40}\b(?:passage|road|path|route|corridor|hallway|"
+    r"stairs?|stairway|staircase|ladder|bridgeway|gangway|trail|tunnel|"
+    r"doorway|exit|turn)\b",
     _re.IGNORECASE,
 )
 
@@ -991,7 +1094,7 @@ def _has_player_move_intent(player_input: str) -> bool:
 
 def _find_unavailable_scene_move(player_input: str, current_scene_id: str,
                                  world: dict, session: Optional[dict] = None) -> str:
-    """Return a named module scene when the player tries to skip the scene graph."""
+    """Return a named destination outside the current physical scene graph."""
     normalized = (player_input or "").lower()
     if not _has_player_move_intent(normalized):
         return ""
@@ -1009,10 +1112,38 @@ def _find_unavailable_scene_move(player_input: str, current_scene_id: str,
         # Scene ids are internal implementation details and often ordinary
         # words ("return", "road", "fight"). Matching them in player prose
         # creates false skip blocks, so only player-facing names are eligible.
-        names = [str(scene.get("name", "")).strip()]
+        authored_name = str(scene.get("name", "")).strip()
+        names = [authored_name]
+        # Published adventures commonly prefix locations with map keys such as
+        # "A1. Brig", "B4a: Captain's Room", or "Area 3 - Crypt". Players
+        # naturally omit those keys, so compare the stripped display name too.
+        natural_name = _re.sub(
+            r"^\s*(?:area\s+)?[a-z]?\d+[a-z]?\s*[.：:\-)]+\s*",
+            "", authored_name, flags=_re.IGNORECASE)
+        if natural_name and natural_name != authored_name:
+            names.append(natural_name)
+        aliases = scene.get("aliases", [])
+        if isinstance(aliases, list):
+            names.extend(str(alias).strip() for alias in aliases)
         for name in names:
             if len(name) >= 2 and name.lower() in normalized:
                 candidates.append(name)
+    # Reconstructed locations inside books, dreams, legends, examples, and
+    # backstory remain searchable lore, but can never become physical movement
+    # targets unless a later authoritative event explicitly creates a scene.
+    for setting in world.get("embedded_settings", []):
+        if not isinstance(setting, dict):
+            continue
+        for scene in setting.get("scenes", []):
+            if not isinstance(scene, dict):
+                continue
+            names = [scene.get("name", ""), scene.get("title", "")]
+            names.extend(scene.get("aliases", [])
+                         if isinstance(scene.get("aliases"), list) else [])
+            for raw_name in names:
+                name = str(raw_name).strip()
+                if len(name) >= 2 and name.lower() in normalized:
+                    candidates.append(name)
     return max(candidates, key=len) if candidates else ""
 
 
@@ -1171,7 +1302,7 @@ def _build_object_location_ledger(state: "GMState", current_scene_id: str) -> st
     world = state["world"]
     session = state["session"]
     facts = ensure_fact_state(session, world)
-    here, carried, displaced = [], [], []
+    here, carried, owned, displaced = [], [], [], []
     for eid, entity in world.get("entities", {}).items():
         if not isinstance(entity, dict) or entity.get("type") == "npc":
             continue
@@ -1187,6 +1318,10 @@ def _build_object_location_ledger(state: "GMState", current_scene_id: str) -> st
                 here.append(label)
         elif fact.get("exists", True) and kind == "inventory":
             carried.append(label)
+        elif fact.get("exists", True) and kind == "entity":
+            owner = world.get("entities", {}).get(location_id, {})
+            owner_name = str(owner.get("name", location_id))
+            owned.append(f"{label}: held by {owner_name} [id={location_id}]")
         elif str(entity.get("home_scene", entity.get("scene", ""))) == current_scene_id:
             displaced.append(f"{label}: now {kind}:{location_id or '-'}")
 
@@ -1197,6 +1332,7 @@ def _build_object_location_ledger(state: "GMState", current_scene_id: str) -> st
         "consumed, destroyed, or absent object from that prose.",
         "HERE NOW: " + ("; ".join(here) if here else "none"),
         "CARRIED BY PLAYER: " + ("; ".join(carried) if carried else "none"),
+        "OWNED BY NPC: " + ("; ".join(owned) if owned else "none"),
     ]
     if displaced:
         lines.append("MENTIONED BY THIS SCENE'S INITIAL SOURCE BUT ABSENT NOW: " + "; ".join(displaced))
@@ -1404,7 +1540,8 @@ _ENGLISH_DIALOGUE_INTENT_RE = _re.compile(
     r'question(?:s|ed|ing)?|interrogat(?:e|es|ed|ing)|'
     r'repl(?:y|ies|ied|ying)|answer(?:s|ed|ing)?|greet(?:s|ed|ing)?|'
     r'hello|hi|goodbye|thank(?:s|ed|ing)?|apologi[sz](?:e|es|ed|ing)|'
-    r'warn(?:s|ed|ing)?|persuad(?:e|es|ed|ing)|order(?:s|ed|ing)?)\b',
+    r'warn(?:s|ed|ing)?|persuad(?:e|es|ed|ing)|convinc(?:e|es|ed|ing)|'
+    r'negotiat(?:e|es|ed|ing)|order(?:s|ed|ing)?)\b',
     _re.IGNORECASE,
 )
 _CHINESE_DIALOGUE_PHRASE_RE = _re.compile(
@@ -1771,6 +1908,52 @@ def parse_input(state: GMState) -> GMState:
     current_turn = session.get("current_turn", 0)
     entities = world.get("entities", {})
 
+    # An exact authored action in the current scene is the authoritative rule
+    # boundary.  Resolve it before the generic object planner: in phrases such
+    # as "confront Corbitt using his dagger", the planner correctly identifies
+    # the dagger as a visible tool, but the scenario trigger on Corbitt is the
+    # action that owns the state transition and its prerequisites.
+    for eid in state["scene_entities"]:
+        entity = entities.get(eid)
+        if not entity:
+            continue
+        current_state = entity_states.get(eid, entity.get("initial_state", ""))
+        state_def = entity.get("states", {}).get(current_state, {})
+        if cooldowns.get(eid, 0) > current_turn:
+            continue
+        matched_kw = next((
+            str(keyword) for keyword in state_def.get("triggers", [])
+            if str(keyword).strip()
+            and str(keyword).strip().lower() in inp
+        ), None)
+        if not matched_kw:
+            continue
+        missing = legacy_action_requirements(state_def, session)
+        if missing:
+            resolution.update({
+                "status": "blocked",
+                "events": [],
+                "message": "当前尚未满足执行这个模组动作所需的条件。",
+                "missing_requirements": missing,
+            })
+            state["_action_block"] = resolution["message"]
+            state["matched_entity"] = None
+            return state
+        state["matched_entity"] = {
+            "id": eid,
+            "current_state": current_state,
+            "state_def": state_def,
+        }
+        resolution["defer_to_legacy"] = True
+        resolution["status"] = "accepted"
+        state["_action_block"] = ""
+        print(
+            f"[ENGINE] Exact authored action: {eid} "
+            f"(state={current_state}, trigger='{matched_kw}')",
+            flush=True,
+        )
+        return state
+
     target_id = str(proposal.get("target_id", ""))
     if target_id:
         entity = entities.get(target_id, {})
@@ -1778,10 +1961,22 @@ def parse_input(state: GMState) -> GMState:
             target_id, entity.get("initial_state", "default"))
         if legacy_state_matches_action(
                 entity, current_state, proposal, state["player_input"]):
+            state_def = entity.get("states", {}).get(current_state, {})
+            missing = legacy_action_requirements(state_def, session)
+            if missing:
+                resolution.update({
+                    "status": "blocked",
+                    "events": [],
+                    "message": "当前尚未满足执行这个模组动作所需的条件。",
+                    "missing_requirements": missing,
+                })
+                state["_action_block"] = resolution["message"]
+                state["matched_entity"] = None
+                return state
             state["matched_entity"] = {
                 "id": target_id,
                 "current_state": current_state,
-                "state_def": entity.get("states", {}).get(current_state, {}),
+                "state_def": state_def,
             }
             resolution["defer_to_legacy"] = True
             resolution["status"] = "accepted"
@@ -1817,6 +2012,17 @@ def parse_input(state: GMState) -> GMState:
 
         matched_kw = next((kw for kw in triggers if kw.lower() in inp), None)
         if matched_kw:
+            missing = legacy_action_requirements(state_def, session)
+            if missing:
+                resolution.update({
+                    "status": "blocked",
+                    "events": [],
+                    "message": "当前尚未满足执行这个模组动作所需的条件。",
+                    "missing_requirements": missing,
+                })
+                state["_action_block"] = resolution["message"]
+                state["matched_entity"] = None
+                return state
             state["matched_entity"] = {
                 "id": eid,
                 "current_state": current_state,
@@ -1914,7 +2120,7 @@ def _resolve_clue_skill(check_str: str, ps: dict, rule_system: str):
     effective = min(effective, 95)  # CoC: leave room for failure/fumble
 
     # CoC rolls d100 ≤ skill value; D&D uses the module DC.
-    dc = effective if rule_system == "coc" else (module_dc or 12)
+    dc = effective if is_percentile_system(rule_system) else (module_dc or 12)
     return skill_cn, sv, effective, dc
 
 
@@ -2001,7 +2207,8 @@ def judge(state: GMState) -> GMState:
             skill_name = check.get("skill", "")
             sv = ps.get("skills", {}).get(skill_name, 0)
             effective = min(sv if sv > 0 else 15, 95)
-            dc = effective if rule_system == "coc" else check.get("dc", 12)
+            dc = (effective if is_percentile_system(rule_system)
+                  else check.get("dc", 12))
         elif isinstance(check, str):
             resolved = _resolve_clue_skill(check, ps, rule_system)
             if resolved:
@@ -2148,6 +2355,17 @@ def resolve_entity(state: GMState) -> GMState:
         if legacy_events:
             state.setdefault("_action_events", []).extend(legacy_events)
 
+    if "on_trigger" in state_def:
+        raw_events = state_def.get("on_trigger", {}).get("events", [])
+        for raw_event in raw_events if isinstance(raw_events, list) else []:
+            if not isinstance(raw_event, dict):
+                continue
+            payload = dict(raw_event)
+            payload.setdefault("source", "authored_state_trigger")
+            payload.setdefault("player_action", state.get("player_input", ""))
+            committed = append_world_event(session, world, payload)
+            state.setdefault("_action_events", []).append(committed)
+
     # Award luck token on critical success
     dice = state.get("dice_result")
     if dice and dice.get("verdict") == "critical_success":
@@ -2251,19 +2469,32 @@ def assemble_context(state: GMState) -> GMState:
         session, world, scene_index, entity_index)
     npc_ids_in_scene = [item["id"] for item in interactable_npcs]
     stale_npc_id = session.get("selected_npc_id")
+    matched_entity = state.get("matched_entity") or {}
+    completed_npc_target = ""
+    if (dialogue_intent := _is_dialogue_intent(player_input)):
+        matched_id = str(matched_entity.get("id", ""))
+        matched_type = world.get("entities", {}).get(
+            matched_id, {}).get("type")
+        if (matched_id and matched_id == stale_npc_id
+                and matched_type == "npc"
+                and state.get("action_resolution", {}).get("status") == "accepted"):
+            # The authored dialogue may itself make the NPC unavailable (flee,
+            # restraint, death). It still owns this turn's narration, while the
+            # stale frontend selection is cleared for the next turn.
+            completed_npc_target = matched_id
     if reconcile_interaction_target(session, interactable_npcs):
-        state["_npc_target_became_unavailable"] = True
+        state["_npc_target_became_unavailable"] = not completed_npc_target
         print(
             f"[ENGINE] Selected NPC became unavailable -> cleared: {stale_npc_id}",
             flush=True,
         )
     selected_npc_id = session.get("selected_npc_id")
 
-    dialogue_intent = _is_dialogue_intent(player_input)
-    matched_npc_ids = [selected_npc_id] if selected_npc_id else []
+    matched_npc_ids = ([completed_npc_target] if completed_npc_target else
+                       ([selected_npc_id] if selected_npc_id else []))
     state["_available_npc_count"] = len(npc_ids_in_scene)
 
-    if dialogue_intent and not selected_npc_id:
+    if dialogue_intent and not matched_npc_ids:
         state["_npc_selection_required"] = True
 
     # Non-dialogue references may still use deterministic exact aliases and
@@ -2276,10 +2507,17 @@ def assemble_context(state: GMState) -> GMState:
         record_entity_mention(
             session, matched_npc_ids[0], label=player_input, entity_type="npc")
 
-    # A player who types an NPC's real name/surname knows it → unlock disclosure
-    # so the KP stops redacting a name the player is actively using.
+    # A typed canonical name is evidence only for the active interaction target
+    # or for an NPC the module explicitly marks as public knowledge. Mere
+    # existence in the world book is KP knowledge: accepting arbitrary guessed
+    # names would leak unrevealed identities across scenes.
     allowed_names = {
         entity_index.get(eid, {}).get("name", "") for eid in matched_npc_ids}
+    for entity in world.get("entities", {}).values():
+        if (isinstance(entity, dict) and entity.get("type") == "npc"
+                and entity.get("known_to_player") is True):
+            allowed_names.add(str(entity.get("name", "")))
+    allowed_names.discard("")
     _unlock_names_player_knows(player_input, session, allowed_names)
 
     state["_matched_npc_ids"] = matched_npc_ids
@@ -2532,7 +2770,7 @@ def assemble_context(state: GMState) -> GMState:
         parts.append("=== DICE RESULT ===")
         if dice.get("verdict") == "luck_auto_success":
             parts.append("大幸运 used! Automatic success. (Token consumed)")
-        elif dice.get("rule_system") == "coc":
+        elif is_percentile_system(dice.get("rule_system", "")):
             coc_vmap = {
                 "critical_success": "CRITICAL SUCCESS!",
                 "extreme_success": "EXTREME SUCCESS!",
@@ -2767,7 +3005,8 @@ def narrate(state: GMState) -> GMState:
             response += "这里只有" + "、".join(present) + "。"
         # Even this code-generated line must respect disclosure: present[] is
         # built from real names, so redact the unrevealed ones.
-        response = _redact_unrevealed_names(response, session, state["entity_index"])
+        response = _redact_unrevealed_names(
+            response, session, state["entity_index"], state["world"])
         print(f"[ENGINE] Hard block: '{not_found}' not found, "
               f"code-generated response", flush=True)
         response = _prepend_clock_milestones(state, response)
@@ -2833,7 +3072,8 @@ def narrate(state: GMState) -> GMState:
     # Hard backstop (rules over prompts): redact any unrevealed NPC real name the
     # LLM may have slipped, before it reaches the player.
     content = _redact_unrevealed_entities(content, state["session"], state["world"])
-    content = _redact_unrevealed_names(content, state["session"], state["entity_index"])
+    content = _redact_unrevealed_names(
+        content, state["session"], state["entity_index"], state["world"])
     # KP-driven movement: if the KP narrated advancing to a connected scene, it
     # emits 〔前往：X〕 — apply it (run_gm_turn does the transition) and strip marker.
     content = _maybe_apply_movement(state, content)
@@ -3114,7 +3354,8 @@ def run_gm_turn(
 
         opening = opening or scene_desc or scene_name
         opening = _redact_unrevealed_entities(opening, session, world)
-        opening = _redact_unrevealed_names(opening, session, entity_index)
+        opening = _redact_unrevealed_names(
+            opening, session, entity_index, world)
         _write_eval_trace(
             chat_id,
             1,
@@ -3235,7 +3476,8 @@ def run_gm_turn(
             _clean_dest = _re.sub(r'[（(][^）)]*[）)]', '', scene_name).strip() or scene_name
             kp_narration = f"你们来到了{_clean_dest}。\n\n{scene_desc}"
         kp_narration = _redact_unrevealed_entities(kp_narration, session, world)
-        kp_narration = _redact_unrevealed_names(kp_narration, session, entity_index)
+        kp_narration = _redact_unrevealed_names(
+            kp_narration, session, entity_index, world)
 
         write_turn_log(
             session=session,
@@ -3328,9 +3570,14 @@ def run_gm_turn(
             _skill = str(_dr.get("skill", "") or _dr.get("skill_name", "")).lower()
             if any(s in _skill for s in ["说服", "persuade", "心理学", "psychology", "魅力", "charm"]):
                 _skill_bonus = 5
-        # LLM trust signal (or fallback +1 base per interaction)
+        # LLM trust signal, plus a small fallback only for actual dialogue.
+        # Merely targeting an NPC in combat or another physical action must not
+        # become positive social progress because the narration was long.
         _trust_signal = result.get("_trust_signal", 0)
-        _base_trust = 1 if len(gm_response_text or "") > 50 else 0
+        _is_social_turn = _is_dialogue_intent(
+            result.get("player_input", ""))
+        _base_trust = (
+            1 if _is_social_turn and len(gm_response_text or "") > 50 else 0)
         for eid in matched_npc_ids[:2]:
             einfo = entity_index.get(eid, {})
             npc_name = einfo.get("name", eid)
@@ -3353,7 +3600,8 @@ def run_gm_turn(
                     break
 
     # Post-narration: auto SAN detection from GM response (CoC only)
-    if gm_response_text and session.get("rule_system") == "coc" and not result.get("_san_result"):
+    if (gm_response_text and session.get("rule_system") == "coc"
+            and not result.get("_san_result")):
         try:
             from check_trigger import detect_san_trigger, execute_san_check
             trigger_kw = detect_san_trigger(gm_response_text)

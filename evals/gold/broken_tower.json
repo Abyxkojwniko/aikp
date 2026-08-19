@@ -1,0 +1,314 @@
+{
+  "benchmark_version": "1.0",
+  "module_id": "broken_tower",
+  "title": "The Broken Tower",
+  "source": {
+    "publisher": "Chaosium",
+    "download_url": "https://www.chaosium.com/content/FreePDFs/RuneQuest/CHA4027%20-%20RuneQuest%20Quickstart.pdf",
+    "local_filename": "paper_modules/runequest_quickstart_broken_tower.txt",
+    "sha256": "a64af2c12fe789bd953fa7708564dce97be3bc19249e58459b0ac2e9ab9a6f34"
+  },
+  "nodes": [
+    {
+      "id": "pursuit",
+      "label": "Opening pursuit of the stolen cattle",
+      "aliases": [
+        "Opening Scene"
+      ],
+      "kind": "opening",
+      "scenario_id": "main"
+    },
+    {
+      "id": "lanneke",
+      "label": "Lanneke's corpse",
+      "aliases": [
+        "Greydog Lanneke"
+      ],
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "carthalo",
+      "label": "Carthalo's hovel",
+      "aliases": [
+        "Carthalo"
+      ],
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "road",
+      "label": "On the Road to Ruins",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "lizards",
+      "label": "A Bellow for Help and the rock lizards",
+      "kind": "encounter",
+      "scenario_id": "main"
+    },
+    {
+      "id": "old_ruins",
+      "label": "The Old Ruins",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "exploring",
+      "label": "Exploring the Old Ruins",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "offerings",
+      "label": "The Chamber of Offerings",
+      "kind": "encounter",
+      "scenario_id": "main"
+    },
+    {
+      "id": "danakos",
+      "label": "The Traitor at Last",
+      "aliases": [
+        "Danakos confrontation"
+      ],
+      "kind": "encounter",
+      "scenario_id": "main"
+    },
+    {
+      "id": "idrima",
+      "label": "The Stone Also Rises",
+      "aliases": [
+        "Dealing with the Demon-Goddess",
+        "Idrima confrontation"
+      ],
+      "kind": "choice",
+      "scenario_id": "main"
+    },
+    {
+      "id": "fight",
+      "label": "Fight Idrima",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "flee_cattle",
+      "label": "Fleeing with the Cattle",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "flee_empty",
+      "label": "Fleeing without the Cattle",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "bargain",
+      "label": "Bargaining with Idrima",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "corral",
+      "label": "The Ceremonial Corral",
+      "kind": "ending",
+      "scenario_id": "main"
+    },
+    {
+      "id": "rewards",
+      "label": "Rewards and Experience",
+      "kind": "ending",
+      "scenario_id": "main"
+    }
+  ],
+  "edges": [
+    {
+      "from": "pursuit",
+      "to": "lanneke",
+      "type": "before"
+    },
+    {
+      "from": "lanneke",
+      "to": "carthalo",
+      "type": "branches_to"
+    },
+    {
+      "from": "lanneke",
+      "to": "road",
+      "type": "branches_to"
+    },
+    {
+      "from": "carthalo",
+      "to": "road",
+      "type": "before"
+    },
+    {
+      "from": "road",
+      "to": "lizards",
+      "type": "before"
+    },
+    {
+      "from": "lizards",
+      "to": "old_ruins",
+      "type": "before"
+    },
+    {
+      "from": "old_ruins",
+      "to": "exploring",
+      "type": "enables"
+    },
+    {
+      "from": "exploring",
+      "to": "offerings",
+      "type": "reveals"
+    },
+    {
+      "from": "offerings",
+      "to": "danakos",
+      "type": "causes"
+    },
+    {
+      "from": "danakos",
+      "to": "idrima",
+      "type": "causes"
+    },
+    {
+      "from": "idrima",
+      "to": "fight",
+      "type": "branches_to"
+    },
+    {
+      "from": "idrima",
+      "to": "flee_cattle",
+      "type": "branches_to"
+    },
+    {
+      "from": "idrima",
+      "to": "flee_empty",
+      "type": "branches_to"
+    },
+    {
+      "from": "idrima",
+      "to": "bargain",
+      "type": "branches_to"
+    },
+    {
+      "from": "fight",
+      "to": "corral",
+      "type": "before"
+    },
+    {
+      "from": "flee_cattle",
+      "to": "rewards",
+      "type": "before"
+    },
+    {
+      "from": "bargain",
+      "to": "corral",
+      "type": "enables"
+    },
+    {
+      "from": "corral",
+      "to": "rewards",
+      "type": "before"
+    }
+  ],
+  "entities": [
+    {
+      "id": "lanneke_npc",
+      "name": "Lanneke",
+      "aliases": [
+        "Greydog Lanneke"
+      ],
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "carthalo_npc",
+      "name": "Carthalo",
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "danakos_npc",
+      "name": "Danakos son of Ergost",
+      "aliases": [
+        "Danakos"
+      ],
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "varanik_npc",
+      "name": "Varanik",
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "idrima_npc",
+      "name": "Idrima the Stone Woman",
+      "aliases": [
+        "Stone Woman",
+        "demon-goddess"
+      ],
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "sprul_pa",
+      "name": "sprul-pa",
+      "aliases": [
+        "earth servitors"
+      ],
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "rock_lizards",
+      "name": "rock lizards",
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "bloodstone",
+      "name": "bloodstained stone",
+      "type": "object",
+      "scenario_id": "main"
+    },
+    {
+      "id": "menhirs",
+      "name": "Stone Woman menhirs",
+      "aliases": [
+        "sacred stones"
+      ],
+      "type": "object",
+      "scenario_id": "main"
+    },
+    {
+      "id": "cattle",
+      "name": "Colymar cattle",
+      "aliases": [
+        "stolen cattle"
+      ],
+      "type": "object",
+      "scenario_id": "main"
+    }
+  ],
+  "forbidden_navigable_scenes": [
+    {
+      "id": "gods_war",
+      "label": "the Gods War in the story of the Stone Woman"
+    },
+    {
+      "id": "great_darkness",
+      "label": "the Great Darkness in Idrima's backstory"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "main",
+      "title": "The Broken Tower"
+    }
+  ]
+}

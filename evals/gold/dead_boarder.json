@@ -1,0 +1,218 @@
+{
+  "benchmark_version": "1.0",
+  "module_id": "dead_boarder",
+  "title": "Dead Boarder",
+  "source": {
+    "publisher": "Chaosium",
+    "download_url": "https://www.chaosium.com/content/FreePDFs/CoC/Cult%20of%20Chaos%20Scenarios/Dead%20Boarder.pdf",
+    "local_filename": "dead_boarder.txt",
+    "sha256": "a76fb3cf88f10c7ee9b013f13c26c5d454401d475fa7c02c57d0635d0ebde61f"
+  },
+  "nodes": [
+    {
+      "id": "arrival",
+      "label": "Arrival at James Gardiner's locked room",
+      "aliases": [
+        "Introduction"
+      ],
+      "kind": "opening",
+      "scenario_id": "main"
+    },
+    {
+      "id": "body",
+      "label": "Examine Gardiner's body",
+      "aliases": [
+        "The Body"
+      ],
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "room",
+      "label": "Search Gardiner's room",
+      "aliases": [
+        "The Room"
+      ],
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "journal",
+      "label": "Gardiner's Dream Journal",
+      "kind": "clue",
+      "scenario_id": "main"
+    },
+    {
+      "id": "book",
+      "label": "The Book of Dreams",
+      "kind": "clue",
+      "scenario_id": "main"
+    },
+    {
+      "id": "monster",
+      "label": "The Monster Rises",
+      "aliases": [
+        "Gardiner-Thing rises"
+      ],
+      "kind": "encounter",
+      "scenario_id": "main"
+    },
+    {
+      "id": "combat",
+      "label": "Combat or escape from the Gardiner-Thing",
+      "kind": "choice",
+      "scenario_id": "main"
+    },
+    {
+      "id": "police",
+      "label": "More Police Arrive",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "conclusion",
+      "label": "Conclusion",
+      "aliases": [
+        "monster dead or escaped"
+      ],
+      "kind": "ending",
+      "scenario_id": "main"
+    }
+  ],
+  "edges": [
+    {
+      "from": "arrival",
+      "to": "body",
+      "type": "before"
+    },
+    {
+      "from": "arrival",
+      "to": "room",
+      "type": "before"
+    },
+    {
+      "from": "room",
+      "to": "journal",
+      "type": "reveals"
+    },
+    {
+      "from": "room",
+      "to": "book",
+      "type": "reveals"
+    },
+    {
+      "from": "body",
+      "to": "monster",
+      "type": "enables"
+    },
+    {
+      "from": "book",
+      "to": "monster",
+      "type": "causes"
+    },
+    {
+      "from": "monster",
+      "to": "combat",
+      "type": "branches_to"
+    },
+    {
+      "from": "combat",
+      "to": "police",
+      "type": "branches_to"
+    },
+    {
+      "from": "combat",
+      "to": "conclusion",
+      "type": "branches_to"
+    },
+    {
+      "from": "police",
+      "to": "conclusion",
+      "type": "before"
+    }
+  ],
+  "entities": [
+    {
+      "id": "gardiner",
+      "name": "James Gardiner",
+      "aliases": [
+        "Gardiner-Thing"
+      ],
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "landlord",
+      "name": "The Landlord",
+      "aliases": [
+        "Landlady"
+      ],
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "neighbor",
+      "name": "Mrs. Madeira",
+      "aliases": [
+        "Nosy Neighbor"
+      ],
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "milligan",
+      "name": "Detective Lt. Milligan",
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "malone",
+      "name": "Patrolman Malone",
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "dream_book",
+      "name": "The Book of Dreams",
+      "type": "object",
+      "scenario_id": "main"
+    },
+    {
+      "id": "dream_journal",
+      "name": "Gardiner's Dream Journal",
+      "type": "object",
+      "scenario_id": "main"
+    },
+    {
+      "id": "obsidian_knife",
+      "name": "obsidian knife",
+      "aliases": [
+        "obsidian blade"
+      ],
+      "type": "object",
+      "scenario_id": "main"
+    }
+  ],
+  "forbidden_navigable_scenes": [
+    {
+      "id": "dreamlands",
+      "label": "The Dreamlands",
+      "aliases": [
+        "Dream Land"
+      ]
+    },
+    {
+      "id": "underwater_vision",
+      "label": "underwater scene in the brief vision",
+      "aliases": [
+        "underwater vision"
+      ]
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "main",
+      "title": "Dead Boarder"
+    }
+  ]
+}

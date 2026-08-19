@@ -48,9 +48,12 @@ def _positive_int_env(name: str, default: int) -> int:
 MAX_CONTEXT_CHARS = _positive_int_env("AIKP_MAX_CONTEXT_CHARS", 24000)
 MAX_SCENE_SOURCE_CHARS = _positive_int_env("AIKP_MAX_SCENE_SOURCE_CHARS", 6000)
 FULL_REBUILD_MAX_CHARS = _positive_int_env("AIKP_FULL_REBUILD_MAX_CHARS", 180000)
+LONG_DOCUMENT_WINDOW_CHARS = _positive_int_env(
+    "AIKP_LONG_DOCUMENT_WINDOW_CHARS", 52000)
 NODE_SOURCE_MAX_CHARS = _positive_int_env("AIKP_NODE_SOURCE_MAX_CHARS", 30000)
 NODE_QUALITY_THRESHOLD = _positive_int_env("AIKP_NODE_QUALITY_THRESHOLD", 82)
 NODE_REBUILD_MAX_RETRIES = _positive_int_env("AIKP_NODE_REBUILD_MAX_RETRIES", 2)
+PARSER_ABLATION = os.environ.get("AIKP_PARSER_ABLATION", "full").strip().lower()
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BACKEND_DIR)

@@ -8,11 +8,11 @@
 #  Instead we install deps DIRECTLY into a portable Python (tools\python),
 #  which is relocatable when invoked as  python.exe server.py.
 #
-#  Usage:   powershell -ExecutionPolicy Bypass -File build_release.ps1 -Version v0.1.0
+#  Usage:   powershell -ExecutionPolicy Bypass -File build_release.ps1
 #  Output:  dist\AIKP-Portable-<version>-win64.zip   (and dist\AIKP\ staging)
 # =========================================================================
 [CmdletBinding()]
-param([string]$Version = 'v0.1.0')
+param([string]$Version = '')
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -22,6 +22,11 @@ $PY_VERSION   = '3.11.9'
 $NODE_VERSION = '20.18.1'
 
 $Repo  = $PSScriptRoot
+$DeclaredVersion = (Get-Content (Join-Path $Repo 'VERSION') -Raw).Trim()
+if(-not $Version){ $Version = $DeclaredVersion }
+if($Version -ne $DeclaredVersion){
+    throw "打包版本 $Version 与 VERSION 中的 $DeclaredVersion 不一致"
+}
 $Dist  = Join-Path $Repo 'dist'
 $Stage = Join-Path $Dist 'AIKP'
 $Zip   = Join-Path $Dist "AIKP-Portable-$Version-win64.zip"
@@ -129,12 +134,13 @@ $beSrc = Join-Path $Repo 'backend'
 Robo $beSrc (Join-Path $Stage 'backend') `
      @('__pycache__', (Join-Path $beSrc 'sessions'), (Join-Path $beSrc 'uploads'),
        (Join-Path $beSrc 'world_book'), (Join-Path $beSrc '_chroma')) `
-     @('_t.py','_test_parser.py','_read_xlsx.py','rebuild_backend.py')
+     @('_t.py','_test_parser.py','_read_xlsx.py','rebuild_backend.py','*.log')
 $stSrc = Join-Path $Repo 'Tavern\SillyTavern'
 Robo $stSrc (Join-Path $Stage 'Tavern\SillyTavern') `
      @('.git', (Join-Path $stSrc 'data'), (Join-Path $stSrc 'backups'),
-       (Join-Path $stSrc 'cache'), (Join-Path $stSrc 'thumbnails'), (Join-Path $stSrc 'dist')) `
-     @((Join-Path $stSrc 'config.yaml'))
+       (Join-Path $stSrc 'cache'), (Join-Path $stSrc 'thumbnails'),
+       (Join-Path $stSrc 'dist'), (Join-Path $stSrc 'tests')) `
+     @((Join-Path $stSrc 'config.yaml'),'*.log')
 # root files needed to run
 $rootFiles = @('启动游戏.bat','停止游戏.bat','_aikp_backend.bat','_aikp_frontend.bat',
                '_aikp_setup.ps1','start.bat','start.ps1','.env.example',
@@ -152,6 +158,49 @@ Set-Content -Path (Join-Path $Stage 'models\.gitkeep') -Value '' -Encoding ascii
 $shim = "@echo off`r`nchcp 936 >nul`r`ncd /d `"%~dp0`"`r`ncall `"%~dp0启动游戏.bat`"`r`n"
 [System.IO.File]::WriteAllText((Join-Path $Stage '_aikp_launch.bat'), $shim, [System.Text.Encoding]::GetEncoding(936))
 Ok "程序文件已拷贝"
+
+# No scenario source, user state, credentials, or evaluation material belongs
+# in a public runtime archive.
+Step "审计发布包内容"
+$forbiddenDirs = @(
+    (Join-Path $Stage 'evals'), (Join-Path $Stage 'tests'),
+    (Join-Path $Stage 'docs'), (Join-Path $Stage 'backend\sessions'),
+    (Join-Path $Stage 'backend\uploads'),
+    (Join-Path $Stage 'backend\world_book')
+)
+foreach($dir in $forbiddenDirs){
+    if((Test-Path $dir) -and (Get-ChildItem $dir -Force -Recurse -File | Select-Object -First 1)){
+        throw "发布包包含不允许的运行时或评测文件：$dir"
+    }
+}
+$forbiddenFiles = Get-ChildItem $Stage -Force -Recurse -File | Where-Object {
+    $_.Name -eq '.env' -or $_.Extension -in @('.pdf','.doc','.docx','.epub','.mobi','.7z','.rar')
+}
+if($forbiddenFiles){
+    throw "发布包包含模组、密钥或嵌套压缩文件：$($forbiddenFiles[0].FullName)"
+}
+$unexpectedZip = Get-ChildItem $Stage -Force -Recurse -File -Filter '*.zip' |
+    Where-Object {
+        $_.DirectoryName -ne (Join-Path $Stage 'tools\python') -or
+        $_.Name -notlike 'python*.zip'
+    } | Select-Object -First 1
+if($unexpectedZip){
+    throw "发布包包含非运行时 ZIP：$($unexpectedZip.FullName)"
+}
+$unexpectedTestDir = Get-ChildItem $Stage -Force -Recurse -Directory |
+    Where-Object {
+        $_.Name -in @('tests','evals') -and
+        $_.FullName -notlike "*\node_modules\*" -and
+        $_.FullName -notlike "$(Join-Path $Stage 'tools')\*"
+    } | Select-Object -First 1
+if($unexpectedTestDir){
+    throw "发布包包含项目测试或评测目录：$($unexpectedTestDir.FullName)"
+}
+$modelFiles = @(Get-ChildItem (Join-Path $Stage 'models') -Force -File)
+if($modelFiles.Count -ne 1 -or $modelFiles[0].Name -ne '.gitkeep'){
+    throw 'models 目录必须只包含 .gitkeep'
+}
+Ok "未发现模组、用户数据、评测材料或密钥"
 
 # --------------------------------------- 4. precache offline embedding model
 Step "预缓存语义检索模型（离线用）"

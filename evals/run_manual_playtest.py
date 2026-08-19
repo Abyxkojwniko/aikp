@@ -40,6 +40,16 @@ def _snapshot(session: dict) -> dict:
     }
 
 
+def _authoritative_world_state(snapshot: dict) -> dict:
+    return {
+        key: snapshot.get(key)
+        for key in (
+            "scene", "discovered_clues", "flags", "entity_states",
+            "entity_facts", "inventory_entity_ids", "world_event_types", "clocks",
+        )
+    }
+
+
 def _check_expectations(expect: dict, response: str, state: dict) -> list[str]:
     failures = []
     for key in ("turn", "scene", "selected_npc_id"):
@@ -103,6 +113,10 @@ def main() -> int:
     )
     cli.add_argument("--max-turns", type=int, default=0)
     cli.add_argument("--keep-runtime-state", action="store_true")
+    cli.add_argument(
+        "--annotations", type=Path,
+        default=ROOT / "evals" / "interactive_annotations.json",
+    )
     args = cli.parse_args()
 
     world = json.loads(args.world.read_text(encoding="utf-8"))
@@ -110,6 +124,12 @@ def main() -> int:
     save_world_book(world_id, world)
 
     case = json.loads(args.case.read_text(encoding="utf-8"))
+    if args.annotations.exists():
+        from validate_interactive_cases import (
+            apply_annotation_overlay, load_annotation_overlay,
+        )
+        case = apply_annotation_overlay(
+            case, load_annotation_overlay(args.annotations))
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = args.output_dir / f"manual-{case['name']}-{stamp}"
     requests_dir = run_dir / "requests"
@@ -120,7 +140,7 @@ def main() -> int:
     import npc_context
     from reference_resolver import select_interaction_target
     from scene_system import select_scene_target
-    from world_state import select_object_target
+    from world_state import ensure_fact_state, select_object_target
 
     # Trait extraction is a separate LLM enrichment call, not narration. The
     # manual run deliberately disables it so no hidden API request can occur.
@@ -140,6 +160,8 @@ def main() -> int:
         "turns": [],
         "failures": [],
         "coverage": [],
+        "required_coverage": [
+            str(point) for point in case.get("required_coverage", [])],
     }
     covered = set()
 
@@ -150,22 +172,40 @@ def main() -> int:
             if state_changes:
                 session = engine.get_session(chat_id, world_id)
                 session.setdefault("entity_states", {}).update(state_changes)
+                ensure_fact_state(session, world)
                 engine.save_session(session)
 
             npc_id = turn.get("select_npc")
             if npc_id:
                 session = engine.get_session(chat_id, world_id)
                 scene_index, entity_index = engine.get_indices(world_id)
-                select_interaction_target(
-                    session, npc_id, world, scene_index, entity_index)
+                try:
+                    select_interaction_target(
+                        session, npc_id, world, scene_index, entity_index)
+                except ValueError:
+                    evaluation = turn.get("evaluation", {})
+                    if evaluation.get("expected_outcome") != "blocked":
+                        raise
+                    # Model a stale or forged frontend selection. The runtime
+                    # must revalidate it against the authoritative NPC roster.
+                    session["selected_npc_id"] = npc_id
+                    session.setdefault("conversation_focus", {})["npc"] = npc_id
                 engine.save_session(session)
 
             object_id = turn.get("select_object")
             if object_id:
                 session = engine.get_session(chat_id, world_id)
                 scene_index, entity_index = engine.get_indices(world_id)
-                select_object_target(
-                    session, object_id, world, scene_index, entity_index)
+                try:
+                    select_object_target(
+                        session, object_id, world, scene_index, entity_index)
+                except ValueError:
+                    evaluation = turn.get("evaluation", {})
+                    if evaluation.get("expected_outcome") != "blocked":
+                        raise
+                    # Exercise server-side revalidation against a stale or
+                    # forged object id that a client should not have offered.
+                    session["selected_object_id"] = object_id
                 engine.save_session(session)
 
             scene_id = turn.get("select_scene")
@@ -175,12 +215,20 @@ def main() -> int:
                 engine.save_session(session)
 
             player_input = turn["input"]
+            before_snapshot = _snapshot(load_session(chat_id))
+            provider_index_before = provider.index
             response = engine.run_gm_turn(
                 messages=[{"role": "user", "content": player_input}],
                 model=world_id,
                 chat_id=chat_id,
                 api_key="manual-provider-no-api-key",
                 stream=False,
+            )
+            response_source = (
+                "narrator" if provider.index > provider_index_before else "verifier"
+            )
+            action_outcome = (
+                "accepted" if response_source == "narrator" else "blocked"
             )
             roll_result = None
             forced_verdict = turn.get("roll_verdict")
@@ -195,6 +243,39 @@ def main() -> int:
             snapshot = _snapshot(session)
             failures = _check_expectations(
                 turn.get("expect", {}), response, snapshot)
+            evaluation = turn.get("evaluation", {})
+            expected_outcome = (
+                evaluation.get("expected_outcome")
+                if isinstance(evaluation, dict) else None
+            )
+            if expected_outcome and action_outcome != expected_outcome:
+                failures.append(
+                    f"action_outcome: expected {expected_outcome!r}, "
+                    f"got {action_outcome!r}"
+                )
+            observed = {
+                "response_source": response_source,
+                "action_outcome": action_outcome,
+            }
+            if expected_outcome == "blocked":
+                observed["unsupported_world_mutation"] = (
+                    _authoritative_world_state(before_snapshot)
+                    != _authoritative_world_state(snapshot)
+                )
+            forbidden_terms = turn.get("expect", {}).get(
+                "response_not_contains", [])
+            if forbidden_terms:
+                response_lower = response.lower()
+                observed["hidden_information_leak"] = any(
+                    str(term).lower() in response_lower for term in forbidden_terms
+                )
+            expected_locations = turn.get("expect", {}).get("object_locations", {})
+            if expected_locations:
+                observed["location_continuity_violation"] = any(
+                    snapshot.get("entity_facts", {}).get(entity_id, {}).get("location", {})
+                    != expected_location
+                    for entity_id, expected_location in expected_locations.items()
+                )
             transcript["failures"].extend(
                 f"turn {index}: {failure}" for failure in failures)
             transcript["turns"].append({
@@ -206,6 +287,8 @@ def main() -> int:
                 "kp": response,
                 "roll": roll_result,
                 "intent": turn.get("intent", ""),
+                "evaluation": evaluation,
+                "observed": observed,
                 "state": snapshot,
                 "failures": failures,
                 "covers": turn.get("covers", []),
@@ -222,6 +305,7 @@ def main() -> int:
     required_coverage = {
         str(point) for point in case.get("required_coverage", [])}
     missing_coverage = sorted(required_coverage - covered)
+    transcript["missing_coverage"] = missing_coverage
     if missing_coverage:
         transcript["failures"].append(
             "missing coverage: " + ", ".join(missing_coverage))

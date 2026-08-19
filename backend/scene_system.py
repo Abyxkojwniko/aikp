@@ -68,6 +68,11 @@ def scene_exit_records(current_scene: dict, world: dict) -> list[dict]:
             "keyword": str(metadata.get("label") or keyword or "").strip(),
             "hidden": bool(metadata.get("hidden", False)),
             "requires_flag": str(metadata.get("requires_flag", "")).strip(),
+            "requires_flags": metadata.get("requires_flags", []),
+            "requires_any_flags": metadata.get("requires_any_flags", []),
+            "requires_inventory": metadata.get("requires_inventory", []),
+            "requires_entity_states": metadata.get(
+                "requires_entity_states", {}),
         })
     return records
 
@@ -79,6 +84,38 @@ def _exit_available(record: dict, session: dict) -> bool:
     required_flag = record.get("requires_flag", "")
     if required_flag and required_flag not in set(session.get("flags", [])):
         return False
+    flags = set(session.get("flags", []))
+    inventory = set(session.get("inventory_entity_ids", []))
+    entity_states = session.get("entity_states", {})
+
+    required_flags = record.get("requires_flags", [])
+    if isinstance(required_flags, str):
+        required_flags = [required_flags]
+    if any(str(flag).strip() not in flags for flag in required_flags or []):
+        return False
+
+    any_flags = record.get("requires_any_flags", [])
+    if isinstance(any_flags, str):
+        any_flags = [any_flags]
+    choices = [str(flag).strip() for flag in (any_flags or [])
+               if str(flag).strip()]
+    if choices and not any(flag in flags for flag in choices):
+        return False
+
+    required_inventory = record.get("requires_inventory", [])
+    if isinstance(required_inventory, str):
+        required_inventory = [required_inventory]
+    if any(str(eid).strip() not in inventory
+           for eid in required_inventory or []):
+        return False
+
+    required_states = record.get("requires_entity_states", {})
+    if isinstance(required_states, dict):
+        for entity_id, expected in required_states.items():
+            allowed = expected if isinstance(expected, list) else [expected]
+            if str(entity_states.get(str(entity_id), "")) not in {
+                    str(value) for value in allowed}:
+                return False
     if record.get("hidden") and scene_id not in unlocked and scene_id not in discovered:
         return False
     return True
@@ -159,4 +196,26 @@ def commit_scene_transition(session: dict, world: dict, scene_id: str) -> None:
         raise ValueError("Unknown scene transition target")
     session.setdefault("player_state", {})["current_scene"] = scene_id
     session["selected_scene_id"] = None
+    scene = world["scenes"][scene_id]
+    applied = session.setdefault("applied_scene_entry_events", [])
+    for index, raw_event in enumerate(scene.get("entry_events", []) or []):
+        if not isinstance(raw_event, dict):
+            continue
+        event_key = str(
+            raw_event.get("event_key") or f"scene-entry:{scene_id}:{index}")
+        once = raw_event.get("once", True) is not False
+        if once and event_key in applied:
+            continue
+        event = {
+            key: value for key, value in raw_event.items()
+            if key not in {"event_key", "once"}
+        }
+        if event.get("type") != "entity_moved":
+            raise ValueError("Scene entry events currently support entity_moved only")
+        event.setdefault("location", {"kind": "scene", "id": scene_id})
+        event.setdefault("source", "scene_entry")
+        from world_state import append_world_event
+        append_world_event(session, world, event)
+        if once:
+            applied.append(event_key)
     ensure_scene_state(session, world)

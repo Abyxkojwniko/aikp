@@ -14,6 +14,7 @@ from models import (
     create_session,
 )
 from config import SESSIONS_DIR
+from dice import is_percentile_system
 
 
 # ── Session Persistence ────────────────────────────────────────
@@ -416,15 +417,48 @@ def get_or_compress_conversation_summary(
 
 # ── Session Integration Helpers ────────────────────────────────
 
-def initialize_session_from_world(session: Session, world: dict) -> Session:
+def initialize_session_from_world(
+    session: Session,
+    world: dict,
+    scenario_id: Optional[str] = None,
+) -> Session:
     """Set initial scene and NPC states for a new session based on world book."""
     from npc_state import merge_npcs
 
     scenes = world.get("scenes", {})
     entities = world.get("entities", {})
 
+    scenarios = [row for row in world.get("scenarios", [])
+                 if isinstance(row, dict) and row.get("id")]
+    scenario_by_id = {str(row["id"]): row for row in scenarios}
+    selected_scenario = str(
+        scenario_id or session.get("current_scenario_id", "")
+        or world.get("starting_scenario", "")
+        or (scenarios[0]["id"] if scenarios else "")
+    )
+    if scenarios and selected_scenario not in scenario_by_id:
+        raise ValueError(f"Unknown scenario_id: {selected_scenario}")
+    session["current_scenario_id"] = selected_scenario
+
+    def in_selected_scenario(row: object) -> bool:
+        if not isinstance(row, dict) or not selected_scenario:
+            return True
+        owner = str(row.get("scenario_id", ""))
+        return not owner or owner == selected_scenario
+
+    scoped_scenes = {
+        sid: row for sid, row in scenes.items() if in_selected_scenario(row)
+    }
+    scoped_entities = {
+        eid: row for eid, row in entities.items() if in_selected_scenario(row)
+    }
+    scoped_world = dict(world, scenes=scoped_scenes, entities=scoped_entities)
+
     # Pick first scene: explicit starting_scene → plot_outline → first in dict
-    first_scene_id = world.get("starting_scene", "")
+    first_scene_id = str(
+        scenario_by_id.get(selected_scenario, {}).get("starting_scene", "")
+        or world.get("starting_scene", "")
+    )
     if not first_scene_id:
         plot = world.get("plot_outline", {})
         if isinstance(plot, dict):
@@ -432,17 +466,18 @@ def initialize_session_from_world(session: Session, world: dict) -> Session:
             if phases and isinstance(phases, list):
                 first_scene_id = phases[0].get("starting_scene", "")
     if not first_scene_id:
-        first_scene_id = next(iter(scenes.keys())) if scenes else ""
+        first_scene_id = next(iter(scoped_scenes.keys())) if scoped_scenes else ""
 
     # Validate: a parsed starting_scene that isn't a real scene key.
     # Try resolving by scene name (parser may emit Chinese name instead of ID).
-    if first_scene_id not in scenes:
+    if first_scene_id not in scoped_scenes:
         matched = next(
-            (sid for sid, s in scenes.items()
+            (sid for sid, s in scoped_scenes.items()
              if isinstance(s, dict) and s.get("name", "") == first_scene_id),
             None
         )
-        first_scene_id = matched if matched else (next(iter(scenes.keys())) if scenes else "")
+        first_scene_id = matched if matched else (
+            next(iter(scoped_scenes.keys())) if scoped_scenes else "")
 
     session["player_state"]["current_scene"] = first_scene_id
     session["model"] = world.get("name", "")
@@ -451,8 +486,9 @@ def initialize_session_from_world(session: Session, world: dict) -> Session:
     rule_system = world.get("rule_system", "dnd")
     session["rule_system"] = rule_system
 
-    # CoC default skills (Chinese names to match world book check fields)
-    if rule_system == "coc":
+    # Percentile defaults keep parser-produced checks rollable before a sheet is
+    # imported. SAN remains exclusive to Call of Cthulhu.
+    if is_percentile_system(rule_system):
         session["player_state"]["skills"] = {
             "侦查": 25, "聆听": 20, "图书馆利用": 20,
             "心理学": 10, "意志": 50, "力量": 50,
@@ -464,20 +500,21 @@ def initialize_session_from_world(session: Session, world: dict) -> Session:
             "驾驶": 20, "电气维修": 10, "机械维修": 10,
             "说服": 10, "话术": 5, "恐吓": 15, "魅惑": 15,
         }
-        session["player_state"]["san"] = 50
-        session["player_state"]["max_san"] = 99
+        if rule_system == "coc":
+            session["player_state"]["san"] = 50
+            session["player_state"]["max_san"] = 99
 
     # Initialize entity states to their initial_state
-    for eid, entity in entities.items():
+    for eid, entity in scoped_entities.items():
         session["entity_states"][eid] = entity.get("initial_state", "default")
 
     from world_state import ensure_fact_state
-    ensure_fact_state(session, world)
+    ensure_fact_state(session, scoped_world)
     session["discovered_scene_ids"] = []
     session["visited_scene_ids"] = []
     session["selected_scene_id"] = None
     from scene_system import ensure_scene_state
-    ensure_scene_state(session, world)
+    ensure_scene_state(session, scoped_world)
 
     # Module clocks are separate from chat turns. Their increments are driven
     # by explicit action-cost tables in the world book.
@@ -488,10 +525,11 @@ def initialize_session_from_world(session: Session, world: dict) -> Session:
     }
 
     # Build NPC states from world book entities (merge same-name NPCs)
-    session["npc_states"] = merge_npcs(world)
+    session["npc_states"] = merge_npcs(scoped_world)
 
     # Initialize beat tracking from story_beats
-    beats = world.get("story_beats", [])
+    beats = [beat for beat in world.get("story_beats", [])
+             if in_selected_scenario(beat)]
     if beats:
         session["current_beat_id"] = beats[0].get("id", "")
         session["completed_beats"] = []

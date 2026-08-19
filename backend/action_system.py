@@ -20,6 +20,11 @@ ACTION_ALIASES = {
         "夺取", "pick up", "take", "grab", "collect", "seize",
     ),
     "drop": ("放下", "丢下", "扔下", "drop", "put down", "leave behind"),
+    "give": (
+        "交给", "递给", "交还", "移交", "给他", "给她", "给对方",
+        "give", "hand over",
+        "turn over",
+    ),
     "use": ("使用", "用", "喝", "服用", "use", "drink", "apply"),
     "open": ("打开", "开启", "掀开", "open"),
     "close": ("关上", "关闭", "合上", "close", "shut"),
@@ -39,19 +44,47 @@ ACTION_ALIASES = {
 }
 
 MUTATING_ACTIONS = frozenset({
-    "take", "drop", "use", "open", "close", "unlock", "lock", "break",
+    "take", "drop", "give", "use", "open", "close", "unlock", "lock", "break",
 })
 TARGET_REQUIRED_ACTIONS = frozenset({
-    "take", "drop", "use", "unlock", "lock", "break",
+    "take", "drop", "give", "use", "unlock", "lock", "break",
 })
 
 _ABSTRACT_ACTION_PATTERNS = (
-    r"\btake\s+(?:a\s+)?(?:look|moment|breath|break|road|path|route|turn)\b",
+    r"\btake\s+(?:a\s+|the\s+)?(?:[a-z-]+\s+){0,2}"
+    r"(?:look|moment|breath|break|road|path|route|passage|corridor|hallway|"
+    r"stairs?|stairway|staircase|ladder|bridgeway|gangway|trail|tunnel|"
+    r"doorway|exit|turn)\b",
     r"\buse\s+(?:the\s+)?(?:hidden\s+)?(?:plan|strategy|trick|force|violence|skill|chance|time|road|path|route)\b",
     r"\bopen\s+fire\b",
     r"\bdrop\s+(?:the\s+)?subject\b",
+    r"\bgive\s+(?:the\s+)?(?:rats?|people|crowd|others?|them|him|her)\s+"
+    r"(?:enough\s+)?(?:room|space|way)\b",
     r"用[^\s，。！？]{0,24}(?:力量|暴力|方法|方式|计划|策略)",
 )
+
+_NAVIGATION_TAKE_RE = re.compile(
+    r"\btake\s+(?:a\s+|the\s+)?(?:[a-z-]+\s+){0,3}"
+    r"(?:road|path|route|passage|corridor|hallway|stairs?|stairway|"
+    r"staircase|ladder|bridgeway|gangway|trail|tunnel|doorway|exit|turn)\b",
+    re.IGNORECASE,
+)
+_CHINESE_NAVIGATION_RE = re.compile(
+    r"(?:走|去|前往|进入|穿过|沿着|通过|爬|上|下|返回).{0,16}"
+    r"(?:楼梯|梯子|走廊|通道|桥道|栈桥|道路|小径|隧道|门口|出口)"
+)
+
+
+def looks_like_navigation_action(player_input: str) -> bool:
+    """Recognize route-taking phrases before stale object selection can bind."""
+    text = (player_input or "").lower()
+    return bool(_NAVIGATION_TAKE_RE.search(text)
+                or _CHINESE_NAVIGATION_RE.search(text))
+
+
+def looks_like_abstract_action(player_input: str) -> bool:
+    text = (player_input or "").lower()
+    return any(re.search(pattern, text) for pattern in _ABSTRACT_ACTION_PATTERNS)
 
 
 def normalize(value: str) -> str:
@@ -70,6 +103,10 @@ def detect_action(player_input: str) -> str:
         return "take"
     if re.search(r"\bput\b.{0,40}\bdown\b", lowered):
         return "drop"
+    if re.search(r"\b(?:hand|turn)\b.{0,40}\bover\b", lowered):
+        return "give"
+    if re.search(r"把.{1,40}给.{1,40}", lowered):
+        return "give"
     hits = []
     for intent, aliases in ACTION_ALIASES.items():
         for alias in aliases:
@@ -121,7 +158,7 @@ def build_action_planner_prompt(player_input: str, intent: str,
         "candidate list. Never invent an entity, location, success, clue, or "
         "state change. Return JSON only with keys intent, target_id, tool_id, "
         "confidence, ambiguous. intent must be one of take/drop/use/open/close/"
-        "unlock/lock/read/inspect/break/none. Use an empty id if unresolved.\n\n"
+        "unlock/lock/give/read/inspect/break/none. Use an empty id if unresolved.\n\n"
         f"Detected verb hint: {intent or 'none'}\n"
         f"Player: {player_input}\n"
         f"Candidates: {json.dumps(safe_candidates, ensure_ascii=False)}"
@@ -171,6 +208,8 @@ def plan_action(player_input: str, session: dict, world: dict,
     selected = session.get("selected_object_id")
     by_id = {item["id"]: item for item in candidates}
     explicit = _explicit_targets(player_input, candidates, world)
+    navigation_action = looks_like_navigation_action(player_input)
+    abstract_action = looks_like_abstract_action(player_input)
 
     target_id = ""
     source = "none"
@@ -181,7 +220,8 @@ def plan_action(player_input: str, session: dict, world: dict,
     elif len(explicit) > 1:
         ambiguous = True
         source = "ambiguous_visible_reference"
-    elif selected in by_id and intent:
+    elif (selected in by_id and intent
+          and not navigation_action and not abstract_action):
         target_id = selected
         source = "selected_object"
 
@@ -198,7 +238,8 @@ def plan_action(player_input: str, session: dict, world: dict,
 
     # The model is useful only for semantic resolution that deterministic name
     # matching could not settle. It receives no hidden entities.
-    if intent and not target_id and ai_planner and candidates:
+    if (intent and not target_id and not navigation_action
+            and ai_planner and candidates):
         prompt = build_action_planner_prompt(player_input, intent, candidates)
         ai = parse_ai_proposal(ai_planner(prompt), set(by_id))
         if ai:
@@ -230,8 +271,7 @@ def validate_action(proposal: dict, session: dict, world: dict) -> dict:
     # and "use the plan" in the open narrative path.
     if not target_id:
         text = str(proposal.get("player_input", "")).lower()
-        is_abstract = any(re.search(pattern, text)
-                          for pattern in _ABSTRACT_ACTION_PATTERNS)
+        is_abstract = looks_like_abstract_action(text)
         if intent in TARGET_REQUIRED_ACTIONS and not is_abstract:
             if intent == "break":
                 return {
@@ -276,6 +316,34 @@ def validate_action(proposal: dict, session: dict, world: dict) -> dict:
         base["events"] = [{
             "type": "item_dropped", "entity_id": target_id,
             "scene_id": current_scene,
+        }]
+    elif intent == "give":
+        if kind != "inventory":
+            return {**base, "status": "blocked", "message": "你并没有携带这个对象。"}
+        recipient_id = str(session.get("selected_npc_id", ""))
+        recipient = world.get("entities", {}).get(recipient_id, {})
+        if not recipient_id or recipient.get("type") != "npc":
+            return {
+                **base, "status": "blocked",
+                "message": "请先选择一名在场人物作为接收者。",
+            }
+        from reference_resolver import npc_is_interactable
+        recipient_fact = fact_for(session, world, recipient_id)
+        recipient_location = recipient_fact.get("location", {})
+        recipient_present = (
+            recipient_location.get("kind") == "scene"
+            and str(recipient_location.get("id", "")) == current_scene
+        ) or recipient_id in set(session.get("companions", []))
+        if (not recipient_present
+                or not recipient_fact.get("visible", False)
+                or not npc_is_interactable(recipient_id, world, session)):
+            return {
+                **base, "status": "blocked",
+                "message": "所选人物当前不在场或无法接收物品。",
+            }
+        base["events"] = [{
+            "type": "item_transferred", "entity_id": target_id,
+            "owner_id": recipient_id,
         }]
     elif intent == "use":
         if kind != "inventory":
@@ -335,3 +403,44 @@ def legacy_state_matches_action(entity: dict, current_state: str,
     intent = proposal.get("intent", "none")
     aliases = ACTION_ALIASES.get(intent, ())
     return any(any(alias in trigger for alias in aliases) for trigger in triggers)
+
+
+def legacy_action_requirements(state_def: dict, session: dict) -> list[str]:
+    """Return unmet closed-world prerequisites for an authored state trigger."""
+    missing: list[str] = []
+    inventory = set(session.get("inventory_entity_ids", []))
+    flags = set(session.get("flags", []))
+    entity_states = session.get("entity_states", {})
+
+    required_inventory = state_def.get("requires_inventory", [])
+    if isinstance(required_inventory, str):
+        required_inventory = [required_inventory]
+    for entity_id in required_inventory if isinstance(required_inventory, list) else []:
+        entity_id = str(entity_id).strip()
+        if entity_id and entity_id not in inventory:
+            missing.append(f"inventory:{entity_id}")
+
+    required_flags = state_def.get("requires_flags", [])
+    if isinstance(required_flags, str):
+        required_flags = [required_flags]
+    for flag in required_flags if isinstance(required_flags, list) else []:
+        flag = str(flag).strip()
+        if flag and flag not in flags:
+            missing.append(f"flag:{flag}")
+
+    any_flags = state_def.get("requires_any_flags", [])
+    if isinstance(any_flags, str):
+        any_flags = [any_flags]
+    if isinstance(any_flags, list):
+        choices = [str(flag).strip() for flag in any_flags if str(flag).strip()]
+        if choices and not any(flag in flags for flag in choices):
+            missing.append("any_flag:" + "|".join(choices))
+
+    required_states = state_def.get("requires_entity_states", {})
+    if isinstance(required_states, dict):
+        for entity_id, expected in required_states.items():
+            allowed = expected if isinstance(expected, list) else [expected]
+            allowed = {str(value) for value in allowed}
+            if str(entity_states.get(str(entity_id), "")) not in allowed:
+                missing.append(f"state:{entity_id}")
+    return missing

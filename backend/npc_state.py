@@ -160,14 +160,19 @@ def merge_npcs(world: dict) -> dict[str, dict]:
         npc_with_type = {**npc, "type": "npc"}
         _extract(npc_id, npc_with_type)
 
-    # Initialize disclosure from the opening narration: an NPC whose real name
-    # already appears in the opening text is known to the player (e.g. a famous
-    # climber introduced by name); everyone else starts hidden until revealed
-    # through play (asking their name, an event, reaching a scene…).
+    # Initialize disclosure from player-facing evidence. `known_to_player` is
+    # set only when the module explicitly names the NPC in an opening, briefing,
+    # handout, or other information the characters begin with.
     opening = world.get("opening", "") or ""
+    public_names = {
+        str(entity.get("name", ""))
+        for entity in entities.values()
+        if (isinstance(entity, dict) and entity.get("type") == "npc"
+            and entity.get("known_to_player") is True)
+    }
     for nm, rec in merged.items():
         d = rec["dynamic"].setdefault("disclosure", {"name": False, "background": False})
-        d["name"] = nm in opening
+        d["name"] = nm in opening or nm in public_names
 
     return merged
 

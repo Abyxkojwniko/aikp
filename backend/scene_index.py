@@ -78,7 +78,7 @@ def build_scene_index(world: dict) -> dict[str, list[str]]:
 
 
 def build_entity_index(world: dict) -> dict[str, dict]:
-    """Build entity_id → {type, scene, name} for O(1) metadata lookup."""
+    """Build the stable runtime metadata index for entity resolution."""
     index: dict[str, dict] = {}
     entities = world.get("entities", {})
 
@@ -87,6 +87,10 @@ def build_entity_index(world: dict) -> dict[str, dict]:
             "type": entity.get("type", "?"),
             "scene": entity.get("scene", ""),
             "name": entity.get("name", eid),
+            "aliases": list(entity.get("aliases", []))
+            if isinstance(entity.get("aliases", []), list) else [],
+            "public_label": entity.get("public_label", ""),
+            "known_to_player": entity.get("known_to_player") is True,
         }
 
     # Legacy compat: build entries from old npcs/items/clues if entities is empty
@@ -96,6 +100,10 @@ def build_entity_index(world: dict) -> dict[str, dict]:
                 "type": "npc",
                 "scene": npc.get("scene", ""),
                 "name": npc.get("name", npc_id),
+                "aliases": list(npc.get("aliases", []))
+                if isinstance(npc.get("aliases", []), list) else [],
+                "public_label": npc.get("public_label", ""),
+                "known_to_player": npc.get("known_to_player") is True,
             }
         for item_id, item in world.get("items", {}).items():
             index[item_id] = {

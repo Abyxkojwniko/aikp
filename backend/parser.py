@@ -15,6 +15,7 @@ import os
 import time
 import re
 import hashlib
+import copy
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -26,9 +27,11 @@ from config import (
     WORLD_BOOK_DIR,
     BACKEND_DIR,
     FULL_REBUILD_MAX_CHARS,
+    LONG_DOCUMENT_WINDOW_CHARS,
     NODE_SOURCE_MAX_CHARS,
     NODE_QUALITY_THRESHOLD,
     NODE_REBUILD_MAX_RETRIES,
+    PARSER_ABLATION,
 )
 from chunker import chunk_document, Chunk
 
@@ -71,26 +74,34 @@ Return ONLY one valid JSON object:
   "overview": {
     "title":"", "mystery":"", "opening":"verbatim player-facing opening",
     "starting_node":"playable story-tree node id",
-    "starting_scene":"runtime scene id or exact name", "genre":"", "rule_system":"coc or dnd"
+    "starting_scene":"runtime scene id or exact name", "genre":"",
+    "ruleset":"coc/dnd/starfinder/runequest/brp/dragonbane/pendragon/7thsea/gumshoe/coriolis/other",
+    "dice_system":"d100/d20/d6_pool/custom"
   },
   "story_spine": {
     "premise":"", "truth":"KP-only causal truth", "timeline":["ordered facts"],
     "acts":[{"id":"", "goal":"", "turning_point":""}],
     "invariants":["facts that must never change without a committed game event"]
   },
+  "scenarios": [
+    {"id":"stable scenario id", "title":"", "root_node_id":"",
+     "starting_node":"playable node id", "starting_scene":"runtime scene id or exact name"}
+  ],
   "narrative_scopes": [
     {"id":"physical", "kind":"physical", "parent_scope":"", "navigable":true,
      "description":"the real playable layer"}
   ],
   "entity_registry": [
     {"id":"stable canonical id", "name":"", "type":"npc or unique_object or concept",
-     "aliases":[], "identity_rule":"how occurrences are recognized as this identity"}
+     "aliases":[], "identity_rule":"how occurrences are recognized as this identity",
+     "known_to_player":false}
   ],
   "story_tree": {
     "root_id":"root",
     "nodes":[
-      {"id":"stable node id", "parent_id":"root or another node", "children":[],
-       "title":"", "kind":"act or scene or event or decision or outcome or ending",
+      {"id":"stable node id", "scenario_id":"scenario id, or empty only for collection root",
+       "parent_id":"root or another node", "children":[],
+       "title":"", "kind":"act or opening or event or choice or clue or encounter or ending",
        "scope_id":"physical", "playable":true, "summary":"rough global role only",
        "source_refs":[0],
        "preconditions":["rough causal prerequisites"],
@@ -106,6 +117,53 @@ Return ONLY one valid JSON object:
 Use the supplied source catalog offsets to disambiguate repeated names. Never turn a
 heading into a scene merely because it looks like a location. Never merge facts from
 different narrative scopes or different physical rooms."""
+
+
+DOCUMENT_MAP_SYSTEM = """You are mapping ONE ordered window of a long TRPG document.
+
+This is an evidence-preserving compression pass, not the final reconstruction. Classify
+rules, reference material, adventures, character sheets, handouts, examples, and
+metadata separately. Find every independent adventure/scenario in the window and never
+merge their people, places, or causal chains. A fictional place inside a book, dream,
+legend, memory, example, or backstory must remain in its non-physical narrative scope.
+
+Use ONLY SOURCE_REF values printed in this window. Preserve endings, failure routes,
+optional routes, irreversible state changes, and setup/payoff links even when briefly.
+The payload may include `known_scenarios` discovered in earlier windows. If this
+window continues one of them, reuse its exact id. Create a new id only with evidence
+that a genuinely independent adventure begins here.
+Return ONLY JSON:
+{
+  "document_roles":[{"source_refs":[0],"kind":"rules/reference/adventure/characters/handout/metadata",
+    "scenario_id":"stable id or empty","summary":"compact evidence-backed role"}],
+  "story_fragments":[{"scenario_id":"stable id","title":"","scope_id":"physical",
+    "source_refs":[0],"summary":"what happens and why","preconditions":[],"outcomes":[],
+    "choices":[],"links_to":[]}],
+  "entity_mentions":[{"scenario_id":"","id":"stable id","name":"","type":"npc/unique_object/concept",
+    "aliases":[],"source_refs":[0]}],
+  "scope_mentions":[{"scenario_id":"","id":"","kind":"physical/book/dream/memory/legend/example/backstory",
+    "navigable":false,"source_refs":[0]}],
+  "unresolved_links":[{"from":"","to_hint":"","relation":"before/causes/enables/branches_to/reveals/pays_off",
+    "source_refs":[0]}]
+}"""
+
+
+LONG_DOCUMENT_SYNTHESIS_SYSTEM = FULL_REBUILD_SYSTEM + """
+
+LONG-DOCUMENT SYNTHESIS RULES:
+- You receive a closed source catalog and ordered evidence maps covering the complete
+  document, not raw prose. Reconstruct the global story only from those maps.
+- Keep independent scenarios as separate subtrees. Never connect them merely because
+  they share a rulebook, archetype, room name, or generic object.
+- Preserve every non-empty `scenario_id` from the evidence maps exactly. Emit one
+  `scenarios` registry row per independent adventure and put that id on every node in
+  its subtree. Only a collection-level root may have an empty scenario_id.
+- Story node ids must be globally unique across the complete document. Prefix them
+  with scenario_id when two adventures use similar local headings.
+- Rules/examples/character sheets may inform metadata but are not playable story nodes.
+- Every playable node must select source_refs from the closed catalog. Detailed facts
+  will be rebuilt later from the original passages at those refs.
+"""
 
 
 NODE_REBUILD_SYSTEM = """Expand ONE node from a globally planned TRPG story tree.
@@ -124,6 +182,9 @@ DETAIL REQUIREMENTS:
   knowledge gains; relationship changes; promises/setups and their payoffs.
 - NPC occurrences must use canonical registry ids. Generic physical objects are local
   instances even if another scene has the same name.
+- Set an NPC's `known_to_player` true only when player-facing opening, briefing, or
+  handout evidence explicitly gives the player that real name. A name present only in
+  KP notes, future scenes, secrets, or the entity registry remains false.
 - Every scene/entity/clue/event/state transition/branch must have a short exact
   `source_quote` from the supplied evidence and `source_ref` equal to its catalog start.
 - Do not expose locations inside books, memories, legends or visions as physical map
@@ -137,7 +198,7 @@ Return ONLY JSON:
     "desc":"detailed concrete description","purpose":"","npcs":[],"exits":{},
     "source_ref":0,"source_quote":""}],
   "npcs":[{"id":"canonical registry id","name":"","aliases":[],"scene":"","all_scenes":[],
-    "profession":"","public_label":"","appearance":"","personality":"","dialogue":{},
+    "profession":"","public_label":"","known_to_player":false,"appearance":"","personality":"","dialogue":{},
     "storyline":[{"beat":"node id","does":""}],"storyline_secret":"",
     "source_ref":0,"source_quote":""}],
   "objects":[{"id":"local base id","name":"","type":"item/object/door/container/document",
@@ -191,6 +252,7 @@ Return ONLY valid JSON (no markdown, no explanation):
 }
 
 NPC aliases: list ALL ways each character is referred to in the text. For example, if character 尾金星杉 is also called "年轻人" or "年轻男子" in scene descriptions, include those as aliases.
+Set known_to_player=true only when player-facing opening, briefing, or handout text explicitly gives that real name. A name appearing only in KP material or a future scene is false.
 One-off unnamed characters (old woman who appears once, a random climber) should NOT be in this list — only recurring named characters.
 rule_system detection: if the text mentions CoC/克苏鲁/d100/SAN/理智/幸运 -> "coc"; if D&D/DnD/d20/DC/AC -> "dnd"; default "dnd"."""
 
@@ -216,7 +278,7 @@ the chunk contains no supporting sentence.
 Return ONLY valid JSON:
 {
   "scenes": [{"id":"short_english_slug","name":"中文名","desc":"3-5 sentence description","purpose":"one KP sentence","type":"location","source_quote":"exact quote"}],
-  "npcs": [{"id":"...","name":"...","scene":"scene_id","profession":"...","public_label":"原文中玩家在未知姓名时实际看见的称呼，必须逐字出现于该场景原文且不得包含姓名或秘密身份；无法确认则留空","appearance":"...","personality":"...","dialogue":{"topic":"line"},"source_quote":"exact quote"}],
+  "npcs": [{"id":"...","name":"...","scene":"scene_id","profession":"...","public_label":"原文中玩家在未知姓名时实际看见的称呼，必须逐字出现于该场景原文且不得包含姓名或秘密身份；无法确认则留空","known_to_player":false,"appearance":"...","personality":"...","dialogue":{"topic":"line"},"source_quote":"exact quote"}],
   "items": [{"id":"...","name":"...","scene":"scene_id","desc":"...","source_quote":"exact quote"}],
   "clues": [{"id":"...","name":"...","scene":"scene_id","desc":"...","check":"Skill DC","reveals":"...","points_to":"","source_quote":"exact quote"}],
   "events": [{"id":"...","name":"...","desc":"...","scene":"scene_id","trigger":"...","source_quote":"exact quote"}]
@@ -357,14 +419,36 @@ PASS_NPC_STYLE_SYSTEM = """你是 TRPG 角色分析师。根据每个 NPC 的【
 
 # ── Parser Class ──────────────────────────────────────────────
 
+PARSER_ABLATIONS = frozenset({
+    "full", "legacy", "no_document_map", "no_semantic_judge", "no_node_repair",
+})
+
+
 class ModuleParser:
-    def __init__(self, api_key: str, base_url: str = DEEPSEEK_BASE_URL, model: str = "deepseek-chat"):
+    def __init__(self, api_key: str, base_url: str = DEEPSEEK_BASE_URL,
+                 model: str = "deepseek-chat", ablation: str = PARSER_ABLATION):
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
+        self.ablation = ablation if ablation in PARSER_ABLATIONS else "full"
         self._last_error = None  # set when an LLM call fails
+        self._experiment_usage = {
+            "calls": 0,
+            "failures": 0,
+            "prompt_chars": 0,
+            "response_chars": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+
+    def experiment_usage(self) -> dict:
+        """Return parser-call telemetry without exposing provider credentials."""
+        return copy.deepcopy(self._experiment_usage)
 
     def _llm(self, system: str, user: str, temperature: float = 0.3,
              max_tokens: int = 4096, json_mode: bool = False) -> str:
+        usage = self._experiment_usage
+        usage["calls"] += 1
+        usage["prompt_chars"] += len(system) + len(user)
         try:
             print(f"[PARSER:LLM] Calling {self.model} with {len(user)} chars (max_tokens={max_tokens})...", flush=True)
             kwargs = {}
@@ -385,9 +469,16 @@ class ModuleParser:
                 **kwargs,
             )
             result = resp.choices[0].message.content or ""
+            usage["response_chars"] += len(result)
+            provider_usage = getattr(resp, "usage", None)
+            usage["prompt_tokens"] += int(
+                getattr(provider_usage, "prompt_tokens", 0) or 0)
+            usage["completion_tokens"] += int(
+                getattr(provider_usage, "completion_tokens", 0) or 0)
             print(f"[PARSER:LLM] Response: {len(result)} chars, starts: {result[:80]}", flush=True)
             return result
         except Exception as e:
+            usage["failures"] += 1
             msg = str(e)[:200]
             print(f"[PARSER:LLM] ERROR: {msg}", flush=True)
             # Store error for status reporting; return empty so pipeline continues
@@ -487,22 +578,16 @@ class ModuleParser:
         The source catalog gives stable offsets for repeated room/object names. A
         later attributed pass expands each playable node in detail.
         """
-        if not text or len(text) > FULL_REBUILD_MAX_CHARS:
-            if len(text) > FULL_REBUILD_MAX_CHARS:
-                print(
-                    f"[PARSER:REBUILD] Document has {len(text)} chars, above "
-                    f"AIKP_FULL_REBUILD_MAX_CHARS={FULL_REBUILD_MAX_CHARS}; "
-                    "using legacy compatibility pipeline",
-                    flush=True,
-                )
+        if not text:
             return {}
 
-        catalog = []
-        for segment in _split_text_segments(text):
-            catalog.append({
-                "start": segment.get("start", 0),
-                "title": segment.get("title", ""),
-            })
+        segments = _split_text_segments(text)
+        catalog = _source_catalog(segments)
+        if len(text) > FULL_REBUILD_MAX_CHARS:
+            if getattr(self, "ablation", "full") == "no_document_map":
+                return {}
+            return self.pass_long_document_rebuild(text, segments, catalog)
+
         user = (
             "=== SOURCE CATALOG (offsets into the exact document below) ===\n"
             + json.dumps(catalog, ensure_ascii=False, separators=(",", ":"))
@@ -521,7 +606,124 @@ class ModuleParser:
         if not _valid_full_rebuild(result):
             print("[PARSER:REBUILD] Invalid reconstruction; falling back", flush=True)
             return {}
+        _normalize_story_node_kinds(result)
+        _normalize_story_scenarios(result)
         _bind_document_provenance(result, text)
+        result["_planning"] = {
+            "method": "complete_document",
+            "source_chars": len(text),
+            "window_count": 1,
+        }
+        return result
+
+    def pass_long_document_rebuild(
+        self,
+        text: str,
+        segments: Optional[list[dict]] = None,
+        catalog: Optional[list[dict]] = None,
+    ) -> dict:
+        """Map every long-document window, then synthesize one global story tree."""
+        segments = segments or _split_text_segments(text)
+        catalog = catalog or _source_catalog(segments)
+        windows = _catalog_windows(segments, LONG_DOCUMENT_WINDOW_CHARS)
+        if not windows:
+            return {}
+
+        print(
+            f"[PARSER:REBUILD] Long document has {len(text)} chars; mapping "
+            f"{len(windows)} complete structural windows",
+            flush=True,
+        )
+        maps = []
+        known_scenarios: dict[str, dict] = {}
+        for index, window in enumerate(windows, 1):
+            allowed_refs = [int(row.get("start", 0)) for row in window]
+            payload = {
+                "window_index": index,
+                "window_count": len(windows),
+                "allowed_source_refs": allowed_refs,
+                "known_scenarios": list(known_scenarios.values()),
+            }
+            user = (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                + "\n\n=== WINDOW SOURCE SECTIONS ===\n"
+                + _format_source_segments(window)
+            )
+            raw = self._llm(
+                DOCUMENT_MAP_SYSTEM,
+                user,
+                temperature=0.0,
+                max_tokens=4096,
+                json_mode=True,
+            )
+            mapped = self._parse_json(raw)
+            if not _valid_document_map(mapped, set(allowed_refs)):
+                print(
+                    f"[PARSER:REBUILD] Invalid document map at window {index}; "
+                    "long-document reconstruction aborted",
+                    flush=True,
+                )
+                return {}
+            mapped["window_index"] = index
+            mapped["allowed_source_refs"] = allowed_refs
+            maps.append(mapped)
+            for key in ("story_fragments", "document_roles"):
+                for row in mapped.get(key, []):
+                    if not isinstance(row, dict) or not row.get("scenario_id"):
+                        continue
+                    scenario_id = str(row["scenario_id"])
+                    known_scenarios.setdefault(scenario_id, {
+                        "id": scenario_id,
+                        "title": str(row.get("title") or row.get("summary", ""))[:240],
+                    })
+
+        synthesis_payload = {
+            "source_catalog": catalog,
+            "ordered_window_maps": maps,
+        }
+        raw = self._llm(
+            LONG_DOCUMENT_SYNTHESIS_SYSTEM,
+            json.dumps(synthesis_payload, ensure_ascii=False, separators=(",", ":")),
+            temperature=0.0,
+            max_tokens=8192,
+            json_mode=True,
+        )
+        result = self._parse_json(raw)
+        if not _valid_full_rebuild(result):
+            print("[PARSER:REBUILD] Invalid long-document synthesis", flush=True)
+            return {}
+        mapped_scenario_ids = {
+            str(row.get("scenario_id"))
+            for mapped in maps
+            for key in ("document_roles", "story_fragments")
+            for row in mapped.get(key, [])
+            if isinstance(row, dict) and row.get("scenario_id")
+        }
+        scenario_errors = _scenario_integrity_errors(result, mapped_scenario_ids)
+        if scenario_errors:
+            print(
+                "[PARSER:REBUILD] Invalid scenario isolation: "
+                + "; ".join(scenario_errors),
+                flush=True,
+            )
+            return {}
+        catalog_refs = {int(row["start"]) for row in catalog}
+        invalid_refs = _invalid_story_tree_refs(result, catalog_refs)
+        if invalid_refs:
+            print(
+                "[PARSER:REBUILD] Long-document synthesis invented source refs: "
+                + repr(sorted(invalid_refs)),
+                flush=True,
+            )
+            return {}
+        _normalize_story_node_kinds(result)
+        _bind_document_provenance(result, text)
+        result["_planning"] = {
+            "method": "hierarchical_document_map",
+            "source_chars": len(text),
+            "window_count": len(windows),
+            "catalog_size": len(catalog),
+        }
         return result
 
     def pass_node_rebuild(
@@ -627,13 +829,17 @@ class ModuleParser:
             best_detail: dict = {}
             best_report: dict = {"overall": 0, "passed": False}
             feedback: Optional[dict] = None
-            for attempt in range(NODE_REBUILD_MAX_RETRIES + 1):
+            retry_count = (0 if getattr(self, "ablation", "full") == "no_node_repair"
+                           else NODE_REBUILD_MAX_RETRIES)
+            for attempt in range(retry_count + 1):
                 detail = self.pass_node_rebuild(
                     blueprint, node, evidence, feedback=feedback)
                 deterministic = _score_story_node_detail(
                     node, detail, evidence, known_node_ids)
-                judgement = self.pass_node_evaluation(
-                    blueprint, node, detail, evidence)
+                judgement = (
+                    {} if getattr(self, "ablation", "full") == "no_semantic_judge"
+                    else self.pass_node_evaluation(blueprint, node, detail, evidence)
+                )
                 report = _combine_node_quality(
                     node_id, deterministic, judgement, attempt + 1)
                 if report["overall"] > best_report.get("overall", 0):
@@ -1357,7 +1563,10 @@ class ModuleParser:
         print(f"[PARSER] Starting pipeline: {len(text)} chars", flush=True)
 
         print("[PARSER] Rebuild: reading complete module into a rough story tree...", flush=True)
-        blueprint = self.pass_full_rebuild(text)
+        blueprint = (
+            {} if getattr(self, "ablation", "full") == "legacy"
+            else self.pass_full_rebuild(text)
+        )
         rebuilt: dict = {}
         if blueprint:
             details, node_quality = self.rebuild_story_tree_nodes(text, blueprint)
@@ -1370,7 +1579,12 @@ class ModuleParser:
             pass1 = [pass1_data]
             print("[PARSER] Rebuild: binding physical scenes to source...", flush=True)
             self.pass1_7_bind_source_text(pass1, text)
-            parser_mode = "hierarchical_story_tree_rebuild"
+            planning_method = blueprint.get("_planning", {}).get("method", "")
+            parser_mode = (
+                "hierarchical_long_document_rebuild"
+                if planning_method == "hierarchical_document_map"
+                else "hierarchical_story_tree_rebuild"
+            )
         else:
             # Compatibility path for oversized documents or invalid API output.
             print("[PARSER] Pass 0: Overview...", flush=True)
@@ -1396,8 +1610,11 @@ class ModuleParser:
         print("[PARSER] Assembling world book (code)...", flush=True)
         world_book = _assemble_world_book(pass1[0], pass2, overview)
         world_book["_parser_mode"] = parser_mode
+        world_book["_parser_ablation"] = getattr(self, "ablation", "full")
         if rebuilt:
             world_book["story_spine"] = rebuilt.get("story_spine", {})
+            world_book["scenarios"] = rebuilt.get("scenarios", [])
+            world_book["starting_scenario"] = overview.get("starting_scenario", "")
             world_book["narrative_scopes"] = embedded["narrative_scopes"]
             world_book["embedded_settings"] = embedded["embedded_settings"]
             world_book["entity_registry"] = rebuilt.get("entity_registry", [])
@@ -1428,11 +1645,25 @@ class ModuleParser:
         # starting_scene is already resolved by _assemble_world_book;
         # no further override needed here.
 
-        # Rule system: LLM detection → fallback heuristic
-        rule_system = overview.get("rule_system", "")
-        if rule_system not in ("dnd", "coc"):
-            rule_system = _detect_rule_system(text)
-        world_book["rule_system"] = rule_system
+        # Keep the concrete game ruleset separate from its dice/check family.
+        # Older books expose only coc/dnd through rule_system and remain valid.
+        detected = _detect_rule_profile(text)
+        ruleset = _normalize_ruleset(
+            overview.get("ruleset") or overview.get("rule_system"))
+        if detected["ruleset"] != "other":
+            ruleset = detected["ruleset"]
+        dice_system = str(overview.get("dice_system", "")).lower()
+        if detected["ruleset"] != "other":
+            dice_system = detected["dice_system"]
+        elif dice_system not in {"d100", "d20", "d6_pool", "custom"}:
+            dice_system = _ruleset_dice_system(ruleset)
+        world_book["ruleset"] = ruleset
+        world_book["dice_system"] = dice_system
+        world_book["rule_system"] = ruleset
+        world_book["automatic_check_adapter"] = ruleset in {
+            "coc", "dnd", "starfinder", "runequest", "brp", "dragonbane",
+            "pendragon",
+        }
 
         # Extract PL-facing information (player rules/warnings)
         pl_info = _extract_pl_info(text)
@@ -1477,6 +1708,11 @@ class ModuleParser:
         # Pass 3.5: Validation
         print("[PARSER] Pass 3.5: Validating...", flush=True)
         issues = self.pass3_5_validate(world_book)
+        if not world_book.get("automatic_check_adapter", True):
+            issues.append(
+                f"Ruleset '{world_book.get('ruleset')}' is parsed structurally but "
+                "has no automatic check adapter"
+            )
         reconstruction_quality = world_book.get("reconstruction_quality", {})
         if reconstruction_quality and not reconstruction_quality.get("passed"):
             issues.append(
@@ -1501,6 +1737,87 @@ class ModuleParser:
 _PROVENANCE_COLLECTIONS = ("scenes", "npcs", "items", "objects", "clues", "events")
 
 
+def _source_catalog(segments: list[dict]) -> list[dict]:
+    return [
+        {"start": int(segment.get("start", 0)),
+         "title": str(segment.get("title", ""))}
+        for segment in segments
+    ]
+
+
+def _format_source_segments(segments: list[dict]) -> str:
+    return "\n\n".join(
+        f"[SOURCE_REF={int(segment.get('start', 0))} "
+        f"TITLE={segment.get('title', '')}]\n{segment.get('text', '')}"
+        for segment in segments
+    )
+
+
+def _catalog_windows(segments: list[dict], max_chars: int) -> list[list[dict]]:
+    """Pack structural sections into bounded ordered windows without dropping text."""
+    max_chars = max(4000, int(max_chars))
+    parts: list[dict] = []
+    for segment in segments:
+        body = str(segment.get("text", ""))
+        if len(body) <= max_chars:
+            parts.append(segment)
+            continue
+        for part_index, start in enumerate(range(0, len(body), max_chars), 1):
+            part = dict(segment)
+            part["text"] = body[start:start + max_chars]
+            part["title"] = f"{segment.get('title', '')} [part {part_index}]"
+            parts.append(part)
+
+    windows: list[list[dict]] = []
+    current: list[dict] = []
+    current_chars = 0
+    for segment in parts:
+        size = len(str(segment.get("text", "")))
+        if current and current_chars + size > max_chars:
+            windows.append(current)
+            current = []
+            current_chars = 0
+        current.append(segment)
+        current_chars += size
+    if current:
+        windows.append(current)
+    return windows
+
+
+def _iter_source_refs(value: object):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"source_refs", "allowed_source_refs"} and isinstance(child, list):
+                for raw_ref in child:
+                    ref = _source_ref_value(raw_ref)
+                    if ref is not None:
+                        yield ref
+            else:
+                yield from _iter_source_refs(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_source_refs(child)
+
+
+def _valid_document_map(result: object, allowed_refs: set[int]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    required_lists = (
+        "document_roles", "story_fragments", "entity_mentions",
+        "scope_mentions", "unresolved_links",
+    )
+    if any(not isinstance(result.get(key), list) for key in required_lists):
+        return False
+    used_refs = set(_iter_source_refs(result))
+    return bool(used_refs) and used_refs.issubset(allowed_refs)
+
+
+def _invalid_story_tree_refs(result: dict, catalog_refs: set[int]) -> set[int]:
+    tree = result.get("story_tree", {}) if isinstance(result, dict) else {}
+    used = set(_iter_source_refs(tree))
+    return used - catalog_refs
+
+
 def _valid_full_rebuild(result: object) -> bool:
     """Require the global structures that distinguish rebuilding from extraction."""
     story_tree = result.get("story_tree", {}) if isinstance(result, dict) else {}
@@ -1514,6 +1831,128 @@ def _valid_full_rebuild(result: object) -> bool:
         and isinstance(story_tree.get("nodes"), list)
         and story_tree.get("nodes")
     )
+
+
+def _normalize_story_node_kinds(blueprint: dict) -> None:
+    """Map legacy planner labels onto the closed annotation taxonomy."""
+    aliases = {
+        "decision": "choice",
+        "revelation": "clue",
+        "climax": "encounter",
+        "resolution": "ending",
+        "scene": "event",
+        "investigation": "event",
+        "transition": "event",
+        "optional": "event",
+        "conditional": "event",
+        "outcome": "event",
+        "travel": "event",
+    }
+    allowed = {"root", "act", "opening", "event", "choice", "clue",
+               "encounter", "ending"}
+    tree = blueprint.get("story_tree", {})
+    for node in tree.get("nodes", []) if isinstance(tree, dict) else []:
+        if not isinstance(node, dict):
+            continue
+        kind = str(node.get("kind", "")).strip().lower()
+        kind = aliases.get(kind, kind)
+        if kind not in allowed:
+            kind = "event" if node.get("playable", True) else "act"
+        node["kind"] = kind
+
+
+def _normalize_story_scenarios(blueprint: dict) -> list[dict]:
+    """Give every story node an explicit scenario boundary and registry row."""
+    tree = blueprint.get("story_tree", {})
+    nodes = [row for row in tree.get("nodes", []) if isinstance(row, dict)]
+    explicit = [row for row in blueprint.get("scenarios", [])
+                if isinstance(row, dict) and row.get("id")]
+    explicit_ids = {str(row["id"]) for row in explicit}
+    observed_ids = {
+        str(row.get("scenario_id")) for row in nodes if row.get("scenario_id")
+    }
+    scenario_ids = explicit_ids | observed_ids
+    if not scenario_ids:
+        scenario_ids = {"main"}
+
+    default_id = next(iter(scenario_ids)) if len(scenario_ids) == 1 else ""
+    for node in nodes:
+        if not node.get("scenario_id") and (
+                default_id or node.get("playable", node.get("kind") not in {"root", "act"})):
+            node["scenario_id"] = default_id
+
+    node_by_id = {str(row.get("id")): row for row in nodes if row.get("id")}
+    overview = blueprint.setdefault("overview", {})
+    declared = {str(row["id"]): dict(row) for row in explicit}
+    registry = []
+    for scenario_id in sorted(scenario_ids):
+        scenario_nodes = [row for row in nodes
+                          if str(row.get("scenario_id", "")) == scenario_id]
+        playable = [row for row in scenario_nodes
+                    if row.get("playable", row.get("kind") not in {"root", "act"})]
+        row = declared.get(scenario_id, {"id": scenario_id})
+        root = str(row.get("root_node_id", ""))
+        if root not in node_by_id or str(node_by_id[root].get("scenario_id", "")) != scenario_id:
+            root = next((str(node.get("id")) for node in scenario_nodes
+                         if not node.get("parent_id") or str(node.get("parent_id")) not in {
+                             str(item.get("id")) for item in scenario_nodes
+                         }), "")
+        start = str(row.get("starting_node", ""))
+        overview_start = str(overview.get("starting_node", ""))
+        if start not in node_by_id or str(node_by_id[start].get("scenario_id", "")) != scenario_id:
+            start = (overview_start if overview_start in node_by_id
+                     and str(node_by_id[overview_start].get("scenario_id", "")) == scenario_id
+                     else next((str(node.get("id")) for node in playable), root))
+        row.update({"id": scenario_id, "root_node_id": root, "starting_node": start})
+        row.setdefault("title", (overview.get("title", "") if len(scenario_ids) == 1
+                                 else scenario_id))
+        row.setdefault("starting_scene", "")
+        registry.append(row)
+    blueprint["scenarios"] = registry
+    if registry:
+        selected = str(overview.get("starting_scenario", ""))
+        if selected not in {row["id"] for row in registry}:
+            overview["starting_scenario"] = registry[0]["id"]
+    return registry
+
+
+def _scenario_integrity_errors(blueprint: dict, expected_ids: set[str] | None = None) -> list[str]:
+    """Return deterministic anthology-boundary violations."""
+    registry = _normalize_story_scenarios(blueprint)
+    nodes = [row for row in blueprint.get("story_tree", {}).get("nodes", [])
+             if isinstance(row, dict) and row.get("id")]
+    node_ids = [str(row["id"]) for row in nodes]
+    node_by_id = {str(row["id"]): row for row in nodes}
+    errors = []
+    duplicate_ids = sorted({node_id for node_id in node_ids
+                            if node_ids.count(node_id) > 1})
+    if duplicate_ids:
+        errors.append("duplicate story node ids: " + ", ".join(duplicate_ids))
+    registry_ids = {str(row["id"]) for row in registry}
+    expected = {str(value) for value in (expected_ids or set()) if value}
+    if expected and not expected.issubset(registry_ids):
+        errors.append("missing mapped scenarios: " + ", ".join(sorted(expected - registry_ids)))
+    for node in nodes:
+        if node.get("playable", node.get("kind") not in {"root", "act"}) \
+                and not node.get("scenario_id"):
+            errors.append(f"playable node {node['id']!r} has no scenario_id")
+
+    edges = []
+    for node in nodes:
+        for target in node.get("successors", []):
+            edges.append((str(node["id"]), str(target), "successor"))
+    for row in blueprint.get("story_tree", {}).get("relations", []):
+        if isinstance(row, dict):
+            edges.append((str(row.get("from", "")), str(row.get("to", "")),
+                          str(row.get("type", "relation"))))
+    for source, target, edge_type in edges:
+        left, right = node_by_id.get(source, {}), node_by_id.get(target, {})
+        left_id, right_id = str(left.get("scenario_id", "")), str(right.get("scenario_id", ""))
+        if left_id and right_id and left_id != right_id:
+            errors.append(
+                f"cross-scenario {edge_type}: {source!r} ({left_id}) -> "
+                f"{target!r} ({right_id})")
+    return errors
 
 
 def _source_ref_value(value: object) -> Optional[int]:
@@ -1573,9 +2012,7 @@ def _select_node_evidence(text: str, node: dict) -> dict:
         start = int(segment.get("start", 0))
         body = str(segment.get("text", ""))
         if len(body) > per_section:
-            marker = "\n... [middle of selected source section omitted] ...\n"
-            keep = max(0, per_section - len(marker))
-            body = body[:keep // 2] + marker + body[-(keep - keep // 2):]
+            body = _focused_source_excerpt(body, node, per_section)
         source_map[start] = body
         blocks.append(
             f"[SOURCE_REF={start} TITLE={segment.get('title', '')}]\n{body}"
@@ -1587,6 +2024,51 @@ def _select_node_evidence(text: str, node: dict) -> dict:
         "requested_refs": requested,
         "invalid_requested_refs": [ref for ref in requested if ref not in by_start],
     }
+
+
+def _focused_source_excerpt(source: str, node: dict, limit: int) -> str:
+    """Keep section boundaries plus contract-relevant evidence from its middle."""
+    if len(source) <= limit:
+        return source
+    marker = "\n... [non-selected source span omitted] ...\n"
+    boundary_budget = max(600, limit // 5)
+    head = source[:boundary_budget]
+    tail = source[-boundary_budget:]
+    contract_text = " ".join([
+        str(node.get("title", "")), str(node.get("summary", "")),
+        " ".join(map(str, node.get("preconditions", []))),
+        " ".join(map(str, node.get("outcomes", []))),
+    ])
+    phrases = [str(node.get("title", "")).strip()]
+    phrases.extend(re.findall(r"[A-Za-z][A-Za-z0-9'’-]{3,}|[\u4e00-\u9fff]{2,}",
+                              contract_text))
+    positions = []
+    lowered = source.lower()
+    for phrase in phrases:
+        if not phrase:
+            continue
+        position = lowered.find(phrase.lower())
+        if position >= boundary_budget and position < len(source) - boundary_budget:
+            if all(abs(position - existing) > 500 for existing in positions):
+                positions.append(position)
+        if len(positions) >= 8:
+            break
+
+    remaining = max(0, limit - len(head) - len(tail) - len(marker) * 2)
+    focused = []
+    if positions and remaining:
+        span = max(240, remaining // len(positions))
+        for position in positions:
+            start = max(boundary_budget, position - span // 2)
+            end = min(len(source) - boundary_budget, start + span)
+            focused.append(source[start:end])
+    middle = marker.join(focused)
+    result = head + marker + middle + marker + tail
+    if len(result) <= limit:
+        return result
+    # Marker overhead can exceed the estimate when many anchors are selected.
+    overflow = len(result) - limit
+    return head + marker + middle[:-overflow] + marker + tail
 
 
 _NODE_PROVENANCE_COLLECTIONS = (
@@ -2103,18 +2585,94 @@ def _extract_pl_info(text: str) -> str:
 
 # ── Rule System Detection ─────────────────────────────────────
 
-_COC_KEYWORDS = re.compile(
-    r'克苏鲁|COC|[Cc]all\s+of\s+[Cc]thulhu|d100|1d100|SAN值|理智值|理智检定|幸运检定|'
-    r'技能值|POW|STR|DEX|CON|APP|SIZ|INT|EDU|侦查|聆听|图书馆',
-    re.IGNORECASE,
+_RULESET_PATTERNS = (
+    ("starfinder", re.compile(
+        r'\bStarfinder(?:\s+Second\s+Edition)?\b', re.IGNORECASE)),
+    ("coriolis", re.compile(
+        r'\bCoriolis:\s*The\s+Great\s+Dark\b|\bThe\s+Sky\s+Machine\b',
+        re.IGNORECASE)),
+    ("runequest", re.compile(r'\bRuneQuest\b|Glorantha|符文战争', re.IGNORECASE)),
+    ("dragonbane", re.compile(r'\bDragonbane\b|\bDrakar och Demoner\b', re.IGNORECASE)),
+    ("pendragon", re.compile(
+        r'\bPendragon\b|Great Pendragon Campaign|Player-knights?', re.IGNORECASE)),
+    ("7thsea", re.compile(r'\b7th\s+Sea\b|7TH SEA ADVENTURES', re.IGNORECASE)),
+    ("gumshoe", re.compile(r'\bGUMSHOE\b|Trail of Cthulhu', re.IGNORECASE)),
+    ("coc", re.compile(
+        r'克苏鲁的呼唤|克苏鲁神话|\bCOC\b|\bCall\s+of\s+Cthulhu\b|SAN值|理智检定',
+        re.IGNORECASE)),
+    ("dnd", re.compile(
+        r'\bD&D\b|\bDungeons\s*&\s*Dragons\b|龙与地下城|\bArmor Class\b',
+        re.IGNORECASE)),
+    ("brp", re.compile(
+        r'\bBasic Roleplaying\b|\bBRP\b|Universal Game Engine',
+        re.IGNORECASE)),
 )
 
+
+def _normalize_ruleset(value: object) -> str:
+    normalized = re.sub(r'[^a-z0-9]+', '', str(value or "").lower())
+    aliases = {
+        "callofcthulhu": "coc", "cthulhu": "coc", "coc": "coc",
+        "dungeonsdragons": "dnd", "dnd": "dnd", "d20": "dnd",
+        "starfinder": "starfinder", "starfinder2e": "starfinder",
+        "starfindersecondedition": "starfinder",
+        "runequest": "runequest", "rq": "runequest",
+        "basicroleplaying": "brp", "brp": "brp",
+        "dragonbane": "dragonbane", "drakarochdemoner": "dragonbane",
+        "pendragon": "pendragon", "kingarthurpendragon": "pendragon",
+        "7thsea": "7thsea", "seventhsea": "7thsea",
+        "gumshoe": "gumshoe",
+        "coriolis": "coriolis", "coriolisthegreatdark": "coriolis",
+    }
+    return aliases.get(normalized, "other")
+
+
+def _ruleset_dice_system(ruleset: str) -> str:
+    if ruleset in {"coc", "runequest", "brp"}:
+        return "d100"
+    if ruleset in {"dnd", "starfinder", "dragonbane", "pendragon"}:
+        return "d20"
+    if ruleset == "coriolis":
+        return "d6_pool"
+    return "custom"
+
+
+def _detect_rule_profile(text: str) -> dict:
+    """Detect a concrete ruleset without conflating every percentile game with CoC."""
+    snippet = text[:16000]
+    title_block = text[:3500]
+    title_signatures = (
+        ("starfinder", r'STARFINDER(?:\s+SECOND\s+EDITION)?.{0,100}'
+                       r'(?:ADVENTURE|FREE\s+RPG\s+DAY)'),
+        ("coriolis", r'CORIOLIS:\s*THE\s+GREAT\s+DARK|THE\s+SKY\s+MACHINE'),
+        ("brp", r'BASIC\s+ROLEPLAYING\s+QUICKSTART|Basic Roleplaying:\s*Universal'),
+        ("runequest", r'RUNEQUEST.{0,80}(?:QUICK-?START|QUICKSTART)|'
+                      r'(?:QUICK-?START|QUICKSTART).{0,80}RUNEQUEST'),
+        ("dragonbane", r'DRAGONBANE.{0,80}QUICKSTART'),
+        ("pendragon", r'PENDRAGON.{0,80}(?:QUICK-?START|SCENARIO)|'
+                       r'(?:QUICK-?START|SCENARIO).{0,80}PENDRAGON'),
+        ("7thsea", r'\b7TH\s+SEA\b'),
+        ("coc", r'CALL\s+OF\s+CTHULHU.{0,80}(?:QUICK-?START|QUICKSTART)'),
+    )
+    for ruleset, signature in title_signatures:
+        if re.search(signature, title_block, flags=re.IGNORECASE | re.DOTALL):
+            return {"ruleset": ruleset,
+                    "dice_system": _ruleset_dice_system(ruleset)}
+    for ruleset, pattern in _RULESET_PATTERNS:
+        if pattern.search(snippet):
+            return {"ruleset": ruleset,
+                    "dice_system": _ruleset_dice_system(ruleset)}
+    # Compatibility heuristic for unlabelled community modules.
+    if re.search(r'\bd100\b|1d100|percentile|percentage\s+roll',
+                 snippet, flags=re.IGNORECASE):
+        return {"ruleset": "brp", "dice_system": "d100"}
+    if re.search(r'\bd20\b|\bDC\s*\d+|\bAC\s*\d+', snippet, flags=re.IGNORECASE):
+        return {"ruleset": "dnd", "dice_system": "d20"}
+    return {"ruleset": "other", "dice_system": "custom"}
+
 def _detect_rule_system(text: str) -> str:
-    """Fallback heuristic: scan first 4000 chars for system indicators."""
-    snippet = text[:4000]
-    if _COC_KEYWORDS.search(snippet):
-        return "coc"
-    return "dnd"
+    """Backward-compatible concrete ruleset detector."""
+    return _detect_rule_profile(text)["ruleset"]
 
 
 # ── Deduplication ──────────────────────────────────────────────
@@ -2253,31 +2811,94 @@ def _merge_story_node_details(
     events: list[dict] = []
     node_to_scenes: dict[str, list[str]] = {}
     detail_by_node: dict[str, dict] = {}
-    for detail in details:
+    scenarios = _normalize_story_scenarios(blueprint)
+    anthology = len(scenarios) > 1
+
+    def scoped_id(scenario_id: str, value: object) -> str:
+        raw = str(value or "")
+        if not raw or not anthology or not scenario_id:
+            return raw
+        prefix = f"{scenario_id}::"
+        return raw if raw.startswith(prefix) else prefix + raw
+
+    def scoped_scene_ref(scenario_id: str, value: object) -> object:
+        if isinstance(value, dict):
+            result = dict(value)
+            for field in ("target", "scene_id", "to"):
+                if result.get(field):
+                    result[field] = scoped_id(scenario_id, result[field])
+            return result
+        return scoped_id(scenario_id, value)
+    node_contracts = {
+        str(row.get("id")): row
+        for row in blueprint.get("story_tree", {}).get("nodes", [])
+        if isinstance(row, dict) and row.get("id")
+    }
+    normalized_details = []
+    for raw_detail in details:
+        detail = dict(raw_detail) if isinstance(raw_detail, dict) else raw_detail
         if not isinstance(detail, dict):
             continue
         node_id = str(detail.get("node_id", ""))
+        scenario_id = str(node_contracts.get(node_id, {}).get("scenario_id", ""))
+        detail["scenario_id"] = scenario_id
+        normalized_details.append(detail)
         detail_by_node[node_id] = detail
-        local_scenes = [
-            scene for scene in detail.get("scenes", [])
-            if isinstance(scene, dict) and scene.get("id")
-        ]
+        local_scenes = []
+        for raw in detail.get("scenes", []):
+            if not isinstance(raw, dict) or not raw.get("id"):
+                continue
+            scene = dict(raw)
+            scene["scenario_id"] = scenario_id
+            scene["id"] = scoped_id(scenario_id, scene["id"])
+            if isinstance(scene.get("exits"), dict):
+                scene["exits"] = {
+                    label: scoped_scene_ref(scenario_id, target)
+                    for label, target in scene["exits"].items()
+                }
+            scene["npcs"] = [scoped_id(scenario_id, value)
+                             for value in scene.get("npcs", [])]
+            for clue in scene.get("clues", []):
+                if isinstance(clue, dict) and clue.get("id"):
+                    clue["id"] = scoped_id(scenario_id, clue["id"])
+            local_scenes.append(scene)
+        detail["scenes"] = local_scenes
         node_to_scenes[node_id] = [str(scene["id"]) for scene in local_scenes]
         scenes.extend(local_scenes)
-        for npc in detail.get("npcs", []):
-            if not isinstance(npc, dict) or not npc.get("id"):
+        for raw in detail.get("npcs", []):
+            if not isinstance(raw, dict) or not raw.get("id"):
                 continue
+            npc = dict(raw)
+            npc["scenario_id"] = scenario_id
+            npc["id"] = scoped_id(scenario_id, npc["id"])
+            if npc.get("scene"):
+                npc["scene"] = scoped_id(scenario_id, npc["scene"])
+            if isinstance(npc.get("all_scenes"), list):
+                npc["all_scenes"] = [scoped_id(scenario_id, value)
+                                     for value in npc["all_scenes"]]
             npc_id = str(npc["id"])
             npc_by_id[npc_id] = (
                 _merge_rich_record(npc_by_id[npc_id], npc)
                 if npc_id in npc_by_id else dict(npc)
             )
-        objects.extend([
-            row for row in detail.get("objects", detail.get("items", []))
-            if isinstance(row, dict)
-        ])
-        clues.extend([row for row in detail.get("clues", []) if isinstance(row, dict)])
-        events.extend([row for row in detail.get("events", []) if isinstance(row, dict)])
+        for key, destination in (("objects", objects), ("clues", clues), ("events", events)):
+            source = detail.get(key, detail.get("items", []) if key == "objects" else [])
+            rows = []
+            for raw in source:
+                if not isinstance(raw, dict):
+                    continue
+                row = dict(raw)
+                row["scenario_id"] = scenario_id
+                if row.get("id"):
+                    row["id"] = scoped_id(scenario_id, row["id"])
+                if row.get("scene"):
+                    row["scene"] = scoped_id(scenario_id, row["scene"])
+                if isinstance(row.get("all_scenes"), list):
+                    row["all_scenes"] = [scoped_id(scenario_id, value)
+                                         for value in row["all_scenes"]]
+                rows.append(row)
+                destination.append(row)
+            detail[key] = rows
 
     scene_graph: dict[str, dict] = {}
     for scene in scenes:
@@ -2305,6 +2926,10 @@ def _merge_story_node_details(
             target_scenes = node_to_scenes.get(str(edge.get("to", "")), [])
             if not target_scenes:
                 continue
+            target_node = node_by_id.get(str(edge.get("to", "")), {})
+            if (node_by_id.get(node_id, {}).get("scenario_id")
+                    != target_node.get("scenario_id")):
+                continue
             label = str(edge.get("choice") or edge.get("condition") or edge.get("to"))
             exits.setdefault(label, target_scenes[0])
         explicit_targets = {
@@ -2315,6 +2940,9 @@ def _merge_story_node_details(
             successor_id = str(successor)
             target_scenes = node_to_scenes.get(successor_id, [])
             if not target_scenes or target_scenes[0] in explicit_targets:
+                continue
+            if (node_by_id.get(node_id, {}).get("scenario_id")
+                    != node_by_id.get(successor_id, {}).get("scenario_id")):
                 continue
             target_title = str(
                 node_by_id.get(successor_id, {}).get("title", successor_id))
@@ -2333,6 +2961,7 @@ def _merge_story_node_details(
         ]
         story_beats.append({
             "id": node_id,
+            "scenario_id": str(node.get("scenario_id", "")),
             "name": node.get("title", node_id),
             "kp_note": detail.get("node_summary", node.get("summary", "")),
             "scenes": scene_ids,
@@ -2358,13 +2987,19 @@ def _merge_story_node_details(
         if first_scenes:
             overview["starting_scene"] = first_scenes[0]
 
+    for scenario in scenarios:
+        start_node = str(scenario.get("starting_node", ""))
+        if node_to_scenes.get(start_node):
+            scenario["starting_scene"] = node_to_scenes[start_node][0]
+
     return {
         "overview": overview,
         "story_spine": blueprint.get("story_spine", {}),
+        "scenarios": scenarios,
         "narrative_scopes": blueprint.get("narrative_scopes", []),
         "entity_registry": blueprint.get("entity_registry", []),
         "story_tree": blueprint.get("story_tree", {}),
-        "detailed_story_nodes": details,
+        "detailed_story_nodes": normalized_details,
         "reconstruction_quality": quality,
         "scenes": scenes,
         "npcs": list(npc_by_id.values()),
@@ -2419,20 +3054,25 @@ def _score_global_reconstruction(blueprint: dict, quality: dict) -> dict:
         100 * quality.get("node_count", 0) / max(1, playable_count)
     ))
     node_quality = _clamped_score(quality.get("overall", 0))
-    overall = round(0.75 * node_quality + 0.15 * graph_closure + 0.10 * node_coverage)
+    scenario_errors = _scenario_integrity_errors(blueprint)
+    scenario_isolation = 0 if scenario_errors else 100
+    overall = round(0.65 * node_quality + 0.15 * graph_closure
+                    + 0.10 * node_coverage + 0.10 * scenario_isolation)
     result = dict(quality)
     result["node_quality"] = node_quality
     result["global_dimensions"] = {
         "node_coverage": node_coverage,
         "story_graph_closure": graph_closure,
+        "scenario_isolation": scenario_isolation,
     }
-    result["graph_errors"] = invalid_graph_refs
+    result["graph_errors"] = invalid_graph_refs + scenario_errors
     result["overall"] = overall
     result["passed"] = bool(
         quality.get("passed")
         and overall >= NODE_QUALITY_THRESHOLD
         and graph_closure == 100
         and node_coverage == 100
+        and scenario_isolation == 100
     )
     return result
 
@@ -2599,7 +3239,13 @@ def _sanitize_scene_exits(scenes: dict[str, dict]) -> None:
             target = raw
             if isinstance(raw, dict):
                 target = raw.get("target") or raw.get("scene_id") or raw.get("to")
-            if str(target or "") in valid and str(target) != sid:
+            target_id = str(target or "")
+            source_scenario = str(scene.get("scenario_id", ""))
+            target_scenario = str(scenes.get(target_id, {}).get("scenario_id", ""))
+            same_scenario = not (
+                source_scenario and target_scenario and source_scenario != target_scenario
+            )
+            if target_id in valid and target_id != sid and same_scenario:
                 clean[label] = raw
             else:
                 print(

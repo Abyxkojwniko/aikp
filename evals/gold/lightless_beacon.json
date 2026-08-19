@@ -1,0 +1,201 @@
+{
+  "benchmark_version": "1.0",
+  "module_id": "lightless_beacon",
+  "title": "The Lightless Beacon",
+  "source": {
+    "publisher": "Chaosium",
+    "download_url": "https://www.chaosium.com/content/FreePDFs/WeAreAllUs/2019/The%20Lightless%20Beacon%20-%20Call%20of%20Cthulhu.pdf",
+    "local_filename": "the_lightless_beacon.txt",
+    "sha256": "bbd8a5c02524678ef337ddd149a868eb2f9541d97fdd52a043581057e8c39d5d"
+  },
+  "nodes": [
+    {
+      "id": "wreck",
+      "label": "Shipwreck and landing on Beacon Island",
+      "aliases": [
+        "Dead Beacon",
+        "Rocky Shore"
+      ],
+      "kind": "opening",
+      "scenario_id": "main"
+    },
+    {
+      "id": "footprints",
+      "label": "Following the Footprints",
+      "kind": "choice",
+      "scenario_id": "main"
+    },
+    {
+      "id": "thicket",
+      "label": "The Thicket and Michael Turner's body",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "outbuildings",
+      "label": "Generator shed and workshop",
+      "aliases": [
+        "Outbuildings"
+      ],
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "cottage",
+      "label": "The Lighthouse Cottage",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "lighthouse",
+      "label": "The Lighthouse",
+      "kind": "event",
+      "scenario_id": "main"
+    },
+    {
+      "id": "assault",
+      "label": "An Amphibious Assault",
+      "aliases": [
+        "youngling attack"
+      ],
+      "kind": "encounter",
+      "scenario_id": "main"
+    },
+    {
+      "id": "escape",
+      "label": "Escape or rescue",
+      "aliases": [
+        "radio rescue",
+        "south pier escape"
+      ],
+      "kind": "ending",
+      "scenario_id": "main"
+    }
+  ],
+  "edges": [
+    {
+      "from": "wreck",
+      "to": "footprints",
+      "type": "branches_to"
+    },
+    {
+      "from": "wreck",
+      "to": "cottage",
+      "type": "branches_to"
+    },
+    {
+      "from": "footprints",
+      "to": "thicket",
+      "type": "reveals"
+    },
+    {
+      "from": "footprints",
+      "to": "outbuildings",
+      "type": "branches_to"
+    },
+    {
+      "from": "thicket",
+      "to": "cottage",
+      "type": "before"
+    },
+    {
+      "from": "outbuildings",
+      "to": "cottage",
+      "type": "before"
+    },
+    {
+      "from": "cottage",
+      "to": "lighthouse",
+      "type": "enables"
+    },
+    {
+      "from": "cottage",
+      "to": "assault",
+      "type": "before"
+    },
+    {
+      "from": "lighthouse",
+      "to": "assault",
+      "type": "before"
+    },
+    {
+      "from": "assault",
+      "to": "escape",
+      "type": "branches_to"
+    }
+  ],
+  "entities": [
+    {
+      "id": "turner",
+      "name": "Michael Turner",
+      "aliases": [
+        "Warren Thomas"
+      ],
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "cassidy",
+      "name": "George Cassidy",
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "smith",
+      "name": "Samuel Smith",
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "younglings",
+      "name": "younglings",
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "hybrid",
+      "name": "deep one hybrid",
+      "type": "npc",
+      "scenario_id": "main"
+    },
+    {
+      "id": "journal",
+      "name": "Cassidy's journal",
+      "type": "object",
+      "scenario_id": "main"
+    },
+    {
+      "id": "coins",
+      "name": "gold coins",
+      "type": "object",
+      "scenario_id": "main"
+    },
+    {
+      "id": "radio",
+      "name": "radio",
+      "type": "object",
+      "scenario_id": "main"
+    },
+    {
+      "id": "generator",
+      "name": "electric generator",
+      "type": "object",
+      "scenario_id": "main"
+    }
+  ],
+  "forbidden_navigable_scenes": [
+    {
+      "id": "painting_window",
+      "label": "window scene in the watercolor",
+      "aliases": [
+        "scene depicted in the painting"
+      ]
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "main",
+      "title": "The Lightless Beacon"
+    }
+  ]
+}

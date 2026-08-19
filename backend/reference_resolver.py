@@ -206,6 +206,10 @@ def npc_is_interactable(eid: str, world: dict, session: dict) -> bool:
     raw_state = session.get("entity_states", {}).get(
         eid, entity.get("initial_state", "present"))
     state = str(raw_state or "present").strip().lower()
+    state_def = entity.get("states", {}).get(str(raw_state), {})
+    if (isinstance(state_def, dict)
+            and state_def.get("interactable") is False):
+        return False
     if state in _NON_INTERACTABLE_NPC_STATES:
         return False
     # Parser/model-authored world books sometimes qualify lifecycle states as

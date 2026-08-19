@@ -40,6 +40,10 @@ def write_route(stem: str, module: str, world_fixture: str,
             "input": step["input"],
             "intent": step.get("intent", ""),
             "covers": step.get("covers", []),
+            "evaluation": step.get("evaluation", {
+                "action_validity": "invalid" if step.get("code_response") else "valid",
+                "expected_outcome": "blocked" if step.get("code_response") else "accepted",
+            }),
             "expect": expect,
         }
         if step.get("roll_verdict"):

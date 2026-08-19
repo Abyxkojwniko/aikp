@@ -82,7 +82,7 @@ class Session(TypedDict, total=False):
     turn_log: list[TurnLog]
     plot_phase: str               # "intro" | "investigation" | "climax" | "resolution"
     derailment_level: int         # 0–4 escalation counter
-    rule_system: str              # "dnd" | "coc", from world book
+    rule_system: str              # concrete ruleset id, from world book
     _story_summary: str           # LLM-compressed prior scene narrative
     _cached_summary: str          # mid-range conversation summary cache
     _cached_summary_turn: int     # turn when _cached_summary was last generated
@@ -107,6 +107,7 @@ class Session(TypedDict, total=False):
     discovered_scene_ids: list[str]       # player-known scenes, including visible exits
     visited_scene_ids: list[str]          # scenes the player has physically entered
     selected_scene_id: Optional[str]      # explicit frontend-selected reachable destination
+    current_scenario_id: str              # selected independent adventure in an anthology
 
 
 # ── Entity State Definition (world book level) ─────────────────
@@ -213,7 +214,7 @@ class WorldBook(TypedDict):
     name: str
     version: str
     description: str
-    rule_system: Optional[str]      # "dnd" | "coc"
+    rule_system: Optional[str]      # concrete ruleset id
     scenes: dict[str, SceneDef]
     entities: dict[str, EntityDef]
     plot_outline: Optional[list[str]]
@@ -296,4 +297,5 @@ def create_session(chat_id: str, model: str) -> Session:
         discovered_scene_ids=[],
         visited_scene_ids=[],
         selected_scene_id=None,
+        current_scenario_id="",
     )

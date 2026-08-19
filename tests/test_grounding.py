@@ -22,6 +22,7 @@ from engine import (
     _maybe_apply_movement,
     _redact_unrevealed_entities,
     _redact_unrevealed_names,
+    _unlock_names_player_knows,
     _try_arm_scene_clue,
     assemble_context,
     narrate,
@@ -303,7 +304,8 @@ class ProvenanceTests(unittest.TestCase):
     def test_dialogue_intent_keeps_actual_conversation(self):
         for text in ("我问房东发生了什么", "我对她说你好", "和山登交谈",
                      "我呼喊四间管", "去问房东", "和山登说", "找老板聊",
-                     "I ask him"):
+                     "I ask him", "I convince Brinn to release us",
+                     "I negotiate with the captain"):
             with self.subTest(text=text):
                 self.assertTrue(_is_dialogue_intent(text))
 
@@ -633,6 +635,53 @@ class NpcTargetApiTests(unittest.TestCase):
         save_mock.assert_called_once_with(self.session)
 
 
+class ScenarioTargetApiTests(unittest.TestCase):
+    def setUp(self):
+        self.world = {
+            "name": "Anthology API", "rule_system": "coc",
+            "scenarios": [
+                {"id": "first", "title": "First", "starting_scene": "first::room"},
+                {"id": "second", "title": "Second", "starting_scene": "second::room"},
+            ],
+            "scenes": {
+                "first::room": {"name": "First Room", "scenario_id": "first",
+                                "exits": {}},
+                "second::room": {"name": "Second Room", "scenario_id": "second",
+                                 "exits": {}},
+            },
+            "entities": {}, "story_beats": [],
+        }
+        self.session = create_session("scenario-api", "Anthology API")
+        self.session["model"] = "Anthology API"
+        self.session["current_scenario_id"] = "first"
+        self.context = (self.session, self.world, {}, {})
+        self.client = TestClient(app)
+
+    def test_list_and_switch_scenario_contract(self):
+        with patch("server._npc_roster_context", return_value=self.context), \
+                patch("state_manager.save_session") as save_mock, \
+                patch.dict("engine._session_cache", {}, clear=True):
+            listed = self.client.get("/api/session/scenario-api/scenarios")
+            switched = self.client.post(
+                "/api/session/scenario-api/scenario-target",
+                json={"scenario_id": "second"},
+            )
+
+        self.assertEqual(200, listed.status_code)
+        self.assertEqual("first", listed.json()["selected_scenario_id"])
+        self.assertEqual(200, switched.status_code)
+        self.assertEqual("second", switched.json()["selected_scenario_id"])
+        self.assertEqual("second::room", switched.json()["starting_scene"])
+        save_mock.assert_called_once()
+
+    def test_unknown_scenario_is_rejected(self):
+        with patch("server._npc_roster_context", return_value=self.context):
+            response = self.client.post(
+                "/api/session/scenario-api/scenario-target",
+                json={"scenario_id": "missing"},
+            )
+        self.assertEqual(400, response.status_code)
+
 class PlayerKnowledgeBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.world = {
@@ -764,6 +813,84 @@ class PlayerKnowledgeBoundaryTests(unittest.TestCase):
             self.session["npc_states"]["George Cassidy"]["dynamic"]
             ["disclosure"]["name"])
 
+    def test_unrevealed_english_surname_is_redacted(self):
+        output = _redact_unrevealed_names(
+            "Cassidy's body lies in the lantern room.",
+            self.session,
+            self.entity_index,
+        )
+
+        self.assertNotIn("Cassidy", output)
+        self.assertFalse(
+            self.session["npc_states"]["George Cassidy"]["dynamic"]
+            ["disclosure"]["name"])
+
+    def test_public_place_surname_is_not_redacted_but_full_name_stays_hidden(self):
+        self.session["npc_states"]["Walter Corbitt"] = {
+            "dynamic": {"disclosure": {"name": False}, "traits": []}}
+        self.entity_index["corbitt"] = {
+            "type": "npc", "name": "Walter Corbitt",
+            "public_label": "wizened body", "scene": "cellar",
+        }
+        world = dict(self.world)
+        world["opening"] = "You have been hired to inspect the Corbitt House."
+
+        output = _redact_unrevealed_names(
+            "The Corbitt House was owned by Walter Corbitt.",
+            self.session, self.entity_index, world)
+
+        self.assertIn("Corbitt House", output)
+        self.assertNotIn("Walter Corbitt", output)
+        self.assertIn("wizened body", output)
+
+    def test_territorial_title_does_not_redact_place_or_faction_name(self):
+        self.session["npc_states"]["King Uriens of Gorre"] = {
+            "dynamic": {"disclosure": {"name": False}, "traits": []}}
+        self.entity_index["uriens"] = {
+            "type": "npc", "name": "King Uriens of Gorre",
+            "public_label": "king of Gorre", "scene": "study",
+        }
+
+        output = _redact_unrevealed_names(
+            "The Blue Team charges the Knights of Gorre.",
+            self.session,
+            self.entity_index,
+        )
+
+        self.assertEqual(
+            "The Blue Team charges the Knights of Gorre.", output)
+
+    def test_surname_unlock_requires_an_allowed_current_or_public_npc(self):
+        _unlock_names_player_knows(
+            "I inspect Cassidy's coat.", self.session, {"George Cassidy"})
+
+        self.assertTrue(
+            self.session["npc_states"]["George Cassidy"]["dynamic"]
+            ["disclosure"]["name"])
+
+    def test_role_name_and_shared_surname_are_not_over_redacted(self):
+        self.session["npc_states"] = {
+            "The Landlord": {"dynamic": {"disclosure": {"name": False}}},
+            "May Ledbetter": {"dynamic": {"disclosure": {"name": True}}},
+            "Ruth Ledbetter": {"dynamic": {"disclosure": {"name": False}}},
+        }
+        self.entity_index["landlord"] = {
+            "type": "npc", "name": "The Landlord",
+            "public_label": "landlord", "scene": "study",
+        }
+
+        output = _redact_unrevealed_names(
+            "The landlord says May Ledbetter is at the Ledbetter house, but "
+            "Ruth Ledbetter is absent.",
+            self.session,
+            self.entity_index,
+        )
+
+        self.assertIn("landlord", output.lower())
+        self.assertIn("May Ledbetter", output)
+        self.assertIn("Ledbetter house", output)
+        self.assertNotIn("Ruth Ledbetter", output)
+
     def test_stall_push_does_not_name_hidden_entity_or_invent_time(self):
         self.session["current_turn"] = 8
         self.session["turn_log"] = [
@@ -786,6 +913,54 @@ class PlayerKnowledgeBoundaryTests(unittest.TestCase):
 
         allowed = _find_unavailable_scene_move("I go to the Hall", "study", self.world)
         self.assertEqual("", allowed)
+
+    def test_player_cannot_use_alias_to_bypass_gated_exit(self):
+        self.world["scenes"]["study"]["exits"]["open sealed stairs"] = {
+            "target": "basement", "requires_flag": "stairs_unsealed",
+        }
+        self.world["scenes"]["basement"]["aliases"] = ["cellar"]
+
+        blocked = _find_unavailable_scene_move(
+            "I enter the cellar", "study", self.world, self.session)
+
+        self.assertEqual("cellar", blocked)
+
+    def test_numbered_module_heading_resolves_from_natural_scene_name(self):
+        world = {
+            "scenes": {
+                "rec": {"name": "A2. Rec Room", "exits": {"cargo": "cargo"}},
+                "cargo": {"name": "A4. Lower Cargo Hold", "exits": {}},
+                "bridge": {"name": "B5. Bridge", "exits": {}},
+            },
+            "entities": {},
+        }
+
+        blocked = _find_unavailable_scene_move(
+            "We teleport directly to the bridge.", "rec", world)
+
+        self.assertEqual("Bridge", blocked)
+
+    def test_player_cannot_enter_a_storybook_setting(self):
+        world = dict(self.world)
+        world["embedded_settings"] = [{
+            "scope": {"id": "storybook", "navigable": False},
+            "scenes": [{
+                "id": "book_castle", "name": "Castle in the Storybook",
+                "aliases": ["Paper Castle"], "navigable": False,
+            }],
+            "entities": [],
+        }]
+
+        self.assertEqual(
+            "Castle in the Storybook",
+            _find_unavailable_scene_move(
+                "I enter the Castle in the Storybook", "study", world),
+        )
+        self.assertEqual(
+            "Paper Castle",
+            _find_unavailable_scene_move(
+                "I go to the Paper Castle", "study", world),
+        )
 
     def test_english_adverbial_move_cannot_skip_scenes(self):
         blocked = _find_unavailable_scene_move(
@@ -941,6 +1116,31 @@ class PlayerKnowledgeBoundaryTests(unittest.TestCase):
             narrated = narrate(result)
         self.assertEqual("当前没有可交谈的在场人物。", narrated["gm_response"])
 
+    def test_authored_dialogue_can_finish_when_it_disables_target(self):
+        self.world["entities"]["keeper"]["states"] = {
+            "present": {},
+            "restrained": {"interactable": False},
+        }
+        select_interaction_target(
+            self.session, "keeper", self.world, self.scene_index,
+            self.entity_index)
+        self.session["entity_states"]["keeper"] = "restrained"
+        state = self._context_state("I ask him what happened")
+        state["matched_entity"] = {
+            "id": "keeper", "current_state": "present", "state_def": {},
+        }
+        state["action_resolution"] = {"status": "accepted"}
+
+        with patch("rag.hybrid_search", return_value=[]):
+            result = assemble_context(state)
+
+        self.assertFalse(result.get("_npc_selection_required", False))
+        self.assertEqual(["keeper"], result["_matched_npc_ids"])
+        self.assertIsNone(self.session["selected_npc_id"])
+        with narration_provider(lambda _request: "He gives one final warning."):
+            narrated = narrate(result)
+        self.assertEqual("He gives one final warning.", narrated["gm_response"])
+
     def test_reconcile_keeps_valid_target_and_clears_only_stale_focus(self):
         self.session["selected_npc_id"] = "keeper"
         self.session["conversation_focus"] = {"npc": "keeper", "item": "desk"}
@@ -989,6 +1189,85 @@ class PlayerKnowledgeBoundaryTests(unittest.TestCase):
                 self.assertTrue(result["_npc_selection_required"])
                 narrated = narrate(result)
                 self.assertIn("选择", narrated["gm_response"])
+
+    def test_player_can_name_public_third_party_across_scenes(self):
+        self.world["scenes"]["hospital"] = {
+            "name": "Hospital", "desc": "A hospital ward."}
+        self.world["entities"]["old_gurteen"] = {
+            "type": "npc", "name": "Old Gurteen", "scene": "hospital",
+            "initial_state": "present", "description": "An elderly patient.",
+            "known_to_player": True,
+        }
+        self.entity_index["old_gurteen"] = {
+            "type": "npc", "name": "Old Gurteen", "scene": "hospital"}
+        self.session["entity_states"]["old_gurteen"] = "present"
+        self.session["npc_states"]["Old Gurteen"] = {
+            "static": {"name": "Old Gurteen", "dialogue": {}},
+            "dynamic": {
+                "disclosure": {"name": False, "background": False},
+                "traits": [], "nicknames": [], "trust": 0, "mood": "neutral",
+            },
+        }
+        self.session["selected_npc_id"] = "keeper"
+        state = self._context_state(
+            "I ask the keeper where Old Gurteen lives.")
+
+        with patch("rag.hybrid_search", return_value=[]):
+            assemble_context(state)
+
+        self.assertTrue(
+            self.session["npc_states"]["Old Gurteen"]["dynamic"]
+            ["disclosure"]["name"])
+        self.assertIn(
+            "Old Gurteen",
+            _redact_unrevealed_names(
+                "Old Gurteen's cottage is nearby.", self.session,
+                self.entity_index),
+        )
+
+    def test_player_cannot_unlock_unencountered_name_by_guessing(self):
+        self.world["entities"]["elias_marsh"] = {
+            "type": "npc", "name": "Elias Marsh", "scene": "lighthouse",
+            "initial_state": "present", "description": "A distant keeper.",
+        }
+        self.entity_index["elias_marsh"] = dict(
+            self.world["entities"]["elias_marsh"])
+        self.session["entity_states"]["elias_marsh"] = "present"
+        self.session["npc_states"]["Elias Marsh"] = {
+            "static": {"name": "Elias Marsh", "dialogue": {}},
+            "dynamic": {
+                "disclosure": {"name": False, "background": False},
+                "traits": [], "nicknames": [], "trust": 0, "mood": "neutral",
+            },
+        }
+        self.session["selected_npc_id"] = "keeper"
+
+        with patch("rag.hybrid_search", return_value=[]):
+            assemble_context(self._context_state(
+                "I ask whether Elias Marsh is at the lighthouse."))
+
+        self.assertFalse(
+            self.session["npc_states"]["Elias Marsh"]["dynamic"]
+            ["disclosure"]["name"])
+
+    def test_player_cannot_unlock_hidden_npc_by_guessing_name(self):
+        self.session["npc_states"]["Marsh Lurker"] = {
+            "static": {"name": "Marsh Lurker", "dialogue": {}},
+            "dynamic": {
+                "disclosure": {"name": False, "background": False},
+                "traits": [], "nicknames": [], "trust": 0, "mood": "neutral",
+            },
+        }
+        self.session["selected_npc_id"] = "keeper"
+        state = self._context_state(
+            "I ask the keeper whether Marsh Lurker is nearby.")
+
+        with patch("rag.hybrid_search", return_value=[]):
+            assemble_context(state)
+
+        self.assertFalse(
+            self.session["npc_states"].get("Marsh Lurker", {})
+            .get("dynamic", {}).get("disclosure", {}).get("name", False))
 
     def test_selected_npc_id_is_the_only_dialogue_target(self):
         select_interaction_target(

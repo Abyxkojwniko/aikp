@@ -2,6 +2,7 @@
 """AIKP 骰子引擎 —— 与 LLM 完全分离的确定性判定模块"""
 
 import random
+import math
 from typing import Optional
 
 # ── 通用骰子 ──────────────────────────────────────────
@@ -221,14 +222,98 @@ def coc_skill_check(skill_value: int) -> dict:
     }
 
 
+PERCENTILE_RULE_SYSTEMS = frozenset({"coc", "brp", "runequest"})
+
+
+def is_percentile_system(rule_system: str) -> bool:
+    return str(rule_system or "").lower() in PERCENTILE_RULE_SYSTEMS
+
+
+def brp_skill_check(skill_value: int, rule_system: str = "brp") -> dict:
+    """Resolve non-CoC BRP-family percentile levels.
+
+    RuneQuest uses 1/20 critical, 1/5 special, and a fumble range equal
+    to 5% of the failure chance. Generic BRP quickstart uses a 1/10 critical.
+    """
+    skill_value = max(0, int(skill_value))
+    d100 = random.randint(1, 100)
+    if rule_system == "runequest":
+        critical_threshold = max(1, int(skill_value * 0.05 + 0.5))
+        special_threshold = max(1, int(skill_value * 0.20 + 0.5))
+        failure_chance = max(5, 100 - min(skill_value, 95))
+        fumble_count = max(1, int(failure_chance * 0.05 + 0.5))
+        fumble_threshold = 101 - fumble_count
+    else:
+        critical_threshold = max(1, math.ceil(skill_value / 10))
+        special_threshold = 0
+        fumble_threshold = 100
+
+    if d100 <= critical_threshold:
+        verdict, success = "critical_success", True
+    elif special_threshold and d100 <= special_threshold:
+        verdict, success = "special_success", True
+    elif d100 <= min(skill_value, 95):
+        verdict, success = "success", True
+    elif d100 >= fumble_threshold:
+        verdict, success = "fumble", False
+    else:
+        verdict, success = "failure", False
+    return {
+        "skill_value": skill_value,
+        "d100": d100,
+        "success": success,
+        "verdict": verdict,
+        "critical_threshold": critical_threshold,
+        "special_threshold": special_threshold,
+        "fumble_threshold": fumble_threshold,
+    }
+
+
+def dragonbane_skill_check(skill_value: int) -> dict:
+    """Dragonbane d20 roll-under: 1 is a dragon, 20 is a demon."""
+    skill_value = max(1, min(18, int(skill_value)))
+    d20 = random.randint(1, 20)
+    if d20 == 1:
+        verdict, success = "critical_success", True
+    elif d20 == 20:
+        verdict, success = "fumble", False
+    elif d20 <= skill_value:
+        verdict, success = "success", True
+    else:
+        verdict, success = "failure", False
+    return {"skill_value": skill_value, "d20": d20,
+            "success": success, "verdict": verdict}
+
+
+def pendragon_skill_check(skill_value: int) -> dict:
+    """Pendragon d20 roll-under where exactly the target is critical."""
+    skill_value = max(1, int(skill_value))
+    d20 = random.randint(1, 20)
+    target = min(skill_value, 20)
+    if d20 == target:
+        verdict, success = "critical_success", True
+    elif d20 < target:
+        verdict, success = "success", True
+    elif d20 == 20 and target < 20:
+        verdict, success = "fumble", False
+    else:
+        verdict, success = "failure", False
+    return {"skill_value": skill_value, "target": target, "d20": d20,
+            "success": success, "verdict": verdict}
+
+
 # ── 统一检定分发 ──────────────────────────────────────
 
 def resolve_check(rule_system: str, skill_value: int, difficulty: int = 0) -> dict:
-    """Dispatch to correct check based on rule_system.
-    'coc' -> d100 <= skill_value; 'dnd' (default) -> d20 + skill vs DC.
-    """
+    """Dispatch to the concrete ruleset's check mechanic."""
     if rule_system == "coc":
         result = coc_skill_check(skill_value)
+    elif rule_system in {"brp", "runequest"}:
+        result = brp_skill_check(skill_value, rule_system)
+    elif rule_system == "dragonbane":
+        result = dragonbane_skill_check(skill_value)
+    elif rule_system == "pendragon":
+        result = pendragon_skill_check(skill_value)
     else:
         result = skill_check(skill_value, difficulty)
     result["rule_system"] = rule_system

@@ -118,7 +118,8 @@ def generate_alone() -> None:
         {"input": "I go directly to The Beacon.", "response": "不能跳过中间区域。",
          "code_response": True, "contains": ["不能直接越过"], "covers": ["blocked_jump"]},
         {"input": "I take the ritual knife.", "response": "尚未发现。",
-         "code_response": True, "contains": ["没有发现"], "covers": ["hidden_item_block"]},
+         "code_response": True, "contains": ["没有发现"], "covers": ["hidden_item_block"],
+         "expect": {"response_not_contains": ["festival"]}},
         {"input": "I take the laser pistol from the bus stop.", "response": "不存在的物品。",
          "code_response": True, "contains": ["未能把这个动作对应"],
          "covers": ["invented_object_block"]},
@@ -230,14 +231,22 @@ def generate_great_hunt() -> None:
              "object_locations": {
                  "panther": {"kind": "inventory", "id": "player"}},
          }},
-        movement_step("We resume the plan.", "The animal plan is ready.",
-                      "planning", [], ["ready"]),
-        movement_step("We bring the menagerie to Berwyn.", "The knights reach Berwyn with the animals.",
-                      "menagerie", [], ["animals"]),
-        movement_step("We ride to Berwyn.", "The dragon's attack shakes the countryside.",
-                      "berwyn", ["reach_berwyn"], ["dragon"]),
-        movement_step("We confront the dragon.", "The knights draw the dragon toward the prepared panther.",
-                      "dragon", [], ["panther"]),
+        {**movement_step("We resume the plan.", "The animal plan is ready.",
+                         "planning", [], ["ready"]),
+         "expect": {"inventory_contains": ["panther"], "object_locations": {
+             "panther": {"kind": "inventory", "id": "player"}}}},
+        {**movement_step("We bring the menagerie to Berwyn.", "The knights reach Berwyn with the animals.",
+                         "menagerie", [], ["animals"]),
+         "expect": {"inventory_contains": ["panther"], "object_locations": {
+             "panther": {"kind": "inventory", "id": "player"}}}},
+        {**movement_step("We ride to Berwyn.", "The dragon's attack shakes the countryside.",
+                         "berwyn", ["reach_berwyn"], ["dragon"]),
+         "expect": {"inventory_contains": ["panther"], "object_locations": {
+             "panther": {"kind": "inventory", "id": "player"}}}},
+        {**movement_step("We confront the dragon.", "The knights draw the dragon toward the prepared panther.",
+                         "dragon", [], ["panther"]),
+         "expect": {"inventory_contains": ["panther"], "object_locations": {
+             "panther": {"kind": "inventory", "id": "player"}}}},
         {**movement_step(
             "We use the panther rather than charge.",
             "The panther's belch overcomes the dragon.",
@@ -245,6 +254,8 @@ def generate_great_hunt() -> None:
          "select_object": "panther",
          "expect": {
              "inventory_contains": ["panther"],
+             "object_locations": {
+                 "panther": {"kind": "inventory", "id": "player"}},
              "world_event_types_contains": ["item_used"],
          }},
     ])
@@ -254,7 +265,8 @@ def generate_great_hunt() -> None:
         {"input": "I ride directly to The Dragon of Berwyn.", "response": "路径被阻止。",
          "code_response": True, "contains": ["不能直接越过"], "covers": ["dragon_jump_block"]},
         {"input": "I take the captured panther from my inventory.", "response": "未发现该物品。",
-         "code_response": True, "contains": ["没有发现"], "covers": ["panther_guess_block"]},
+         "code_response": True, "contains": ["没有发现"], "covers": ["panther_guess_block"],
+         "expect": {"response_not_contains": ["Traveling Menagerie"]}},
         {"input": "I use the dragon horn in my pack.", "response": "不存在的物品。",
          "code_response": True, "contains": ["未能把这个动作对应"],
          "covers": ["invented_object_block"]},
@@ -371,10 +383,14 @@ def generate_red_blade() -> None:
                  "red_blade": {"kind": "inventory", "id": "player"}},
              "world_event_types_contains": ["item_picked_up"],
          }},
-        movement_step("We turn back to save Pig Boy from the feast.", "The rescue prevents Pig Boy's sacrifice.",
-                      "feast", ["save_pig_boy"], ["rescue"]),
-        movement_step("We return home together.", "The knights return with the blade and the rescued boy.",
-                      "return", ["honorable_return"], ["rescued"]),
+        {**movement_step("We turn back to save Pig Boy from the feast.", "The rescue prevents Pig Boy's sacrifice.",
+                         "feast", ["save_pig_boy"], ["rescue"]),
+         "expect": {"inventory_contains": ["red_blade"], "object_locations": {
+             "red_blade": {"kind": "inventory", "id": "player"}}}},
+        {**movement_step("We return home together.", "The knights return with the blade and the rescued boy.",
+                         "return", ["honorable_return"], ["rescued"]),
+         "expect": {"inventory_contains": ["red_blade"], "object_locations": {
+             "red_blade": {"kind": "inventory", "id": "player"}}}},
     ])
     write_route("expanded_red_blade_betrayal", "expanded_red_blade", "expanded_red_blade", [
         {"input": "开始游戏", "response": "Sir Gregor explains the mission to recover the Red Death Blade.",
@@ -382,7 +398,8 @@ def generate_red_blade() -> None:
         {"input": "I go directly to King Cadwalader's Hall.", "response": "不能跳到终局。",
          "code_response": True, "contains": ["不能直接越过"], "covers": ["hall_jump_block"]},
         {"input": "I use the Red Death Blade now.", "response": "隐藏物品不可用。",
-         "code_response": True, "contains": ["没有发现"], "covers": ["blade_guess_block"]},
+         "code_response": True, "contains": ["没有发现"], "covers": ["blade_guess_block"],
+         "expect": {"response_not_contains": ["Cadwalader's Hall"]}},
         {"input": "I take the invisibility cloak.", "response": "不存在的物品。",
          "code_response": True, "contains": ["未能把这个动作对应"],
          "covers": ["invented_object_block"]},
@@ -428,8 +445,10 @@ def generate_red_blade() -> None:
                  "red_blade": {"kind": "inventory", "id": "player"}},
              "world_event_types_contains": ["item_picked_up"],
          }},
-        movement_step("We abandon Pig Boy and keep running.", "The knights save themselves and leave the captive behind.",
-                      "return", ["abandon_pig_boy", "selfish_return"], ["leave"]),
+        {**movement_step("We abandon Pig Boy and keep running.", "The knights save themselves and leave the captive behind.",
+                         "return", ["abandon_pig_boy", "selfish_return"], ["leave"]),
+         "expect": {"inventory_contains": ["red_blade"], "object_locations": {
+             "red_blade": {"kind": "inventory", "id": "player"}}}},
     ])
     write_json("expanded_red_blade_coverage.json", {
         "module": "expanded_red_blade",
@@ -504,14 +523,17 @@ def generate_sword_kings() -> None:
                 "We escape our chains on the island.",
                 "The Heroes slip away from Cormac and enter the jungle.",
                 "island", ["chain_escape"], ["jungle"]))
-        steps.append(movement_step(
+        island_step = movement_step(
             "We negotiate with the island guardians." if approach == "talk"
             else "We fight through the island guardians.",
             "Whakapau Hina grants passage after negotiation."
             if approach == "talk" else
             "The Heroes force a costly path through the defenders.",
             "cave", ["island_negotiate" if approach == "talk" else "island_violence"],
-            ["passage" if approach == "talk" else "costly"]))
+            ["passage" if approach == "talk" else "costly"])
+        if approach == "talk":
+            island_step["select_npc"] = "tribal_leader"
+        steps.append(island_step)
         steps.append(movement_step(
             f"We choose the {ending} sword.",
             f"The Heroes accept the consequences of the {ending} sword.",
@@ -526,7 +548,8 @@ def generate_sword_kings() -> None:
         {"input": "I ask Cormac to surrender without selecting him.", "response": "需要选择。",
          "code_response": True, "contains": ["选择一名"], "covers": ["cormac_selection_required"]},
         {"input": "I take the Third Sword from my bag.", "response": "尚未取得。",
-         "code_response": True, "contains": ["没有发现"], "covers": ["third_sword_guess_block"]},
+         "code_response": True, "contains": ["没有发现"], "covers": ["third_sword_guess_block"],
+         "expect": {"response_not_contains": ["Cave of the Three Swords"]}},
         {"input": "I use the magic compass in my pack.", "response": "不存在的物品。",
          "code_response": True, "contains": ["未能把这个动作对应"],
          "covers": ["invented_object_block"]},
@@ -534,8 +557,11 @@ def generate_sword_kings() -> None:
          "code_response": True, "contains": ["不能直接越过"], "covers": ["cave_jump_block"]},
         movement_step("We win the storm battle.", "The Heroes reach the island free.",
                       "island", [], ["free"]),
-        movement_step("We negotiate passage.", "The island guardians permit entry to the cave.",
-                      "cave", [], ["permit"]),
+        {**movement_step(
+            "We negotiate passage.",
+            "The island guardians permit entry to the cave.",
+            "cave", [], ["permit"]),
+         "select_npc": "tribal_leader"},
         movement_step("We choose the third sword.", "The third sword imposes its dramatic consequence.",
                       "third", ["third_ending"], ["third"]),
     ])
@@ -643,7 +669,8 @@ def generate_rattling_wind() -> None:
         {"input": "开始游戏", "response": "Jorgrin asks for protection from the weekly Rattling Wind.",
          "scene": "tavern", "contains": ["Jorgrin"], "covers": []},
         {"input": "I take Beleros' fine kopis from the stable.", "response": "隐藏物品被阻止。",
-         "code_response": True, "contains": ["没有发现"], "covers": ["kopis_guess_block"]},
+         "code_response": True, "contains": ["没有发现"], "covers": ["kopis_guess_block"],
+         "expect": {"response_not_contains": ["Farfield"]}},
         {"input": "I take the silver wand from the stable.", "response": "不存在的物品。",
          "code_response": True, "contains": ["未能把这个动作对应"],
          "covers": ["invented_object_block"]},

@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "description": "Expected action validity and verifier outcome for legacy hand-authored offline cases.",
+  "cases": {
+    "climb-mountain-companion-lifecycle": {
+      "1": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "2": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "3": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "4": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "5": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "6": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "7": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "8": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "9": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "10": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "11": {"action_validity": "valid", "expected_outcome": "accepted"}
+    },
+    "dawn-goblet-death-and-resurrection": {
+      "1": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "2": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "3": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "4": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "5": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "6": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "7": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "8": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "9": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "10": {"action_validity": "valid", "expected_outcome": "accepted"}
+    },
+    "dead-boarder-lifecycle": {
+      "1": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "2": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "3": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "4": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "5": {"action_validity": "valid", "expected_outcome": "accepted"}
+    },
+    "haunting-codex-manual": {
+      "1": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "2": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "3": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "4": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "5": {"action_validity": "invalid", "expected_outcome": "blocked"}
+    },
+    "honeybucket-development-clock": {
+      "1": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "2": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "3": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "4": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "5": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "6": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "7": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "8": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "9": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "10": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "11": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "12": {"action_validity": "valid", "expected_outcome": "accepted"}
+    },
+    "lightless-beacon-grounding": {
+      "1": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "2": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "3": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "4": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "5": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "6": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "7": {"action_validity": "valid", "expected_outcome": "accepted"}
+    },
+    "scritch-scratch-navigation": {
+      "1": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "2": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "3": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "4": {"action_validity": "invalid", "expected_outcome": "blocked"},
+      "5": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "6": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "7": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "8": {"action_validity": "valid", "expected_outcome": "accepted"},
+      "9": {"action_validity": "invalid", "expected_outcome": "blocked"}
+    }
+  }
+}

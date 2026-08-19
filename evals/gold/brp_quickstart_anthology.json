@@ -1,0 +1,360 @@
+{
+  "benchmark_version": "1.0",
+  "module_id": "brp_quickstart_anthology",
+  "title": "Basic Roleplaying Quickstart 2025 Adventures",
+  "source": {
+    "publisher": "Chaosium",
+    "download_url": "https://downloads.chaosium.com/basic-roleplaying/cha2040-brp-quickstart/CHA2040_Basic_Roleplaying_Quickstart.pdf",
+    "local_filename": "paper_modules/brp_quickstart_2025.txt",
+    "sha256": "1ead313579df881f990e3678d333c8479d062762dd43a47d65c50fa90608cfc5"
+  },
+  "nodes": [
+    {
+      "id": "r_gate",
+      "label": "Prison Gate",
+      "kind": "opening",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "r_courtyard",
+      "label": "The Courtyard",
+      "kind": "event",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "r_barracks",
+      "label": "The Barracks",
+      "kind": "event",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "r_stables",
+      "label": "The Stables",
+      "kind": "event",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "r_gallows",
+      "label": "Gallows",
+      "kind": "event",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "r_home",
+      "label": "Viceroy's Home",
+      "kind": "event",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "r_cellblock",
+      "label": "Cellblock and rescue Treville",
+      "kind": "encounter",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "r_escape",
+      "label": "Escape with Treville and the message",
+      "kind": "ending",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "f_crash",
+      "label": "Crash landing on Nayan",
+      "kind": "opening",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "f_routes",
+      "label": "Choose a route to the distress signal",
+      "kind": "choice",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "f_route_a",
+      "label": "Route A and transport skiff",
+      "kind": "event",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "f_route_b",
+      "label": "Route B mountain crossing",
+      "kind": "event",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "f_route_c",
+      "label": "Route C toxic valley",
+      "kind": "event",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "f_station",
+      "label": "Security robots at the signal station",
+      "kind": "encounter",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "f_chimera",
+      "label": "Decision about Chimera",
+      "kind": "choice",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "g_entry",
+      "label": "Entryway",
+      "kind": "opening",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "g_centipede",
+      "label": "Centipede Lair",
+      "kind": "encounter",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "g_tunnel",
+      "label": "Trapped Tunnel",
+      "kind": "event",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "g_pit",
+      "label": "Open Pit",
+      "kind": "encounter",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "g_statue",
+      "label": "Guardian Statue",
+      "kind": "encounter",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "g_temple",
+      "label": "The Temple and skeleton battle",
+      "kind": "encounter",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "g_release",
+      "label": "Free the ghostly knight and recover treasure",
+      "kind": "ending",
+      "scenario_id": "garthoon"
+    }
+  ],
+  "edges": [
+    {
+      "from": "r_gate",
+      "to": "r_courtyard",
+      "type": "before"
+    },
+    {
+      "from": "r_courtyard",
+      "to": "r_barracks",
+      "type": "branches_to"
+    },
+    {
+      "from": "r_courtyard",
+      "to": "r_stables",
+      "type": "branches_to"
+    },
+    {
+      "from": "r_courtyard",
+      "to": "r_gallows",
+      "type": "branches_to"
+    },
+    {
+      "from": "r_courtyard",
+      "to": "r_home",
+      "type": "branches_to"
+    },
+    {
+      "from": "r_courtyard",
+      "to": "r_cellblock",
+      "type": "branches_to"
+    },
+    {
+      "from": "r_cellblock",
+      "to": "r_home",
+      "type": "reveals"
+    },
+    {
+      "from": "r_home",
+      "to": "r_escape",
+      "type": "enables"
+    },
+    {
+      "from": "r_cellblock",
+      "to": "r_escape",
+      "type": "enables"
+    },
+    {
+      "from": "f_crash",
+      "to": "f_routes",
+      "type": "before"
+    },
+    {
+      "from": "f_routes",
+      "to": "f_route_a",
+      "type": "branches_to"
+    },
+    {
+      "from": "f_routes",
+      "to": "f_route_b",
+      "type": "branches_to"
+    },
+    {
+      "from": "f_routes",
+      "to": "f_route_c",
+      "type": "branches_to"
+    },
+    {
+      "from": "f_route_a",
+      "to": "f_station",
+      "type": "before"
+    },
+    {
+      "from": "f_route_b",
+      "to": "f_station",
+      "type": "before"
+    },
+    {
+      "from": "f_route_c",
+      "to": "f_station",
+      "type": "before"
+    },
+    {
+      "from": "f_station",
+      "to": "f_chimera",
+      "type": "reveals"
+    },
+    {
+      "from": "g_entry",
+      "to": "g_centipede",
+      "type": "before"
+    },
+    {
+      "from": "g_centipede",
+      "to": "g_tunnel",
+      "type": "before"
+    },
+    {
+      "from": "g_tunnel",
+      "to": "g_pit",
+      "type": "before"
+    },
+    {
+      "from": "g_pit",
+      "to": "g_statue",
+      "type": "before"
+    },
+    {
+      "from": "g_statue",
+      "to": "g_temple",
+      "type": "before"
+    },
+    {
+      "from": "g_temple",
+      "to": "g_release",
+      "type": "causes"
+    }
+  ],
+  "entities": [
+    {
+      "id": "treville",
+      "name": "Monsieur Treville",
+      "aliases": [
+        "Treville"
+      ],
+      "type": "npc",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "renault",
+      "name": "Viceroy Renault",
+      "aliases": [
+        "Vampire Viceroy Renault"
+      ],
+      "type": "npc",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "message",
+      "name": "secret message",
+      "type": "object",
+      "scenario_id": "richelieu"
+    },
+    {
+      "id": "chimera",
+      "name": "Chimera",
+      "type": "npc",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "utility_robots",
+      "name": "utility robots",
+      "type": "npc",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "sentry_robots",
+      "name": "sentry robots",
+      "type": "npc",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "skiff",
+      "name": "transport skiff",
+      "type": "object",
+      "scenario_id": "footsteps"
+    },
+    {
+      "id": "centipede",
+      "name": "Large Centipede",
+      "type": "npc",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "skeletons",
+      "name": "skeletons",
+      "type": "npc",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "knight",
+      "name": "Skeleton Knight",
+      "aliases": [
+        "ghostly knight"
+      ],
+      "type": "npc",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "dagger",
+      "name": "magic dagger with a bone hilt",
+      "type": "object",
+      "scenario_id": "garthoon"
+    },
+    {
+      "id": "helmet",
+      "name": "ghostly knight's helmet",
+      "type": "object",
+      "scenario_id": "garthoon"
+    }
+  ],
+  "forbidden_navigable_scenes": [],
+  "scenarios": [
+    {
+      "id": "richelieu",
+      "title": "Richelieu"
+    },
+    {
+      "id": "footsteps",
+      "title": "Footsteps in the Dark"
+    },
+    {
+      "id": "garthoon",
+      "title": "The Lost Temple of Garthoon"
+    }
+  ]
+}

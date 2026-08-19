@@ -274,6 +274,24 @@ def apply_world_event(session: dict, world: dict, event: dict) -> dict:
     if event_type == "entity_discovered":
         fact.update({"known": True, "visible": True, "exists": True})
         _set_legacy_state(session, eid, str(event.get("state", "revealed")))
+        if world.get("entities", {}).get(eid, {}).get("type") == "clue":
+            discovered = session.setdefault("discovered_clues", [])
+            if eid not in discovered:
+                discovered.append(eid)
+            flag = f"{eid}_discovered"
+            flags = session.setdefault("flags", [])
+            if flag not in flags:
+                flags.append(flag)
+    elif event_type == "npc_name_disclosed":
+        entity = world.get("entities", {}).get(eid, {})
+        if entity.get("type") != "npc":
+            raise ValueError("npc_name_disclosed requires an NPC entity")
+        fact["known"] = True
+        name = str(entity.get("name", "")).strip()
+        npc_state = session.setdefault("npc_states", {}).get(name)
+        if isinstance(npc_state, dict):
+            npc_state.setdefault("dynamic", {}).setdefault(
+                "disclosure", {})["name"] = True
     elif event_type == "item_picked_up":
         fact.update({
             "location": {"kind": "inventory", "id": "player"},
@@ -286,6 +304,16 @@ def apply_world_event(session: dict, world: dict, event: dict) -> dict:
             "known": True, "visible": True, "exists": True,
         })
         _set_legacy_state(session, eid, "present")
+    elif event_type == "item_transferred":
+        owner_id = str(event.get("owner_id", ""))
+        owner = world.get("entities", {}).get(owner_id, {})
+        if not owner_id or not isinstance(owner, dict) or owner.get("type") != "npc":
+            raise ValueError("item transfer requires a known NPC owner")
+        fact.update({
+            "location": {"kind": "entity", "id": owner_id},
+            "known": True, "visible": True, "exists": True,
+        })
+        _set_legacy_state(session, eid, "transferred")
     elif event_type == "item_used":
         fact["known"] = True
         if event.get("consumed"):
@@ -298,7 +326,20 @@ def apply_world_event(session: dict, world: dict, event: dict) -> dict:
             fact["condition"] = str(event.get("condition", "used"))
             _set_legacy_state(session, eid, "used")
     elif event_type == "entity_moved":
-        fact["location"] = deepcopy(event.get("location", {}))
+        location = event.get("location", {})
+        if not isinstance(location, dict):
+            raise ValueError("entity movement requires a structured location")
+        location_kind = str(location.get("kind", ""))
+        location_id = str(location.get("id", ""))
+        if location_kind == "scene":
+            if location_id not in world.get("scenes", {}):
+                raise ValueError("entity movement references an unknown scene")
+        elif location_kind == "entity":
+            if location_id not in world.get("entities", {}):
+                raise ValueError("entity movement references an unknown owner")
+        else:
+            raise ValueError("entity movement requires a scene or entity location")
+        fact["location"] = {"kind": location_kind, "id": location_id}
     elif event_type == "entity_removed":
         fact.update({
             "location": {"kind": "removed", "id": ""},
@@ -360,7 +401,21 @@ def sync_legacy_transition(session: dict, world: dict, entity_id: str,
     elif new in REMOVED_STATES:
         event = {"type": "entity_removed", "entity_id": entity_id,
                  "state": new, "source": "legacy_state_machine"}
-    elif new in {"found", "read", "revealed", "visible", "opened"}:
+    elif new == "opened":
+        event_types = (["object_unlocked", "object_opened"]
+                       if old == "locked" else ["object_opened"])
+        committed_events = [
+            append_world_event(session, world, {
+                "type": event_type, "entity_id": entity_id,
+                "source": "legacy_state_machine",
+            })
+            for event_type in event_types
+        ]
+        session.setdefault("entity_states", {})[entity_id] = new_state
+        session.setdefault("entity_facts", {}).setdefault(
+            entity_id, {})["legacy_state"] = new_state
+        return committed_events
+    elif new in {"found", "read", "revealed", "visible"}:
         event = {"type": "entity_discovered", "entity_id": entity_id,
                  "state": new, "source": "legacy_state_machine"}
     else:

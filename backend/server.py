@@ -124,6 +124,10 @@ class SceneTargetRequest(BaseModel):
     scene_id: Optional[str] = None
 
 
+class ScenarioTargetRequest(BaseModel):
+    scenario_id: str
+
+
 @app.get("/v1/models")
 def list_models():
     models = []
@@ -252,6 +256,8 @@ def health():
             "narrative_scope_guard",
             "object_instance_identity",
             "object_location_ledger",
+            "anthology_scenario_isolation",
+            "explicit_scenario_target",
         ],
     }
 
@@ -430,6 +436,64 @@ def _npc_roster_context(chat_id: str):
     world = load_world(model)
     scene_index, entity_index = get_indices(model)
     return session, world, scene_index, entity_index
+
+
+def _scenario_rows(world: dict, selected: str = "") -> list[dict]:
+    return [
+        {
+            "id": str(row["id"]),
+            "title": str(row.get("title") or row["id"]),
+            "selected": str(row["id"]) == selected,
+        }
+        for row in world.get("scenarios", [])
+        if isinstance(row, dict) and row.get("id")
+    ]
+
+
+@app.get("/api/session/{chat_id}/scenarios")
+def get_scenarios(chat_id: str):
+    """List independent adventures available in the active world book."""
+    try:
+        session, world, _scene_index, _entity_index = _npc_roster_context(chat_id)
+        selected = str(session.get("current_scenario_id", ""))
+        return {"selected_scenario_id": selected,
+                "scenarios": _scenario_rows(world, selected)}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/session/{chat_id}/scenario-target")
+def set_scenario(chat_id: str, req: ScenarioTargetRequest):
+    """Start one anthology scenario with isolated runtime state."""
+    from engine import _session_cache
+    from models import create_session
+    from state_manager import initialize_session_from_world, save_session
+
+    try:
+        previous, world, _scene_index, _entity_index = _npc_roster_context(chat_id)
+        valid_ids = {str(row.get("id")) for row in world.get("scenarios", [])
+                     if isinstance(row, dict) and row.get("id")}
+        if req.scenario_id not in valid_ids:
+            raise ValueError(f"Unknown scenario_id: {req.scenario_id}")
+        model = str(previous.get("model", ""))
+        session = create_session(chat_id, model)
+        session["current_scenario_id"] = req.scenario_id
+        initialize_session_from_world(session, world, req.scenario_id)
+        imported = previous.get("imported_card")
+        if imported:
+            session["player_state"].update(imported)
+            session["imported_card"] = imported
+        save_session(session)
+        _session_cache[chat_id] = session
+        return {
+            "selected_scenario_id": req.scenario_id,
+            "scenarios": _scenario_rows(world, req.scenario_id),
+            "starting_scene": session.get("player_state", {}).get("current_scene", ""),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/api/session/{chat_id}/npcs")
@@ -619,7 +683,7 @@ def roll_check(chat_id: str):
     RNG), grade it (CoC success levels), apply state transition + SAN, clear the
     pending check, and return the roll for the UI to show."""
     from state_manager import load_session, save_session
-    from dice import resolve_check, coc_skill_check, coc_san_loss
+    from dice import resolve_check, coc_san_loss
     from engine import _apply_pending_clock_outcome, load_world
 
     session = load_session(chat_id)
@@ -628,6 +692,11 @@ def roll_check(chat_id: str):
         raise HTTPException(status_code=400, detail="没有待掷的检定")
 
     world = load_world(session.get("model", ""))
+    if world.get("automatic_check_adapter", True) is False:
+        raise HTTPException(
+            status_code=400,
+            detail=f"规则系统 {world.get('ruleset', 'custom')} 尚无自动检定适配器",
+        )
     entity = world.get("entities", {}).get(pc.get("entity_id", ""), {})
     state_def = entity.get("states", {}).get(pc.get("state", ""), {})
     rule = pc.get("rule_system", "coc")
@@ -639,10 +708,7 @@ def roll_check(chat_id: str):
 
     # Skill check: main d100 vs target → success level
     if pc.get("skill"):
-        if rule == "coc":
-            r = coc_skill_check(pc.get("effective", 0))
-        else:
-            r = resolve_check(rule, pc.get("effective", 0), pc.get("dc", 12))
+        r = resolve_check(rule, pc.get("effective", 0), pc.get("dc", 12))
         out["check"] = {
             "skill": pc.get("skill"), "roll": r.get("d100") or r.get("d20"),
             "target": pc.get("effective", 0), "success": r.get("success"),

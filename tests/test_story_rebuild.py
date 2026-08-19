@@ -13,7 +13,9 @@ from engine import _build_current_story_node_block, narration_provider, run_gm_t
 from models import create_session
 from parser import (
     ModuleParser, _assemble_world_book, _bind_document_provenance,
+    _catalog_windows, _detect_rule_profile, _focused_source_excerpt,
     _merge_story_node_details, _prepare_full_rebuild,
+    _normalize_story_node_kinds,
     _score_global_reconstruction, _score_story_node_detail,
     _select_node_evidence,
 )
@@ -162,6 +164,155 @@ def detailed_story_nodes():
 
 
 class FullStoryRebuildTests(unittest.TestCase):
+    def test_long_document_maps_every_window_before_global_synthesis(self):
+        parser = object.__new__(ModuleParser)
+        parser.model = "mock"
+        parser._last_error = None
+        mapped_source = []
+
+        def fake_llm(system, user, **kwargs):
+            if system.startswith("You are mapping ONE ordered window"):
+                payload = json.loads(user.split("\n\n", 1)[0])
+                mapped_source.append(user)
+                ref = payload["allowed_source_refs"][0]
+                return json.dumps({
+                    "document_roles": [{"source_refs": [ref], "kind": "adventure",
+                                        "scenario_id": "test", "summary": "part"}],
+                    "story_fragments": [{"scenario_id": "test", "title": "Test",
+                                         "scope_id": "physical", "source_refs": [ref],
+                                         "summary": "part", "preconditions": [],
+                                         "outcomes": [], "choices": [], "links_to": []}],
+                    "entity_mentions": [], "scope_mentions": [],
+                    "unresolved_links": [],
+                })
+            rebuilt = reconstructed_module()
+            rebuilt["scenarios"] = [{"id": "test", "title": "Test",
+                                      "root_node_id": "root",
+                                      "starting_node": "study_node"}]
+            for node in rebuilt["story_tree"]["nodes"]:
+                node["scenario_id"] = "test"
+            return json.dumps(rebuilt)
+
+        parser._llm = fake_llm
+        text = (
+            "SCENE 1: Opening\n" + "opening evidence " * 300
+            + "\nSCENE 2: Middle\n" + "middle evidence " * 300
+            + "\nSCENE 3: Ending\n" + "ending evidence " * 300
+            + "FINAL_LONG_DOCUMENT_PAYOFF"
+        )
+        with patch("parser.FULL_REBUILD_MAX_CHARS", 5000), \
+                patch("parser.LONG_DOCUMENT_WINDOW_CHARS", 4000):
+            result = parser.pass_full_rebuild(text)
+
+        self.assertEqual("hierarchical_document_map",
+                         result["_planning"]["method"])
+        self.assertGreater(result["_planning"]["window_count"], 1)
+        self.assertTrue(any("FINAL_LONG_DOCUMENT_PAYOFF" in row
+                            for row in mapped_source))
+        later_payload = json.loads(mapped_source[1].split("\n\n", 1)[0])
+        self.assertEqual("test", later_payload["known_scenarios"][0]["id"])
+
+    def test_long_document_rejects_invented_synthesis_source_ref(self):
+        parser = object.__new__(ModuleParser)
+        parser.model = "mock"
+        parser._last_error = None
+
+        def fake_llm(system, user, **kwargs):
+            if system.startswith("You are mapping ONE ordered window"):
+                payload = json.loads(user.split("\n\n", 1)[0])
+                ref = payload["allowed_source_refs"][0]
+                return json.dumps({
+                    "document_roles": [{"source_refs": [ref], "kind": "adventure"}],
+                    "story_fragments": [], "entity_mentions": [],
+                    "scope_mentions": [], "unresolved_links": [],
+                })
+            result = reconstructed_module()
+            result["story_tree"]["nodes"][0]["source_refs"] = [999999]
+            return json.dumps(result)
+
+        parser._llm = fake_llm
+        with patch("parser.LONG_DOCUMENT_WINDOW_CHARS", 4000):
+            result = parser.pass_long_document_rebuild(
+                "SCENE 1: Test\n" + "source " * 1000)
+
+        self.assertEqual({}, result)
+
+    def test_catalog_windows_preserve_oversized_section_content(self):
+        body = "0123456789" * 1000
+        windows = _catalog_windows(
+            [{"start": 7, "title": "One giant section", "text": body}], 4000)
+
+        self.assertGreater(len(windows), 1)
+        self.assertEqual(body, "".join(
+            segment["text"] for window in windows for segment in window))
+        self.assertEqual({7}, {
+            segment["start"] for window in windows for segment in window})
+
+    def test_ruleset_detection_distinguishes_percentile_games(self):
+        self.assertEqual(
+            {"ruleset": "runequest", "dice_system": "d100"},
+            _detect_rule_profile("RuneQuest Quickstart Rules and Adventure"),
+        )
+        self.assertEqual(
+            {"ruleset": "brp", "dice_system": "d100"},
+            _detect_rule_profile("Basic Roleplaying Universal Game Engine"),
+        )
+        self.assertEqual(
+            {"ruleset": "pendragon", "dice_system": "d20"},
+            _detect_rule_profile("Pendragon 6th Edition Quick-Start Scenario\nRoll 1D20"),
+        )
+        self.assertEqual(
+            {"ruleset": "7thsea", "dice_system": "custom"},
+            _detect_rule_profile("THE SWORD OF KINGS 7TH SEA ADVENTURES"),
+        )
+        self.assertEqual(
+            {"ruleset": "coriolis", "dice_system": "d6_pool"},
+            _detect_rule_profile(
+                "QUICKSTART\nCoriolis: The Great Dark\nThe Sky Machine"),
+        )
+        self.assertEqual(
+            {"ruleset": "starfinder", "dice_system": "d20"},
+            _detect_rule_profile(
+                "STARFINDER SECOND EDITION ADVENTURE\nArmor Class 17\nDC 15"),
+        )
+        self.assertEqual(
+            {"ruleset": "other", "dice_system": "custom"},
+            _detect_rule_profile("STR DEX CON are ordinary labels without dice rules"),
+        )
+        self.assertEqual(
+            {"ruleset": "brp", "dice_system": "d100"},
+            _detect_rule_profile(
+                "BASIC ROLEPLAYING QUICKSTART\nHistory mentions RuneQuest and Call of Cthulhu"),
+        )
+
+    def test_story_node_kinds_use_closed_annotation_taxonomy(self):
+        blueprint = {"story_tree": {"nodes": [
+            {"id": "root", "kind": "root", "playable": False},
+            {"id": "old-choice", "kind": "decision"},
+            {"id": "old-scene", "kind": "investigation"},
+            {"id": "unknown", "kind": "set_piece"},
+        ]}}
+
+        _normalize_story_node_kinds(blueprint)
+
+        self.assertEqual(
+            ["root", "choice", "event", "event"],
+            [row["kind"] for row in blueprint["story_tree"]["nodes"]],
+        )
+
+    def test_large_section_evidence_keeps_contract_relevant_middle(self):
+        source = "start " * 1000 + "THE HIDDEN CEREMONIAL CORRAL" + " end" * 1000
+
+        excerpt = _focused_source_excerpt(
+            source,
+            {"title": "Ceremonial Corral", "summary": "recover the cattle",
+             "preconditions": [], "outcomes": ["cattle recovered"]},
+            2400,
+        )
+
+        self.assertLessEqual(len(excerpt), 2400)
+        self.assertIn("THE HIDDEN CEREMONIAL CORRAL", excerpt)
+
     def test_full_rebuild_receives_document_ending_beyond_old_pass0_limit(self):
         parser = object.__new__(ModuleParser)
         parser.model = "mock"
@@ -412,6 +563,59 @@ class HierarchicalReconstructionQualityTests(unittest.TestCase):
         self.assertLess(report["global_dimensions"]["story_graph_closure"], 100)
         self.assertTrue(any("missing_node" in error for error in report["graph_errors"]))
 
+    def test_global_quality_rejects_cross_scenario_story_edge(self):
+        blueprint = reconstructed_module()
+        blueprint["scenarios"] = [
+            {"id": "first", "root_node_id": "study_node",
+             "starting_node": "study_node"},
+            {"id": "second", "root_node_id": "hall_node",
+             "starting_node": "hall_node"},
+        ]
+        for node in blueprint["story_tree"]["nodes"]:
+            node["scenario_id"] = "first" if node["id"] != "hall_node" else "second"
+        quality = {"overall": 100, "passed": True, "node_count": 2}
+
+        report = _score_global_reconstruction(blueprint, quality)
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(0, report["global_dimensions"]["scenario_isolation"])
+        self.assertTrue(any("cross-scenario" in error
+                            for error in report["graph_errors"]))
+
+    def test_anthology_runtime_ids_are_namespaced_per_scenario(self):
+        blueprint = {
+            "overview": {"title": "Two Stories", "starting_node": "a_node"},
+            "story_spine": {}, "narrative_scopes": [], "entity_registry": [],
+            "scenarios": [
+                {"id": "a", "starting_node": "a_node"},
+                {"id": "b", "starting_node": "b_node"},
+            ],
+            "story_tree": {"root_id": "", "relations": [], "nodes": [
+                {"id": "a_node", "scenario_id": "a", "playable": True,
+                 "successors": []},
+                {"id": "b_node", "scenario_id": "b", "playable": True,
+                 "successors": []},
+            ]},
+        }
+        details = [
+            {"node_id": "a_node", "scenes": [{"id": "study", "name": "Study"}],
+             "npcs": [{"id": "keeper", "name": "Keeper", "scene": "study"}],
+             "objects": [{"id": "door", "name": "Door", "scene": "study"}]},
+            {"node_id": "b_node", "scenes": [{"id": "study", "name": "Study"}],
+             "npcs": [{"id": "keeper", "name": "Keeper", "scene": "study"}],
+             "objects": [{"id": "door", "name": "Door", "scene": "study"}]},
+        ]
+
+        rebuilt = _merge_story_node_details(blueprint, details, {"passed": True})
+        overview, pass1, pass2, _embedded = _prepare_full_rebuild(rebuilt)
+        world = _assemble_world_book(pass1, pass2, overview)
+
+        self.assertEqual({"a::study", "b::study"}, set(world["scenes"]))
+        self.assertEqual({"a::keeper", "b::keeper"}, {
+            npc["id"] for npc in rebuilt["npcs"]})
+        self.assertEqual("a::study", rebuilt["scenarios"][0]["starting_scene"])
+        self.assertEqual("b::study", rebuilt["scenarios"][1]["starting_scene"])
+
     def test_merge_distinguishes_critical_and_optional_clues(self):
         blueprint = reconstructed_module()
         details = detailed_story_nodes()
@@ -426,6 +630,40 @@ class HierarchicalReconstructionQualityTests(unittest.TestCase):
 
         self.assertEqual(["letter"], beat["critical_clues"])
         self.assertEqual(["dust"], beat["optional_clues"])
+
+    def test_runtime_initializes_only_selected_anthology_scenario(self):
+        world = {
+            "name": "Anthology",
+            "rule_system": "coc",
+            "starting_scene": "a_room",
+            "scenarios": [
+                {"id": "a", "title": "A", "starting_scene": "a_room"},
+                {"id": "b", "title": "B", "starting_scene": "b_room"},
+            ],
+            "scenes": {
+                "a_room": {"name": "A Room", "scenario_id": "a", "exits": {}},
+                "b_room": {"name": "B Room", "scenario_id": "b", "exits": {}},
+            },
+            "entities": {
+                "a_npc": {"id": "a_npc", "name": "A NPC", "type": "npc",
+                          "scenario_id": "a", "scene": "a_room"},
+                "b_npc": {"id": "b_npc", "name": "B NPC", "type": "npc",
+                          "scenario_id": "b", "scene": "b_room"},
+            },
+            "story_beats": [
+                {"id": "a_beat", "scenario_id": "a", "scenes": ["a_room"]},
+                {"id": "b_beat", "scenario_id": "b", "scenes": ["b_room"]},
+            ],
+        }
+        session = create_session("anthology-test", "Anthology")
+
+        initialize_session_from_world(session, world, "b")
+
+        self.assertEqual("b", session["current_scenario_id"])
+        self.assertEqual("b_room", session["player_state"]["current_scene"])
+        self.assertEqual("b_beat", session["current_beat_id"])
+        self.assertNotIn("a_npc", session["entity_states"])
+        self.assertIn("b_npc", session["entity_states"])
 
     def test_parse_status_exposes_failed_quality_gate(self):
         world = {

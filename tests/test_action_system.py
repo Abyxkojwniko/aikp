@@ -9,19 +9,24 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from action_system import detect_action, parse_ai_proposal, plan_action, validate_action
-from engine import narration_provider, run_gm_turn
+from action_system import (
+    detect_action, legacy_action_requirements, looks_like_abstract_action,
+    parse_ai_proposal, plan_action, validate_action,
+)
+from engine import _has_player_move_intent, narration_provider, run_gm_turn
 from models import create_session
 from parser import (
     _apply_numbered_scene_edges, _apply_scene_coverage_repair,
     _recover_source_marked_entities, _scene_coverage_candidates,
 )
-from scene_system import list_available_scenes, select_scene_target
+from scene_system import (
+    commit_scene_transition, list_available_scenes, select_scene_target,
+)
 from scene_index import build_entity_index, build_scene_index
 from server import app
 from state_manager import initialize_session_from_world
 from world_state import (
-    append_world_event,
+    append_world_event, fact_for,
     list_interactable_objects,
     select_object_target,
 )
@@ -61,6 +66,10 @@ def build_world():
                 "type": "item", "name": "black crown", "scene": "study",
                 "initial_state": "hidden",
             },
+            "keeper": {
+                "type": "npc", "name": "the keeper", "scene": "study",
+                "initial_state": "present",
+            },
         },
     }
 
@@ -95,6 +104,47 @@ class FactEventTests(unittest.TestCase):
     def test_specific_attack_overrides_generic_use(self):
         self.assertEqual("break", detect_action("我用力量攻击墙板"))
 
+    def test_take_route_is_navigation_not_object_pickup(self):
+        self.session["selected_object_id"] = "coin"
+        for text in (
+            "We take the western passage.",
+            "We take the stairs to upper cargo.",
+            "We take the ladder up.",
+            "We take the starboard bridgeway.",
+        ):
+            with self.subTest(text=text):
+                proposal = plan_action(
+                    text, self.session, self.world,
+                    self.scene_index, self.entity_index,
+                    ai_planner=lambda _prompt: self.fail(
+                        "navigation must not enter object AI resolution"),
+                )
+                resolution = validate_action(proposal, self.session, self.world)
+
+                self.assertEqual("take", proposal["intent"])
+                self.assertEqual("", proposal["target_id"])
+                self.assertEqual("passthrough", resolution["status"])
+                self.assertTrue(_has_player_move_intent(text))
+
+    def test_take_visible_item_still_uses_object_action(self):
+        proposal = plan_action(
+            "Take the brass coin.", self.session, self.world,
+            self.scene_index, self.entity_index)
+        resolution = validate_action(proposal, self.session, self.world)
+
+        self.assertEqual("coin", proposal["target_id"])
+        self.assertEqual("accepted", resolution["status"])
+
+    def test_unconventional_travel_verbs_still_enter_movement_validation(self):
+        for text in (
+            "We teleport directly to the bridge.",
+            "We warp to the bridge.",
+            "We jump to the bridge.",
+            "我们瞬移到舰桥。",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_has_player_move_intent(text))
+
     def test_pickup_removes_object_from_scene_and_carries_across_scenes(self):
         append_world_event(self.session, self.world, {
             "type": "item_picked_up", "entity_id": "coin",
@@ -125,6 +175,47 @@ class FactEventTests(unittest.TestCase):
         coin = next(item for item in self.roster() if item["id"] == "coin")
         self.assertEqual({"kind": "scene", "id": "hall"}, coin["location"])
         self.assertNotIn("coin", self.session["inventory_entity_ids"])
+
+    def test_give_transfers_inventory_to_selected_present_npc(self):
+        append_world_event(self.session, self.world, {
+            "type": "item_picked_up", "entity_id": "coin",
+        })
+        self.session["selected_object_id"] = "coin"
+        self.session["selected_npc_id"] = "keeper"
+
+        proposal = plan_action(
+            "I hand it over to the keeper", self.session, self.world,
+            self.scene_index, self.entity_index)
+        resolution = validate_action(proposal, self.session, self.world)
+        committed = append_world_event(
+            self.session, self.world, resolution["events"][0])
+
+        self.assertEqual("give", proposal["intent"])
+        self.assertEqual("item_transferred", committed["type"])
+        self.assertEqual(
+            {"kind": "entity", "id": "keeper"},
+            self.session["entity_facts"]["coin"]["location"],
+        )
+        self.assertNotIn("coin", self.session["inventory_entity_ids"])
+
+    def test_give_rejects_missing_or_unavailable_recipient(self):
+        append_world_event(self.session, self.world, {
+            "type": "item_picked_up", "entity_id": "coin",
+        })
+        self.session["selected_object_id"] = "coin"
+        proposal = plan_action(
+            "give it away", self.session, self.world,
+            self.scene_index, self.entity_index)
+
+        missing = validate_action(proposal, self.session, self.world)
+        self.session["selected_npc_id"] = "keeper"
+        self.session["entity_states"]["keeper"] = "dead"
+        dead = validate_action(proposal, self.session, self.world)
+
+        self.assertEqual("blocked", missing["status"])
+        self.assertEqual("blocked", dead["status"])
+        self.assertEqual([], missing["events"])
+        self.assertEqual([], dead["events"])
 
     def test_consumed_item_leaves_inventory_and_roster(self):
         append_world_event(self.session, self.world, {
@@ -209,6 +300,41 @@ class FactEventTests(unittest.TestCase):
 
         self.assertEqual("passthrough", resolution["status"])
 
+    def test_give_someone_room_does_not_bind_stale_inventory_selection(self):
+        append_world_event(self.session, self.world, {
+            "type": "item_picked_up", "entity_id": "coin"})
+        self.session["selected_object_id"] = "coin"
+
+        proposal = plan_action(
+            "We give the rats room to escape.", self.session, self.world,
+            self.scene_index, self.entity_index)
+        resolution = validate_action(proposal, self.session, self.world)
+
+        self.assertTrue(looks_like_abstract_action(proposal["player_input"]))
+        self.assertEqual("", proposal["target_id"])
+        self.assertEqual("passthrough", resolution["status"])
+
+    def test_authored_trigger_requirements_are_closed_world(self):
+        state_def = {
+            "requires_inventory": ["coin"],
+            "requires_flags": "ritual_known",
+            "requires_any_flags": ["pub_history", "museum_history"],
+            "requires_entity_states": {"keeper": ["present", "weakened"]},
+        }
+        self.session["entity_states"]["keeper"] = "present"
+
+        self.assertEqual(
+            ["inventory:coin", "flag:ritual_known",
+             "any_flag:pub_history|museum_history"],
+            legacy_action_requirements(state_def, self.session),
+        )
+        append_world_event(self.session, self.world, {
+            "type": "item_picked_up", "entity_id": "coin"})
+        self.session["flags"].append("ritual_known")
+        self.session["flags"].append("museum_history")
+
+        self.assertEqual([], legacy_action_requirements(state_def, self.session))
+
     def test_ambiguous_alias_requires_selection(self):
         self.world["entities"]["silver_coin"] = {
             "type": "item", "name": "silver token", "scene": "study",
@@ -283,6 +409,74 @@ class SceneSystemTests(unittest.TestCase):
         roster = list_available_scenes(self.session, self.world)
 
         self.assertEqual({"hall", "cellar"}, {scene["id"] for scene in roster})
+
+    def test_exit_prerequisites_use_closed_world_state(self):
+        self.world["scenes"]["study"]["exits"]["sealed door"] = {
+            "target": "cellar",
+            "requires_inventory": "coin",
+            "requires_flags": ["seal_read"],
+            "requires_any_flags": ["password_known", "guard_bribed"],
+            "requires_entity_states": {"door": ["opened", "broken"]},
+        }
+
+        self.assertEqual(
+            ["hall"],
+            [item["id"] for item in list_available_scenes(
+                self.session, self.world)],
+        )
+
+        self.session["inventory_entity_ids"] = ["coin"]
+        self.session["flags"] = ["seal_read", "guard_bribed"]
+        self.session["entity_states"]["door"] = "opened"
+        self.assertEqual(
+            {"hall", "cellar"},
+            {item["id"] for item in list_available_scenes(
+                self.session, self.world)},
+        )
+
+    def test_legacy_locked_to_opened_updates_fact_ledger(self):
+        self.world["entities"]["door"]["initial_state"] = "locked"
+        initialize_session_from_world(self.session, self.world)
+
+        from world_state import sync_legacy_transition
+        events = sync_legacy_transition(
+            self.session, self.world, "door", "locked", "opened")
+
+        fact = fact_for(self.session, self.world, "door")
+        self.assertTrue(fact["open"])
+        self.assertFalse(fact["locked"])
+        self.assertEqual("opened", fact["legacy_state"])
+        self.assertEqual(
+            ["object_unlocked", "object_opened"],
+            [event["type"] for event in events],
+        )
+
+    def test_one_shot_scene_entry_event_moves_recurring_npc_authoritatively(self):
+        self.world["entities"]["guide"] = {
+            "type": "npc", "name": "Guide", "scene": "study",
+            "all_scenes": ["study", "hall"], "initial_state": "present",
+        }
+        self.world["scenes"]["hall"]["entry_events"] = [{
+            "type": "entity_moved", "entity_id": "guide",
+            "location": {"kind": "scene", "id": "hall"},
+        }]
+        initialize_session_from_world(self.session, self.world)
+
+        commit_scene_transition(self.session, self.world, "hall")
+
+        self.assertEqual(
+            {"kind": "scene", "id": "hall"},
+            fact_for(self.session, self.world, "guide")["location"],
+        )
+        self.assertEqual(
+            ["entity_moved"],
+            [event["type"] for event in self.session["world_events"]],
+        )
+
+        commit_scene_transition(self.session, self.world, "study")
+        commit_scene_transition(self.session, self.world, "hall")
+
+        self.assertEqual(1, len(self.session["world_events"]))
 
     def test_scene_target_api_rejects_non_adjacent_scene(self):
         context = (self.session, self.world, self.scene_index, self.entity_index)
@@ -471,6 +665,154 @@ class SceneCoverageRepairTests(unittest.TestCase):
 
 
 class HybridEngineActionTests(unittest.TestCase):
+    def test_authored_trigger_is_blocked_until_inventory_requirement_is_met(self):
+        world = build_world()
+        world["entities"]["keeper"]["states"] = {
+            "present": {
+                "triggers": ["confront the keeper"],
+                "requires_inventory": ["coin"],
+                "on_trigger": {
+                    "to_state": "defeated",
+                    "narration": "The keeper is defeated by the brass coin.",
+                },
+            },
+            "defeated": {"interactable": False},
+        }
+        scene_index = build_scene_index(world)
+        entity_index = build_entity_index(world)
+        session = create_session("authored-requirement", world["name"])
+        initialize_session_from_world(session, world)
+
+        context = (
+            patch("engine.load_world", return_value=world),
+            patch("engine.get_indices", return_value=(scene_index, entity_index)),
+            patch("engine.get_session", return_value=session),
+            patch("engine.save_session"),
+            patch("rag.hybrid_search", return_value=[]),
+        )
+        with context[0], context[1], context[2], context[3], context[4], \
+                narration_provider(lambda _request: "This must not override code."):
+            blocked = run_gm_turn(
+                [{"role": "user", "content": "I confront the keeper."}],
+                model=world["name"], chat_id=session["chat_id"],
+                api_key="manual-provider-no-api-key")
+
+        self.assertIn("尚未满足", blocked)
+        self.assertEqual("present", session["entity_states"]["keeper"])
+        append_world_event(session, world, {
+            "type": "item_picked_up", "entity_id": "coin"})
+
+        with patch("engine.load_world", return_value=world), \
+                patch("engine.get_indices", return_value=(scene_index, entity_index)), \
+                patch("engine.get_session", return_value=session), \
+                patch("engine.save_session"), \
+                patch("rag.hybrid_search", return_value=[]), \
+                narration_provider(lambda _request: "unused"):
+            run_gm_turn(
+                [{"role": "user", "content": "I confront the keeper."}],
+                model=world["name"], chat_id=session["chat_id"],
+                api_key="manual-provider-no-api-key")
+
+        self.assertEqual("defeated", session["entity_states"]["keeper"])
+
+    def test_exact_authored_trigger_takes_priority_over_selected_tool(self):
+        world = build_world()
+        world["entities"]["keeper"]["states"] = {
+            "present": {
+                "triggers": ["confront the keeper using the brass coin"],
+                "requires_inventory": ["coin"],
+                "on_trigger": {
+                    "to_state": "defeated",
+                    "narration": "The keeper is defeated by the brass coin.",
+                },
+            },
+            "defeated": {"interactable": False},
+        }
+        scene_index = build_scene_index(world)
+        entity_index = build_entity_index(world)
+        session = create_session("authored-tool-priority", world["name"])
+        initialize_session_from_world(session, world)
+        append_world_event(session, world, {
+            "type": "item_picked_up", "entity_id": "coin"})
+        session["selected_object_id"] = "coin"
+
+        with patch("engine.load_world", return_value=world), \
+                patch("engine.get_indices", return_value=(scene_index, entity_index)), \
+                patch("engine.get_session", return_value=session), \
+                patch("engine.save_session"), \
+                patch("rag.hybrid_search", return_value=[]), \
+                narration_provider(lambda _request: "The keeper falls."):
+            run_gm_turn(
+                [{"role": "user", "content": (
+                    "I confront the keeper using the brass coin.")}],
+                model=world["name"], chat_id=session["chat_id"],
+                api_key="manual-provider-no-api-key")
+
+        self.assertEqual("defeated", session["entity_states"]["keeper"])
+
+    def test_authored_trigger_commits_multi_entity_discovery_events(self):
+        world = build_world()
+        world["entities"]["coin"]["states"] = {
+            "present": {
+                "triggers": ["search the cache"],
+                "on_trigger": {
+                    "to_state": "present",
+                    "narration": "The cache reveals a black crown.",
+                    "events": [{
+                        "type": "entity_discovered", "entity_id": "secret",
+                    }],
+                },
+            },
+        }
+        scene_index = build_scene_index(world)
+        entity_index = build_entity_index(world)
+        session = create_session("authored-events", world["name"])
+        initialize_session_from_world(session, world)
+
+        with patch("engine.load_world", return_value=world), \
+                patch("engine.get_indices", return_value=(scene_index, entity_index)), \
+                patch("engine.get_session", return_value=session), \
+                patch("engine.save_session"), \
+                patch("rag.hybrid_search", return_value=[]), \
+                narration_provider(lambda _request: "unused"):
+            run_gm_turn(
+                [{"role": "user", "content": "I search the cache."}],
+                model=world["name"], chat_id=session["chat_id"],
+                api_key="manual-provider-no-api-key")
+
+        self.assertTrue(fact_for(session, world, "secret")["visible"])
+        self.assertEqual("revealed", session["entity_states"]["secret"])
+        self.assertEqual(
+            "entity_discovered", session["world_events"][-1]["type"])
+
+    def test_authored_discovery_event_registers_clue_and_unlock_flag(self):
+        world = build_world()
+        world["entities"]["secret"]["type"] = "clue"
+        session = create_session("authored-clue", world["name"])
+        initialize_session_from_world(session, world)
+
+        append_world_event(session, world, {
+            "type": "entity_discovered", "entity_id": "secret"})
+
+        self.assertIn("secret", session["discovered_clues"])
+        self.assertIn("secret_discovered", session["flags"])
+
+    def test_authored_name_disclosure_does_not_move_or_reveal_npc_body(self):
+        world = build_world()
+        session = create_session("authored-name", world["name"])
+        initialize_session_from_world(session, world)
+        original_location = dict(fact_for(session, world, "keeper")["location"])
+
+        append_world_event(session, world, {
+            "type": "npc_name_disclosed", "entity_id": "keeper"})
+
+        self.assertTrue(
+            session["npc_states"]["the keeper"]["dynamic"]
+            ["disclosure"]["name"])
+        self.assertEqual(
+            original_location,
+            fact_for(session, world, "keeper")["location"])
+
     def test_narrator_cannot_invent_catastrophic_world_mutation(self):
         world = build_world()
         scene_index = build_scene_index(world)

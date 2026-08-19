@@ -6,7 +6,7 @@ import { getMessageTimeStamp } from '../../RossAscends-mods.js';
 // eventSource, event_types, saveSettingsDebounced accessed via getContext() to avoid
 // circular dependency with script.js which would break slash command registration.
 
-console.log('[AIKP] Extension v2.3.0 loaded');
+console.log('[AIKP] Extension v2.4.0 loaded');
 
 // -- Slash Commands --
 // ST slash command callbacks MUST call sendSystemMessage() / toastr to display
@@ -231,6 +231,39 @@ async function fetchSession() {
         if (r.ok) return await r.json();
     } catch (e) { console.error('[AIKP] fetchSession:', e.message); }
     return null;
+}
+
+async function fetchScenarioRoster() {
+    try {
+        const chatId = await getChatId();
+        const r = await fetch(`${BACKEND_URL}/api/session/${encodeURIComponent(chatId)}/scenarios`);
+        if (r.ok) return await r.json();
+    } catch (e) { console.error('[AIKP] fetchScenarioRoster:', e.message); }
+    return null;
+}
+
+async function setScenario(scenarioId) {
+    try {
+        const chatId = await getChatId();
+        const session = await fetchSession();
+        if ((session?.current_turn || 0) > 0 &&
+                !window.confirm('切换冒险会清空当前游戏进度。继续吗？')) {
+            updateStatusBar();
+            return;
+        }
+        const r = await fetch(`${BACKEND_URL}/api/session/${encodeURIComponent(chatId)}/scenario-target`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scenario_id: scenarioId }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.detail || 'Scenario selection failed');
+        toastr.info('已切换冒险，发送“开始游戏”进入开场。', 'AIKP');
+        updateStatusBar();
+    } catch (e) {
+        toastr.error(e.message, 'AIKP');
+        updateStatusBar();
+    }
 }
 
 async function fetchWorlds() {
@@ -535,6 +568,7 @@ async function updateStatusBar() {
         return;
     }
     const ps = session.player_state || {};
+    const scenarioRoster = await fetchScenarioRoster();
     const sceneName = ps.current_scene_name || ps.current_scene || '?';
     const name = ps.name || '调查员';
     const prof = ps.profession ? `（${ps.profession}）` : '';
@@ -551,13 +585,28 @@ async function updateStatusBar() {
         .map(([k, v]) => `${k}${v}`)
         .join(' ');
 
+    const scenarios = scenarioRoster?.scenarios || [];
+    const scenarioControl = scenarios.length > 1 ? `
+        <label class="aikp-scenario-control">
+            <span>冒险</span>
+            <select id="aikp_scenario_select" aria-label="选择冒险">
+                ${scenarios.map(row => `<option value="${escapeHtml(row.id)}"${row.selected ? ' selected' : ''}>${escapeHtml(row.title)}</option>`).join('')}
+            </select>
+        </label>` : '';
     const html = `
         <div class="aikp-sp-line"><strong>${name}</strong>${prof} &middot; ${sceneName} &middot; T${session.current_turn || 0} &middot; ${session.plot_phase || 'intro'}</div>
         <div class="aikp-sp-line">HP ${ps.hp ?? '?'}/${ps.max_hp ?? '?'} &nbsp; SAN ${ps.san ?? '?'}/${ps.max_san ?? '?'} &nbsp; MP ${ps.mp ?? '?'}/${ps.max_mp ?? '?'}</div>
         ${skillStr ? `<div class="aikp-sp-line aikp-sp-skills">${skillStr}</div>` : ''}
+        ${scenarioControl}
     `;
     const panel = $('#aikp_status_panel');
-    if (panel.length) panel.html(html);
+    if (panel.length) {
+        panel.html(html);
+        panel.off('change.aikpScenario', '#aikp_scenario_select')
+            .on('change.aikpScenario', '#aikp_scenario_select', function () {
+                setScenario(String($(this).val() || ''));
+            });
+    }
 
     // Dice button: show & highlight when a check awaits the player's roll
     const pc = session.pending_check;
