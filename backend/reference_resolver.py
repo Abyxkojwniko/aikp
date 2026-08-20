@@ -117,7 +117,8 @@ def resolve_known_reference(player_input: str, candidate_entity_ids: list[str],
 
     entities = world.get("entities", {})
     for eid in candidates:
-        entity = entities.get(eid, {})
+        from perception import projected_entity
+        entity = projected_entity(eid, session, world) or entities.get(eid, {})
         for raw, base, reason in _known_forms(eid, entity, session):
             form = normalize_reference(str(raw))
             min_len = 3 if re.search(r'[a-z]', form) else 2
@@ -239,7 +240,8 @@ def list_interactable_npcs(session: dict, world: dict,
     seen = set()
     entities = world.get("entities", {})
     for eid in candidates:
-        entity = entities.get(eid, {})
+        from perception import projected_entity
+        entity = projected_entity(eid, session, world) or entities.get(eid, {})
         if (not isinstance(entity, dict) or entity.get("type") != "npc"
                 or eid in seen
                 or not entity_is_player_visible(eid, world, session)

@@ -13,6 +13,7 @@ from engine import _build_current_story_node_block, narration_provider, run_gm_t
 from models import create_session
 from parser import (
     ModuleParser, _assemble_world_book, _bind_document_provenance,
+    _bind_perception_entity_instances,
     _catalog_windows, _detect_rule_profile, _focused_source_excerpt,
     _merge_story_node_details, _prepare_full_rebuild,
     _normalize_story_node_kinds,
@@ -522,6 +523,64 @@ class HierarchicalReconstructionQualityTests(unittest.TestCase):
         self.assertTrue(any("unverified detailed records" in error
                             for error in report["hard_errors"]))
 
+    def test_deterministic_score_rejects_broken_conditional_chain(self):
+        evidence = _select_node_evidence(self.source, self.contract)
+        detail = self._good_detail(evidence)
+        detail["conditional_events"] = [{
+            "id": "idea-gate", "observer_scope": "active_character",
+            "when": {"type": "clock_at_least", "value": 8},
+            "check": {"type": "skill", "difficulty": "impossible"},
+            "outcomes": {
+                "success": {"followup_checks": [{"type": "san"}]},
+            },
+            "source_ref": evidence["source_refs"][0],
+            "source_quote": "You enter the study.",
+            "source_verified": True,
+        }]
+
+        report = _score_story_node_detail(
+            self.contract, detail, evidence, {"study_node"})
+
+        self.assertTrue(any("trigger is missing clock_id" in error
+                            for error in report["hard_errors"]))
+        self.assertTrue(any("is missing skill" in error
+                            for error in report["hard_errors"]))
+        self.assertTrue(any("unsupported difficulty" in error
+                            for error in report["hard_errors"]))
+        self.assertTrue(any("is missing SAN loss" in error
+                            for error in report["hard_errors"]))
+
+    def test_deterministic_score_rejects_broken_scene_projection(self):
+        evidence = _select_node_evidence(self.source, self.contract)
+        detail = self._good_detail(evidence)
+        detail["perception_layers"] = [{
+            "id": "bad-view", "activation": "condition",
+            "description_mode": "merge", "description": "",
+            "when": {"type": "player_stat", "name": "灵感"},
+            "visible_entity_ids": ["door"], "hidden_entity_ids": ["door"],
+            "source_ref": evidence["source_refs"][0],
+            "source_quote": "You enter the study.", "source_verified": True,
+        }]
+        detail["conditional_events"] = [{
+            "id": "idea", "when": {"type": "always"},
+            "check": {"type": "skill", "skill": "Idea"},
+            "outcomes": {"success": {
+                "activate_perception_layers": ["missing-view"],
+            }},
+            "source_ref": evidence["source_refs"][0],
+            "source_quote": "You enter the study.", "source_verified": True,
+        }]
+
+        report = _score_story_node_detail(
+            self.contract, detail, evidence, {"study_node"})
+
+        errors = "\n".join(report["hard_errors"])
+        self.assertIn("missing scene_id", errors)
+        self.assertIn("unsupported description mode", errors)
+        self.assertIn("condition is missing value", errors)
+        self.assertIn("both reveals and hides", errors)
+        self.assertIn("unknown perception layers", errors)
+
     def test_low_scoring_node_is_rebuilt_with_targeted_feedback(self):
         parser = object.__new__(ModuleParser)
         parser.model = "mock"
@@ -630,6 +689,60 @@ class HierarchicalReconstructionQualityTests(unittest.TestCase):
 
         self.assertEqual(["letter"], beat["critical_clues"])
         self.assertEqual(["dust"], beat["optional_clues"])
+
+    def test_merge_links_conditional_outcome_to_perception_layer(self):
+        blueprint = reconstructed_module()
+        details = detailed_story_nodes()
+        details[0]["perception_layers"] = [{
+            "id": "hidden-study", "scene_id": "study", "priority": 10,
+            "activation": "conditional_outcome", "description_mode": "replace",
+            "description": "The study becomes an endless archive.",
+            "visible_entity_ids": ["bookshelf"], "hidden_entity_ids": [],
+        }]
+        details[0]["conditional_events"] = [{
+            "id": "idea-check", "when": {"type": "always"},
+            "check": {"type": "skill", "skill": "Idea"},
+            "outcomes": {"success": {
+                "activate_perception_layers": ["hidden-study"],
+            }},
+        }]
+
+        rebuilt = _merge_story_node_details(blueprint, details, {"passed": True})
+
+        layer = rebuilt["perception_layers"][0]
+        event = rebuilt["conditional_events"][0]
+        self.assertEqual("study_node::hidden-study", layer["id"])
+        self.assertEqual(
+            ["study_node::hidden-study"],
+            event["outcomes"]["success"]["activate_perception_layers"],
+        )
+
+    def test_perception_layer_binds_the_correct_same_named_door_instance(self):
+        blueprint = reconstructed_module()
+        details = detailed_story_nodes()
+        details[0]["perception_layers"] = [{
+            "id": "study-view", "scene_id": "study",
+            "activation": "condition", "when": {"type": "always"},
+            "description": "The study door appears black.",
+            "visible_entity_ids": ["door"],
+        }]
+        details[1]["perception_layers"] = [{
+            "id": "hall-view", "scene_id": "hall",
+            "activation": "condition", "when": {"type": "always"},
+            "description": "The hall door appears white.",
+            "visible_entity_ids": ["door"],
+        }]
+        rebuilt = _merge_story_node_details(blueprint, details, {"passed": True})
+        overview, pass1, pass2, _embedded = _prepare_full_rebuild(rebuilt)
+        world = _assemble_world_book(pass1, pass2, overview)
+        world["perception_layers"] = rebuilt["perception_layers"]
+        _bind_perception_entity_instances(world)
+
+        study_id = world["perception_layers"][0]["visible_entity_ids"][0]
+        hall_id = world["perception_layers"][1]["visible_entity_ids"][0]
+        self.assertNotEqual(study_id, hall_id)
+        self.assertEqual("study", world["entities"][study_id]["scene"])
+        self.assertEqual("hall", world["entities"][hall_id]["scene"])
 
     def test_runtime_initializes_only_selected_anthology_scenario(self):
         world = {

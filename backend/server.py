@@ -407,6 +407,8 @@ def get_session(chat_id: str):
     try:
         session = load_session(chat_id)
         session.pop("turn_log", None)
+        from perception import observer_player_state
+        session["player_state"] = observer_player_state(session)
         # Attach human-readable scene name for the frontend status panel
         try:
             from engine import load_world
@@ -419,7 +421,9 @@ def get_session(chat_id: str):
                 from scene_system import ensure_scene_state
                 ensure_scene_state(session, world)
                 sid = ps.get("current_scene", "")
-                ps["current_scene_name"] = world.get("scenes", {}).get(sid, {}).get("name", sid)
+                from perception import scene_projection
+                ps["current_scene_name"] = scene_projection(
+                    session, world, sid).get("name", sid)
         except Exception:
             pass
         return session
@@ -685,7 +689,14 @@ def roll_check(chat_id: str):
     pending check, and return the roll for the UI to show."""
     from state_manager import load_session, save_session
     from dice import resolve_check, coc_san_loss
-    from engine import _apply_pending_clock_outcome, load_world
+    from engine import (
+        _apply_pending_clock_outcome, _resolve_clue_skill,
+        activate_conditional_events, load_world,
+    )
+    from conditional_events import (
+        check_passed as conditional_check_passed,
+        resolve_followup_outcome, resolve_primary_outcome,
+    )
 
     # Every roll is one rules transaction. Clock/SAN/state/event changes are
     # staged together and reach disk/cache only after the whole outcome passes.
@@ -703,12 +714,16 @@ def roll_check(chat_id: str):
     entity = world.get("entities", {}).get(pc.get("entity_id", ""), {})
     state_def = entity.get("states", {}).get(pc.get("state", ""), {})
     rule = pc.get("rule_system", "coc")
-    ps = session.setdefault("player_state", {})
+    from perception import observer_player_state
+    conditional_observer = str(pc.get("_conditional_observer_id", ""))
+    ps = observer_player_state(
+        session, conditional_observer, mutable=True)
 
     out = {"entity": pc.get("entity_id"), "entity_name": entity.get("name", ""),
            "skill": pc.get("skill", ""), "narration": ""}
     narration = []
     outcome_applied = False
+    next_pending = None
 
     def apply_authored_outcome(outcome: dict) -> None:
         nonlocal outcome_applied
@@ -756,7 +771,30 @@ def roll_check(chat_id: str):
                 milestone["narration"]
                 for milestone in clock_event.get("milestones", [])
                 if milestone.get("narration"))
-        if pc.get("_scene_clue_id"):
+        if pc.get("_conditional_event_id"):
+            passed = conditional_check_passed(pc, r)
+            out["check"]["meets_difficulty"] = passed
+            out["check"]["required_level"] = pc.get(
+                "_required_success_level", "regular")
+            if pc.get("_conditional_stage") == "followup":
+                conditional = resolve_followup_outcome(
+                    session, world, pc, passed, r.get("verdict", ""),
+                    _resolve_clue_skill)
+            else:
+                conditional = resolve_primary_outcome(
+                    session, world, pc, passed, r.get("verdict", ""),
+                    _resolve_clue_skill)
+            next_pending = conditional.get("next_check")
+            out["conditional"] = {
+                "event_id": pc.get("_conditional_event_id"),
+                "observer_id": pc.get("_conditional_observer_id"),
+                "outcome": conditional.get("outcome"),
+                "stage": pc.get("_conditional_stage", "primary"),
+            }
+            narration.append(
+                f"〈{pc.get('skill')}〉检定：{out['check']['verdict_cn']}。")
+            narration.extend(conditional.get("narration", []))
+        elif pc.get("_scene_clue_id"):
             # Scene clue check: on success → reveal clue description
             clue_id = pc["_scene_clue_id"]
             scene_id = pc.get("scene", "")
@@ -813,8 +851,35 @@ def roll_check(chat_id: str):
         if not outcome_applied:
             tr = state_def.get("on_pass") or state_def.get("on_trigger") or {}
             apply_authored_outcome(tr)
+        if pc.get("_conditional_event_id"):
+            san_passed = bool(sr.get("passed_pow_check"))
+            san_verdict = "success" if san_passed else "failure"
+            if pc.get("_conditional_stage") == "followup":
+                conditional = resolve_followup_outcome(
+                    session, world, pc, san_passed, san_verdict,
+                    _resolve_clue_skill)
+            else:
+                conditional = resolve_primary_outcome(
+                    session, world, pc, san_passed, san_verdict,
+                    _resolve_clue_skill)
+            next_pending = conditional.get("next_check")
+            out["conditional"] = {
+                "event_id": pc.get("_conditional_event_id"),
+                "observer_id": pc.get("_conditional_observer_id"),
+                "outcome": conditional.get("outcome"),
+                "stage": pc.get("_conditional_stage", "primary"),
+            }
+            narration.extend(conditional.get("narration", []))
 
-    session["pending_check"] = None
+    session["pending_check"] = next_pending
+    if not next_pending:
+        activation = activate_conditional_events(session, world)
+        narration.extend(activation.get("narration", []))
+        next_pending = activation.get("pending_check")
+    out["next_check"] = ({
+        "skill": next_pending.get("skill", ""),
+        "san_check": next_pending.get("san_check", ""),
+    } if next_pending else None)
     save_session(session)
     # Sync engine's in-memory session cache — otherwise the next turn's
     # run_gm_turn reuses a stale cached session and the roll's SAN/state changes

@@ -54,6 +54,10 @@ _CANONICAL_STATE_KEYS = (
     "discovered_scene_ids",
     "visited_scene_ids",
     "current_scenario_id",
+    "knowledge_facts",
+    "conditional_event_states",
+    "active_perception_layers",
+    "observer_player_states",
 )
 
 
@@ -278,11 +282,17 @@ def fact_for(session: dict, world: dict, entity_id: str) -> dict:
 def entity_is_visible(entity_id: str, world: dict, session: dict) -> bool:
     fact = fact_for(session, world, entity_id)
     entity = world.get("entities", {}).get(entity_id, {})
-    if not fact or not fact.get("exists", True) or not fact.get("visible", False):
+    if not fact or not fact.get("exists", True):
+        return False
+    from perception import entity_is_perceived, entity_visibility_override
+    visible = entity_is_perceived(
+        entity_id, session, world, bool(fact.get("visible", False)))
+    if not visible:
         return False
     if entity.get("type") == "clue":
         return bool(
-            fact.get("known")
+            entity_visibility_override(entity_id, session, world) is True
+            or fact.get("known")
             or entity_id in session.get("discovered_clues", [])
             or f"{entity_id}_discovered" in session.get("flags", [])
         )
@@ -342,19 +352,27 @@ def list_interactable_objects(session: dict, world: dict, scene_index: dict,
     selected = session.get("selected_object_id")
     result = []
     for eid in candidates:
-        entity = world.get("entities", {}).get(eid, {})
+        base_entity = world.get("entities", {}).get(eid, {})
+        from perception import projected_entity
+        entity = projected_entity(eid, session, world)
         if not isinstance(entity, dict) or entity.get("type") in NON_OBJECT_TYPES:
             continue
         if not entity_is_visible(eid, world, session):
             continue
         fact = facts[eid]
+        capabilities = (
+            ["inspect", "read"]
+            if base_entity.get("perception_only") is True
+            else _capabilities(entity, fact)
+        )
         result.append({
             "id": eid,
-            "label": str(entity.get("name", eid)),
+            "label": str(entity.get("label") or entity.get("name", eid)),
             "type": str(entity.get("type", "object")),
             "location": deepcopy(fact.get("location", {})),
             "state": str(session.get("entity_states", {}).get(eid, "default")),
-            "capabilities": _capabilities(entity, fact),
+            "capabilities": capabilities,
+            "perception_only": base_entity.get("perception_only") is True,
             "selected": eid == selected,
         })
     return result
@@ -441,6 +459,9 @@ def apply_world_event(session: dict, world: dict, event: dict) -> dict:
         raise ValueError("world event references an unknown entity")
     fact = session["entity_facts"][eid]
     entity = world.get("entities", {}).get(eid, {})
+    if entity.get("perception_only") is True:
+        raise ValueError(
+            "physical world events cannot target a perception-only entity")
     scene_id = str(event.get("scene_id") or
                    session.get("player_state", {}).get("current_scene", ""))
 

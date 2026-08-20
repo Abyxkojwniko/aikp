@@ -1,7 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 
@@ -26,6 +26,7 @@ from engine import (
     _redact_unrevealed_names,
     _unlock_names_player_knows,
     _try_arm_scene_clue,
+    activate_conditional_events,
     assemble_context,
     narrate,
     narrative_audit_provider,
@@ -33,9 +34,16 @@ from engine import (
     resolve_entity,
     run_gm_turn,
 )
-from narrative_guard import build_narrative_contract
+from narrative_guard import build_narrative_contract, deterministic_violations
+from conditional_events import (
+    extract_clock_conditional_events,
+    observer_knowledge,
+    resolve_primary_outcome,
+)
+from action_system import plan_action, validate_action
 from models import create_session
 from npc_context import build_scene_layer
+from perception import scene_projection
 from parser import (
     _bind_chunk_provenance,
     _extract_action_clocks,
@@ -52,8 +60,10 @@ from reference_resolver import (
     resolve_known_reference,
     select_interaction_target,
 )
-from state_manager import compute_state_snapshot
-from server import app
+from state_manager import compute_state_snapshot, initialize_session_from_world
+from server import app, roll_check
+from scene_index import build_entity_index, build_scene_index
+from world_state import commit_world_events, list_interactable_objects
 
 
 class ContextBudgetTests(unittest.TestCase):
@@ -498,6 +508,521 @@ class NarrationProviderTests(unittest.TestCase):
         self.assertIn("【移动提示·重要】", prompt)
         self.assertIn("CRITICAL: You are a Game Master.", prompt)
         self.assertIn("=== NARRATIVE COMMITMENTS", prompt)
+
+
+class ConditionalPerceptionTests(unittest.TestCase):
+    def setUp(self):
+        self.world = {
+            "name": "conditional-perception",
+            "rule_system": "coc",
+            "starting_scene": "room",
+            "scenes": {"room": {"name": "Room", "exits": {}}},
+            "entities": {
+                "mirror": {
+                    "id": "mirror", "type": "object", "name": "Mirror",
+                    "scene": "room", "initial_state": "present",
+                },
+            },
+            "action_clocks": {"development_round": {
+                "name": "发展轮次", "initial": 0,
+                "actions": [{
+                    "label": "等待", "triggers": ["等待"], "increment": 1,
+                }],
+                "milestones": [{
+                    "at": 8, "flag": "honey_8", "narration": "墙壁爬满手印。",
+                }],
+            }},
+            "conditional_events": [{
+                "id": "idea-at-eight",
+                "observer_scope": "active_character",
+                "when": {
+                    "type": "clock_at_least",
+                    "clock_id": "development_round", "value": 8,
+                },
+                "check": {
+                    "type": "skill", "skill": "灵感", "difficulty": "regular",
+                },
+                "outcomes": {
+                    "success": {
+                        "observations": [{
+                            "id": "vision", "text": "你看见墙后翻涌的幻象。",
+                        }],
+                        "followup_checks": [{"type": "san", "loss": "1/1d3"}],
+                    },
+                    "failure": {},
+                },
+            }],
+        }
+        self.session = create_session("conditional", self.world["name"])
+        initialize_session_from_world(self.session, self.world)
+        self.session["clocks"]["development_round"] = 8
+
+    @staticmethod
+    def success_roll():
+        return {"d100": 20, "success": True, "verdict": "hard_success"}
+
+    @staticmethod
+    def failure_roll():
+        return {"d100": 90, "success": False, "verdict": "failure"}
+
+    def test_default_sheet_resolves_inspiration_as_intelligence(self):
+        activation = activate_conditional_events(self.session, self.world)
+
+        pending = activation["pending_check"]
+        self.assertEqual("智力", pending["skill"])
+        self.assertEqual(60, pending["effective"])
+        self.assertEqual("player", pending["_conditional_observer_id"])
+
+    def test_success_records_private_knowledge_then_queues_san(self):
+        activate_conditional_events(self.session, self.world)
+        saved = []
+        with patch("state_manager.load_session", return_value=self.session), \
+                patch("state_manager.save_session", side_effect=saved.append), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.resolve_check", return_value=self.success_roll()):
+            first = roll_check(self.session["chat_id"])
+
+        staged = saved[-1]
+        self.assertEqual({"skill": "", "san_check": "1/1d3"}, first["next_check"])
+        self.assertEqual(
+            ["你看见墙后翻涌的幻象。"],
+            [row["text"] for row in observer_knowledge(staged, "player")],
+        )
+        self.assertEqual(
+            "awaiting_followup",
+            staged["conditional_event_states"]["idea-at-eight"]["player"]["status"],
+        )
+
+        san_result = {
+            "d100": 30, "passed_pow_check": True,
+            "san_before": 50, "san_after": 49, "san_loss": 1,
+            "insanity_temp": False, "insanity_indef": False,
+        }
+        saved_again = []
+        with patch("state_manager.load_session", return_value=staged), \
+                patch("state_manager.save_session", side_effect=saved_again.append), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.coc_san_loss", return_value=san_result):
+            second = roll_check(staged["chat_id"])
+
+        completed = saved_again[-1]
+        self.assertIsNone(second["next_check"])
+        self.assertIsNone(completed["pending_check"])
+        self.assertEqual(49, completed["player_state"]["san"])
+        self.assertEqual(
+            "resolved",
+            completed["conditional_event_states"]["idea-at-eight"]["player"]["status"],
+        )
+
+    def test_failure_does_not_grant_success_knowledge_or_san_check(self):
+        activate_conditional_events(self.session, self.world)
+        saved = []
+        with patch("state_manager.load_session", return_value=self.session), \
+                patch("state_manager.save_session", side_effect=saved.append), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.resolve_check", return_value=self.failure_roll()):
+            result = roll_check(self.session["chat_id"])
+
+        staged = saved[-1]
+        self.assertIsNone(result["next_check"])
+        self.assertEqual([], observer_knowledge(staged, "player"))
+        self.assertEqual(
+            "failure",
+            staged["conditional_event_states"]["idea-at-eight"]["player"]["outcome"],
+        )
+
+    def test_private_observation_is_not_shared_with_another_investigator(self):
+        activation = activate_conditional_events(self.session, self.world)
+        pending = activation["pending_check"]
+        self.world["conditional_events"][0]["outcomes"]["success"].pop(
+            "followup_checks")
+        from engine import _resolve_clue_skill
+        resolve_primary_outcome(
+            self.session, self.world, pending, True, "success",
+            _resolve_clue_skill)
+
+        self.session["player_state"]["active_character_id"] = "investigator-b"
+        second = activate_conditional_events(self.session, self.world)
+
+        self.assertEqual(
+            ["你看见墙后翻涌的幻象。"],
+            [row["text"] for row in observer_knowledge(
+                self.session, "player")],
+        )
+        self.assertEqual([], observer_knowledge(self.session, "investigator-b"))
+        self.assertEqual(
+            "investigator-b",
+            second["pending_check"]["_conditional_observer_id"],
+        )
+
+    def test_invalid_conditional_world_event_rolls_back_entire_roll(self):
+        self.world["conditional_events"][0]["outcomes"]["success"]["events"] = [{
+            "type": "entity_moved", "entity_id": "mirror",
+            "location": {"kind": "scene", "id": "invented"},
+        }]
+        activate_conditional_events(self.session, self.world)
+        before = dict(self.session)
+        save = Mock()
+        with patch("state_manager.load_session", return_value=self.session), \
+                patch("state_manager.save_session", save), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.resolve_check", return_value=self.success_roll()):
+            with self.assertRaises(ValueError):
+                roll_check(self.session["chat_id"])
+
+        self.assertEqual(before, self.session)
+        save.assert_not_called()
+
+    def test_unknown_perception_layer_rolls_back_entire_roll(self):
+        self.world["conditional_events"][0]["outcomes"]["success"][
+            "activate_perception_layers"] = ["invented-view"]
+        activate_conditional_events(self.session, self.world)
+        before = dict(self.session)
+        save = Mock()
+        with patch("state_manager.load_session", return_value=self.session), \
+                patch("state_manager.save_session", save), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.resolve_check", return_value=self.success_roll()):
+            with self.assertRaises(ValueError):
+                roll_check(self.session["chat_id"])
+
+        self.assertEqual(before, self.session)
+        save.assert_not_called()
+
+    def test_unearned_private_observation_is_deterministically_rejected(self):
+        contract = build_narrative_contract({
+            "session": self.session, "world": self.world,
+            "scene_entities": [], "_action_events": [],
+        })
+        violations = deterministic_violations(
+            "你看见墙后翻涌的幻象。", contract)
+
+        self.assertEqual("hidden_information_leak", violations[0]["kind"])
+
+        activation = activate_conditional_events(self.session, self.world)
+        self.world["conditional_events"][0]["outcomes"]["success"].pop(
+            "followup_checks")
+        from engine import _resolve_clue_skill
+        resolve_primary_outcome(
+            self.session, self.world, activation["pending_check"],
+            True, "success", _resolve_clue_skill)
+        earned_contract = build_narrative_contract({
+            "session": self.session, "world": self.world,
+            "scene_entities": [], "_action_events": [],
+        })
+        self.assertEqual([], deterministic_violations(
+            "你看见墙后翻涌的幻象。", earned_contract))
+
+    def test_skill_followup_can_queue_a_branch_specific_san_check(self):
+        success = self.world["conditional_events"][0]["outcomes"]["success"]
+        success["followup_checks"] = [{
+            "type": "skill", "skill": "意志", "difficulty": "hard",
+            "on_success": {
+                "followup_checks": [{"type": "san", "loss": "1d3/1d10"}],
+            },
+            "on_failure": {
+                "observations": [{"id": "polluted", "text": "精神受到污染。"}],
+            },
+        }]
+        activate_conditional_events(self.session, self.world)
+        saved = []
+        with patch("state_manager.load_session", return_value=self.session), \
+                patch("state_manager.save_session", side_effect=saved.append), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.resolve_check", return_value=self.success_roll()):
+            first = roll_check(self.session["chat_id"])
+
+        self.assertEqual("意志", first["next_check"]["skill"])
+        followup_session = saved[-1]
+        saved_again = []
+        with patch("state_manager.load_session", return_value=followup_session), \
+                patch("state_manager.save_session", side_effect=saved_again.append), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.resolve_check", return_value={
+                    "d100": 20, "success": True, "verdict": "hard_success",
+                }):
+            second = roll_check(followup_session["chat_id"])
+
+        self.assertEqual(
+            {"skill": "", "san_check": "1d3/1d10"}, second["next_check"])
+
+    def test_primary_conditional_san_check_resolves_the_event(self):
+        event = self.world["conditional_events"][0]
+        event["check"] = {"type": "san", "loss": "0/1d3"}
+        event["outcomes"] = {
+            "success": {"observations": [{"text": "你稳住了心神。"}]},
+            "failure": {"observations": [{"text": "恐惧攫住了你。"}]},
+        }
+        activation = activate_conditional_events(self.session, self.world)
+        self.assertEqual("0/1d3", activation["pending_check"]["san_check"])
+        san_result = {
+            "d100": 30, "passed_pow_check": True,
+            "san_before": 50, "san_after": 50, "san_loss": 0,
+            "insanity_temp": False, "insanity_indef": False,
+        }
+        saved = []
+        with patch("state_manager.load_session", return_value=self.session), \
+                patch("state_manager.save_session", side_effect=saved.append), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.coc_san_loss", return_value=san_result):
+            result = roll_check(self.session["chat_id"])
+
+        completed = saved[-1]
+        self.assertIsNone(result["next_check"])
+        self.assertIn("你稳住了心神。", result["narration"])
+        self.assertEqual(
+            "resolved",
+            completed["conditional_event_states"]["idea-at-eight"]["player"]["status"],
+        )
+
+    def test_clock_source_recovers_single_chain_but_not_complex_multi_skill_chain(self):
+        text = (
+            "◇当发展轮次到达[8]时\n墙壁爬满手印。\n"
+            "（此时进行一次普通难度的灵感检定，若成功则看到幻象，"
+            "并进行检定 SAN1/1d3。）\n"
+            "◇当发展轮次到达[12]时\n怪物出现。\n"
+            "（进行一次困难难度的体质检定，再进行一次困难难度的意志检定，"
+            "意志成功则进行 SAN1d3/1d10。）"
+        )
+        clocks = _extract_action_clocks(text)
+        events = extract_clock_conditional_events(text, clocks)
+
+        self.assertEqual(1, len(events))
+        self.assertEqual("灵感", events[0]["check"]["skill"])
+        self.assertEqual(
+            "1/1d3",
+            events[0]["outcomes"]["success"]["followup_checks"][0]["loss"],
+        )
+
+        recovered_world = {
+            "rule_system": "coc", "scenes": {"room": {"exits": {}}},
+            "conditional_events": events,
+        }
+        recovered_session = create_session("recovered", "recovered")
+        recovered_session["player_state"]["current_scene"] = "room"
+        recovered_session["clocks"]["development_round"] = 8
+        activation = activate_conditional_events(recovered_session, recovered_world)
+        from engine import _resolve_clue_skill
+        resolved = resolve_primary_outcome(
+            recovered_session, recovered_world, activation["pending_check"],
+            True, "success", _resolve_clue_skill)
+        self.assertEqual(["你看到了幻象。"], resolved["narration"])
+        self.assertEqual(
+            ["看到幻象"],
+            [row["text"] for row in observer_knowledge(recovered_session)],
+        )
+
+
+class ScenePerceptionProjectionTests(unittest.TestCase):
+    def setUp(self):
+        self.world = {
+            "name": "observer-scene-views", "rule_system": "coc",
+            "starting_scene": "room",
+            "scenes": {"room": {
+                "name": "储藏室", "desc": "这是一间普通的储藏室。",
+                "source_text": "普通的储藏室里摆着书桌。", "exits": {},
+            }},
+            "entities": {
+                "desk": {
+                    "id": "desk", "name": "书桌", "type": "object",
+                    "scene": "room", "initial_state": "present",
+                },
+                "rift_text": {
+                    "id": "rift_text", "name": "不可见手稿", "type": "document",
+                    "scene": "room", "initial_state": "hidden",
+                    "perception_only": True, "portable": False,
+                },
+            },
+            "perception_layers": [
+                {
+                    "id": "mundane-view", "scene_id": "room", "priority": 10,
+                    "activation": "condition",
+                    "when": {"type": "player_stat", "name": "灵感",
+                             "operator": "lt", "value": 70},
+                    "description_mode": "replace",
+                    "description": "低灵感者只看见狭窄、积灰的普通储藏室。",
+                    "source_quote": "低灵感者只看见狭窄、积灰的普通储藏室。",
+                    "visible_entity_ids": ["desk"],
+                    "hidden_entity_ids": ["rift_text"],
+                },
+                {
+                    "id": "rift-view", "scene_id": "room", "priority": 20,
+                    "activation": "condition",
+                    "when": {"type": "player_stat", "name": "灵感",
+                             "operator": "gte", "value": 70},
+                    "name": "无尽档案室", "description_mode": "replace",
+                    "description": "高灵感者看见墙壁退入黑暗，书页悬浮成无尽长廊。",
+                    "source_quote": "高灵感者看见墙壁退入黑暗，书页悬浮成无尽长廊。",
+                    "visible_entity_ids": ["rift_text"],
+                    "hidden_entity_ids": ["desk"],
+                    "entity_overrides": {
+                        "rift_text": {"name": "裂隙手稿",
+                                      "description": "文字在纸面上缓慢游动。"},
+                    },
+                },
+                {
+                    "id": "rolled-vision", "scene_id": "room", "priority": 30,
+                    "activation": "conditional_outcome",
+                    "description_mode": "replace",
+                    "description": "检定成功后，房间翻转成倒悬的镜厅。",
+                    "source_quote": "检定成功后，房间翻转成倒悬的镜厅。",
+                    "visible_entity_ids": ["rift_text"],
+                },
+            ],
+            "conditional_events": [{
+                "id": "idea-view", "observer_scope": "active_character",
+                "when": {"type": "always"},
+                "check": {"type": "skill", "skill": "灵感",
+                          "difficulty": "regular"},
+                "outcomes": {
+                    "success": {"activate_perception_layers": ["rolled-vision"]},
+                    "failure": {},
+                },
+            }],
+        }
+        self.scene_index = build_scene_index(self.world)
+        self.entity_index = build_entity_index(self.world)
+        self.session = create_session("scene-projection", self.world["name"])
+        initialize_session_from_world(self.session, self.world)
+        self.session["observer_player_states"] = {
+            "low": {"attributes": {"智力": 50}, "skills": {"智力": 50}},
+            "high": {"attributes": {"智力": 80}, "skills": {"智力": 80}},
+        }
+
+    def _select_observer(self, observer_id):
+        self.session["player_state"]["active_character_id"] = observer_id
+
+    def test_different_inspiration_values_select_different_whole_scenes(self):
+        self._select_observer("low")
+        low = scene_projection(self.session, self.world)
+        low_objects = list_interactable_objects(
+            self.session, self.world, self.scene_index, self.entity_index)
+
+        self._select_observer("high")
+        high = scene_projection(self.session, self.world)
+        high_objects = list_interactable_objects(
+            self.session, self.world, self.scene_index, self.entity_index)
+
+        self.assertEqual("储藏室", low["name"])
+        self.assertIn("普通储藏室", low["description"])
+        self.assertEqual(["书桌"], [row["label"] for row in low_objects])
+        self.assertEqual("无尽档案室", high["name"])
+        self.assertIn("无尽长廊", high["description"])
+        self.assertEqual(["裂隙手稿"], [row["label"] for row in high_objects])
+        self.assertNotEqual(low["physical_scene_id"], "")
+        self.assertEqual(low["physical_scene_id"], high["physical_scene_id"])
+
+    def test_scene_prompt_contains_only_the_active_projected_roster(self):
+        self._select_observer("low")
+        low = build_scene_layer(
+            "room", self.world, self.scene_index, self.entity_index, self.session)
+        self._select_observer("high")
+        high = build_scene_layer(
+            "room", self.world, self.scene_index, self.entity_index, self.session)
+
+        self.assertIn("普通储藏室", low)
+        self.assertIn("书桌", low)
+        self.assertNotIn("裂隙手稿", low)
+        self.assertIn("无尽档案室", high)
+        self.assertIn("裂隙手稿", high)
+        self.assertNotIn("[object] 书桌", high)
+
+    def test_full_context_does_not_prime_narrator_with_inactive_scene(self):
+        self._select_observer("low")
+        state = {
+            "world": self.world, "session": self.session,
+            "entity_index": self.entity_index, "scene_index": self.scene_index,
+            "api_key": "", "player_input": "我环顾四周",
+            "scene_entities": ["desk"],
+        }
+        with patch("rag.hybrid_search", return_value=[]):
+            result = assemble_context(state)
+
+        prompt = result["context_prompt"]
+        self.assertIn("低灵感者只看见狭窄、积灰的普通储藏室", prompt)
+        self.assertNotIn("高灵感者看见墙壁退入黑暗", prompt)
+        self.assertNotIn("裂隙手稿", prompt)
+
+    def test_perception_only_object_can_be_inspected_but_not_taken(self):
+        self._select_observer("high")
+        inspect = plan_action(
+            "我检查裂隙手稿", self.session, self.world,
+            self.scene_index, self.entity_index)
+        inspect_result = validate_action(inspect, self.session, self.world)
+        take = plan_action(
+            "我拿起裂隙手稿", self.session, self.world,
+            self.scene_index, self.entity_index)
+        take_result = validate_action(take, self.session, self.world)
+
+        self.assertEqual("accepted", inspect_result["status"])
+        self.assertTrue(inspect_result["perception_only"])
+        self.assertEqual([], inspect_result["events"])
+        self.assertEqual("blocked", take_result["status"])
+        self.assertIn("感知到的表象", take_result["message"])
+
+    def test_perception_only_object_rejects_direct_world_mutation_atomically(self):
+        before = dict(self.session)
+
+        with self.assertRaisesRegex(ValueError, "perception-only"):
+            commit_world_events(
+                self.session, self.world,
+                [{"type": "entity_moved", "entity_id": "rift_text",
+                  "location": {"kind": "scene", "id": "room"}}],
+                actor="conditional_event", source="test",
+            )
+
+        self.assertEqual(before, self.session)
+
+    def test_projected_real_clue_is_private_without_global_discovery(self):
+        self.world["entities"]["sigil"] = {
+            "id": "sigil", "name": "墙内刻印", "type": "clue",
+            "scene": "room", "initial_state": "hidden", "portable": False,
+        }
+        self.world["perception_layers"][1]["visible_entity_ids"].append("sigil")
+        scene_index = build_scene_index(self.world)
+        entity_index = build_entity_index(self.world)
+
+        self._select_observer("low")
+        low_ids = {row["id"] for row in list_interactable_objects(
+            self.session, self.world, scene_index, entity_index)}
+        self._select_observer("high")
+        high_ids = {row["id"] for row in list_interactable_objects(
+            self.session, self.world, scene_index, entity_index)}
+
+        self.assertNotIn("sigil", low_ids)
+        self.assertIn("sigil", high_ids)
+        self.assertNotIn("sigil", self.session["discovered_clues"])
+
+    def test_roll_outcome_replaces_only_that_observers_scene(self):
+        self._select_observer("low")
+        activation = activate_conditional_events(self.session, self.world)
+        self.assertEqual(50, activation["pending_check"]["effective"])
+        from engine import _resolve_clue_skill
+        resolve_primary_outcome(
+            self.session, self.world, activation["pending_check"],
+            True, "success", _resolve_clue_skill)
+        low = scene_projection(self.session, self.world)
+
+        self._select_observer("high")
+        high = scene_projection(self.session, self.world)
+        high_activation = activate_conditional_events(self.session, self.world)
+
+        self.assertIn("倒悬的镜厅", low["description"])
+        self.assertIn("无尽长廊", high["description"])
+        self.assertNotIn("rolled-vision", high["active_layer_ids"])
+        self.assertEqual(80, high_activation["pending_check"]["effective"])
+
+    def test_narrative_guard_rejects_another_scene_projection(self):
+        self._select_observer("low")
+        contract = build_narrative_contract({
+            "session": self.session, "world": self.world,
+            "scene_entities": ["desk"], "_action_events": [],
+        })
+        violations = deterministic_violations(
+            "高灵感者看见墙壁退入黑暗，书页悬浮成无尽长廊。", contract)
+
+        self.assertTrue(any(row["kind"] == "hidden_information_leak"
+                            for row in violations))
 
 
 class ProvenanceTests(unittest.TestCase):

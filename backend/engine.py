@@ -45,7 +45,8 @@ from action_system import (
     validate_action,
 )
 from world_state import (
-    append_world_event, commit_world_events, ensure_fact_state, list_interactable_objects,
+    append_world_event, commit_world_events, ensure_fact_state, entity_is_visible,
+    list_interactable_objects,
     reconcile_object_target, scene_entity_ids, sync_legacy_transition,
 )
 from scene_system import (
@@ -61,6 +62,14 @@ from narrative_guard import (
     build_audit_prompt, build_narrative_contract, build_repair_prompt,
     deterministic_violations, grounded_fallback, parse_audit_response,
     render_contract_block,
+)
+from conditional_events import (
+    augment_world_conditional_events,
+    arm_conditional_events,
+    render_observer_knowledge,
+)
+from perception import (
+    projected_entity, render_scene_projection, scene_projection,
 )
 
 
@@ -495,6 +504,7 @@ def load_world(model: str) -> dict:
     if path.exists():
         with open(path, "r", encoding="utf-8-sig") as f:
             _world_cache[model] = json.load(f)
+        augment_world_conditional_events(_world_cache[model])
     else:
         _world_cache[model] = {}
     return _world_cache[model]
@@ -624,6 +634,7 @@ class GMState(TypedDict, total=False):
     _available_npc_count: int         # selects the correct deterministic denial
     _trust_signal: int                # stripped narration marker for post-turn update
     _clock_events: list[dict]         # action-clock changes and crossed milestones
+    _conditional_narration: list[str] # source-backed immediate observations
     _npc_target_became_unavailable: bool
     action_proposal: dict              # AI/deterministic semantic interpretation
     action_resolution: dict            # validator decision and proposed events
@@ -1549,14 +1560,16 @@ def _build_object_location_ledger(state: "GMState", current_scene_id: str) -> st
         if not isinstance(entity, dict) or entity.get("type") == "npc":
             continue
         fact = facts.get(eid, {})
-        if not fact.get("known", False) and not fact.get("visible", False):
+        if (not fact.get("known", False)
+                and not entity_is_visible(eid, world, session)):
             continue
-        name = str(entity.get("name", eid))
+        perceived_entity = projected_entity(eid, session, world) or entity
+        name = str(perceived_entity.get("name", eid))
         label = f"{name} [id={eid}]"
         location = fact.get("location", {})
         kind, location_id = location.get("kind"), str(location.get("id", ""))
         if fact.get("exists", True) and kind == "scene" and location_id == current_scene_id:
-            if fact.get("visible", False):
+            if entity_is_visible(eid, world, session):
                 here.append(label)
         elif fact.get("exists", True) and kind == "inventory":
             carried.append(label)
@@ -1564,7 +1577,9 @@ def _build_object_location_ledger(state: "GMState", current_scene_id: str) -> st
             owner = world.get("entities", {}).get(location_id, {})
             owner_name = str(owner.get("name", location_id))
             owned.append(f"{label}: held by {owner_name} [id={location_id}]")
-        elif str(entity.get("home_scene", entity.get("scene", ""))) == current_scene_id:
+        elif (entity_is_visible(eid, world, session)
+              and str(entity.get("home_scene", entity.get("scene", "")))
+              == current_scene_id):
             displaced.append(f"{label}: now {kind}:{location_id or '-'}")
 
     lines = [
@@ -1877,9 +1892,13 @@ def _scene_entities_with_companions(scene_id: str, scene_index: dict,
     static all_scenes can't enumerate every intermediate scene they pass through,
     so companions (recorded on scene transition) are always considered present.
     This is what lets cross-scene references to a companion resolve anywhere."""
-    here = list(scene_entity_ids(session, world, scene_index, scene_id))
+    here = [
+        eid for eid in scene_entity_ids(session, world, scene_index, scene_id)
+        if entity_is_visible(eid, world, session)
+    ]
     for eid in session.get("companions", []):
-        if eid not in here and entity_index.get(eid, {}).get("type") == "npc":
+        if (eid not in here and entity_index.get(eid, {}).get("type") == "npc"
+                and entity_is_visible(eid, world, session)):
             here.append(eid)
     return here
 
@@ -2035,6 +2054,11 @@ def _prepend_clock_milestones(state: GMState, response: str) -> str:
         for milestone in event.get("milestones", [])
         if milestone.get("narration")
     ]
+    passages.extend(
+        str(line).strip()
+        for line in state.get("_conditional_narration", [])
+        if str(line).strip()
+    )
     if not passages:
         return response
     prefix = "\n\n".join(passages)
@@ -2325,6 +2349,7 @@ _SEARCH_KWS = frozenset({
 
 # English → Chinese skill name mapping for world-book clue checks
 _EN_SKILL_MAP = {
+    "灵感": "智力", "Idea": "智力", "Inspiration": "智力",
     "INT": "智力", "POW": "意志", "APP": "外貌", "CON": "体质",
     "STR": "力量", "DEX": "敏捷", "SIZ": "体型", "EDU": "教育",
     "Persuade": "说服", "Spot Hidden": "侦查", "Psychology": "心理学",
@@ -2436,6 +2461,11 @@ def _try_arm_scene_clue(state: "GMState", inp: str) -> None:
         state["_pending_roll"] = True
         print(f"[ENGINE] Scene clue armed: {cid} → {display} DC{dc}", flush=True)
         break
+
+
+def activate_conditional_events(session: dict, world: dict) -> dict:
+    """Arm the next source-authored conditional check, if one is now due."""
+    return arm_conditional_events(session, world, _resolve_clue_skill)
 
 
 # ── Node: Judge ────────────────────────────────────────────────
@@ -2743,6 +2773,10 @@ def advance_validated_action_clocks(state: GMState) -> GMState:
         return state
     state["_clock_events"] = _advance_action_clocks(
         state.get("player_input", ""), state["session"], state["world"])
+    activation = activate_conditional_events(state["session"], state["world"])
+    state["_conditional_narration"] = activation.get("narration", [])
+    if activation.get("pending_check"):
+        state["_pending_roll"] = True
     return state
 
 
@@ -2943,12 +2977,9 @@ def assemble_context(state: GMState) -> GMState:
         parts.append(storyline_block)
 
     # L1: SCENE (current scene — what the player can interact with NOW)
-    current_scene_data = world.get("scenes", {}).get(current_scene_id, {})
-    full_scene_desc = current_scene_data.get("desc", "") or current_scene_data.get("description", "")
-    scene_source = (
-        current_scene_data.get("source_text", "")
-        or current_scene_data.get("source_quote", "")
-    )
+    projection = scene_projection(session, world, current_scene_id)
+    full_scene_desc = projection["description"]
+    scene_source = projection["source_text"]
     parts.append("")
     parts.append(scene_layer)
     if full_scene_desc and full_scene_desc not in scene_layer:
@@ -2968,16 +2999,24 @@ def assemble_context(state: GMState) -> GMState:
             "until their reveal conditions are satisfied.\n"
             + source_excerpt
         )
+    projection_block = render_scene_projection(session, world)
+    if projection_block:
+        parts.append("")
+        parts.append(projection_block)
     parts.append("")
     parts.append(_build_object_location_ledger(state, current_scene_id))
     parts.append("")
     parts.append(state_snapshot)
+    knowledge_block = render_observer_knowledge(session)
+    if knowledge_block:
+        parts.append("")
+        parts.append(knowledge_block)
 
     proposal = state.get("action_proposal", {})
     resolution = state.get("action_resolution", {})
     target_id = str(proposal.get("target_id", ""))
     if target_id and resolution.get("status") == "accepted":
-        target = world.get("entities", {}).get(target_id, {})
+        target = projected_entity(target_id, session, world)
         action_lines = [
             "=== VALIDATED PLAYER ACTION (AUTHORITATIVE) ===",
             f"Intent: {proposal.get('intent', 'none')}",
@@ -3567,6 +3606,7 @@ def run_gm_turn(
         "_available_npc_count": 0,
         "_trust_signal": 0,
         "_clock_events": [],
+        "_conditional_narration": [],
         "_npc_target_became_unavailable": False,
         "action_proposal": {},
         "action_resolution": {},
@@ -3612,11 +3652,12 @@ def run_gm_turn(
             first_scene_id = real
             session["player_state"]["current_scene"] = first_scene_id
         first_scene = world.get("scenes", {}).get(first_scene_id, {})
-        scene_name = first_scene.get("name", first_scene_id)
-        scene_desc = first_scene.get("desc", "") or first_scene.get("description", "")
-
-        opening_text = world.get("opening", "")
         session["current_turn"] = 1
+        activation = activate_conditional_events(session, world)
+        opening_projection = scene_projection(session, world, first_scene_id)
+        scene_name = opening_projection["name"]
+        scene_desc = opening_projection["description"]
+        opening_text = world.get("opening", "")
 
         # Initialise plot_phase to the first phase of this module.
         _phases = _flatten_plot_phases(world.get("plot_outline"))
@@ -3638,6 +3679,8 @@ def run_gm_turn(
 
         opening_ctx = f"## Module: {world.get('name', 'Unknown')}\n"
         opening_ctx += f"=== 开场场景: {scene_name} ===\n{scene_desc}\n"
+        if opening_projection["active_layer_ids"]:
+            opening_ctx += "\n" + render_scene_projection(session, world) + "\n"
         if atmosphere:
             opening_ctx += f"氛围: {atmosphere}\n"
 
@@ -3709,6 +3752,12 @@ def run_gm_turn(
             "_grounded_fallback": scene_desc or scene_name,
         })
         opening = _audit_and_repair_narration(opening_state, opening)
+        if activation.get("narration"):
+            opening += "\n\n" + "\n".join(activation["narration"])
+        if (pending := activation.get("pending_check")):
+            label = (f"〈{pending['skill']}〉" if pending.get("skill")
+                     else "理智（SAN）")
+            opening += f"\n\n当前情境触发了{label}检定，请先掷骰。"
         _write_eval_trace(
             chat_id,
             1,
@@ -3771,8 +3820,10 @@ def run_gm_turn(
         old_scene = session["player_state"].get("current_scene", "")
         commit_scene_transition(session, world, movement_target)
         new_scene = world["scenes"][movement_target]
-        scene_name = new_scene.get("name", movement_target)
-        scene_desc = new_scene.get("desc", "") or new_scene.get("description", "")
+        activation = activate_conditional_events(session, world)
+        arrival_projection = scene_projection(session, world, movement_target)
+        scene_name = arrival_projection["name"]
+        scene_desc = arrival_projection["description"]
 
         # Companions: an NPC only travels WITH the player if the transition
         # narration shows them coming along (climbing party: "一行人/也朝门口走去/
@@ -3833,6 +3884,15 @@ def run_gm_turn(
         kp_narration = _redact_unrevealed_entities(kp_narration, session, world)
         kp_narration = _redact_unrevealed_names(
             kp_narration, session, entity_index, world)
+        if (arrival_projection["active_layer_ids"] and scene_desc
+                and scene_desc not in kp_narration):
+            kp_narration += "\n\n" + scene_desc
+        if activation.get("narration"):
+            kp_narration += "\n\n" + "\n".join(activation["narration"])
+        if (pending := activation.get("pending_check")):
+            label = (f"〈{pending['skill']}〉" if pending.get("skill")
+                     else "理智（SAN）")
+            kp_narration += f"\n\n进入此处后触发了{label}检定，请先掷骰。"
 
         write_turn_log(
             session=session,

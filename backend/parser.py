@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from openai import OpenAI
+from conditional_events import extract_clock_conditional_events
 
 from config import (
     DEEPSEEK_BASE_URL,
@@ -178,6 +179,14 @@ DETAIL REQUIREMENTS:
   switches and other objects a player could reasonably inspect.
 - Represent branches separately. State exact preconditions, player choices/checks,
   success/failure effects, successor node ids, and irreversible state changes.
+- Reconstruct conditional perception as executable causal chains. Preserve who can
+  perceive it, the exact trigger, skill and difficulty, separate success/failure
+  observations, and ordered follow-up checks such as SAN. Do not flatten a gated
+  observation into unconditional scene prose.
+- When a condition changes the whole perceived scene, reconstruct separate perception
+  layers. Keep one physical scene id, but give each layer its exact description,
+  visible/hidden entity ids and observer condition. Mark purely illusory entities
+  `perception_only`; never turn a hallucination into a portable physical item.
 - Track typed narrative state: event time/order; object and NPC location; character
   knowledge gains; relationship changes; promises/setups and their payoffs.
 - NPC occurrences must use canonical registry ids. Generic physical objects are local
@@ -203,6 +212,7 @@ Return ONLY JSON:
     "source_ref":0,"source_quote":""}],
   "objects":[{"id":"local base id","name":"","type":"item/object/door/container/document",
     "scene":"","scope_id":"","desc":"","portable":false,"unique_identity":false,
+    "perception_only":false,"initial_state":"default/hidden",
     "continuity_id":"canonical id only for a proven unique object",
     "interactions":{"inspect":"observable source-backed detail"},"source_ref":0,"source_quote":""}],
   "clues":[{"id":"","name":"","scene":"","desc":"","check":"","reveals":"",
@@ -217,7 +227,26 @@ Return ONLY JSON:
   "promises_payoffs":[{"setup":"","payoff":"","relation":"setup or payoff",
     "linked_node_id":"","source_ref":0,"source_quote":""}],
   "branch_edges":[{"from":"node id","to":"node id","condition":"","choice":"","check":"",
-    "effects":[],"source_ref":0,"source_quote":""}]
+    "effects":[],"source_ref":0,"source_quote":""}],
+  "conditional_events":[{"id":"","observer_scope":"active_character",
+    "when":{"type":"clock_at_least/flag_present/scene_is/entity_state_is/player_stat",
+      "clock_id":"","value":0,"flag":"","scene_id":"","entity_id":"","state":""},
+    "check":{"type":"skill","skill":"灵感","difficulty":"regular/hard/extreme"},
+    "outcomes":{"success":{"observations":[{"id":"","text":""}],
+      "activate_perception_layers":["perception layer id"],
+      "followup_checks":[{"type":"skill/san","skill":"意志","difficulty":"hard",
+        "loss":"1/1d3","on_success":{"observations":[]},
+        "on_failure":{"observations":[]}}]},
+      "failure":{"observations":[]}},"source_ref":0,"source_quote":""}],
+  "perception_layers":[{"id":"","scene_id":"","priority":0,
+    "activation":"condition/conditional_outcome",
+    "when":{"type":"player_stat/knowledge_fact_present/conditional_outcome_is/always",
+      "name":"智力","operator":"gte","value":70,"fact_id":"","event_id":"","outcome":""},
+    "name":"optional perceived scene name","description_mode":"replace/append",
+    "description":"the complete observer-visible scene description",
+    "visible_entity_ids":[],"hidden_entity_ids":[],
+    "entity_overrides":{"entity id":{"name":"perceived label","description":"perceived form"}},
+    "source_ref":0,"source_quote":""}]
 }"""
 
 
@@ -1620,6 +1649,9 @@ class ModuleParser:
             world_book["entity_registry"] = rebuilt.get("entity_registry", [])
             world_book["story_tree"] = rebuilt.get("story_tree", {})
             world_book["detailed_story_nodes"] = rebuilt.get("detailed_story_nodes", [])
+            world_book["conditional_events"] = rebuilt.get("conditional_events", [])
+            world_book["perception_layers"] = rebuilt.get("perception_layers", [])
+            _bind_perception_entity_instances(world_book)
             world_book["reconstruction_quality"] = rebuilt.get(
                 "reconstruction_quality", {})
 
@@ -1677,6 +1709,17 @@ class ModuleParser:
         action_clocks = _extract_action_clocks(text)
         if action_clocks:
             world_book["action_clocks"] = action_clocks
+            recovered_conditionals = extract_clock_conditional_events(
+                text, action_clocks)
+            existing_conditionals = {
+                str(row.get("id")): row
+                for row in world_book.get("conditional_events", [])
+                if isinstance(row, dict) and row.get("id")
+            }
+            for row in recovered_conditionals:
+                existing_conditionals.setdefault(str(row["id"]), row)
+            world_book["conditional_events"] = list(
+                existing_conditionals.values())
 
         # Pass 3.6: Game mechanics — extract dice/SAN check points from the
         # ORIGINAL text and merge into entity state machines (makes checks rollable).
@@ -2074,6 +2117,8 @@ def _focused_source_excerpt(source: str, node: dict, limit: int) -> str:
 _NODE_PROVENANCE_COLLECTIONS = (
     "scenes", "npcs", "objects", "items", "clues", "events",
     "state_transitions", "knowledge_changes", "promises_payoffs", "branch_edges",
+    "conditional_events",
+    "perception_layers",
 )
 
 
@@ -2130,6 +2175,186 @@ def _nonnegative_int(value: object) -> int:
         return 0
 
 
+def _conditional_payload_errors(
+    payload: object, path: str, depth: int = 0,
+) -> list[str]:
+    if not isinstance(payload, dict):
+        return [f"{path} must be an object"]
+    if depth > 8:
+        return [f"{path} exceeds the supported follow-up depth"]
+    errors = []
+    for field in ("activate_perception_layers", "deactivate_perception_layers"):
+        values = payload.get(field, [])
+        if not isinstance(values, (str, list)):
+            errors.append(f"{path}.{field} must be a string or list")
+    observations = payload.get("observations", payload.get("observation", []))
+    if not isinstance(observations, list):
+        observations = [observations]
+    for index, observation in enumerate(observations):
+        if isinstance(observation, str) and observation.strip():
+            continue
+        if (isinstance(observation, dict)
+                and any(str(observation.get(key, "")).strip()
+                        for key in ("text", "fact", "description"))):
+            continue
+        errors.append(f"{path}.observations[{index}] has no perceivable text")
+    followups = payload.get("followup_checks", [])
+    if not isinstance(followups, list):
+        errors.append(f"{path}.followup_checks must be a list")
+    else:
+        for index, check in enumerate(followups):
+            errors.extend(_conditional_check_errors(
+                check, f"{path}.followup_checks[{index}]", depth + 1))
+    return errors
+
+
+def _conditional_check_errors(
+    check: object, path: str, depth: int = 0,
+) -> list[str]:
+    if not isinstance(check, dict):
+        return [f"{path} must be an object"]
+    kind = str(check.get("type", "skill")).lower()
+    errors = []
+    if kind == "skill":
+        if not str(check.get("skill") or check.get("name") or "").strip():
+            errors.append(f"{path} is missing skill")
+        difficulty = str(check.get("difficulty", "regular")).lower()
+        if difficulty not in {"regular", "normal", "hard", "extreme"}:
+            errors.append(f"{path} has unsupported difficulty {difficulty!r}")
+    elif kind == "san":
+        if not str(check.get("loss") or check.get("san_check") or "").strip():
+            errors.append(f"{path} is missing SAN loss")
+    else:
+        errors.append(f"{path} has unsupported check type {kind!r}")
+    for branch_name in ("on_success", "on_failure"):
+        if branch_name in check:
+            errors.extend(_conditional_payload_errors(
+                check[branch_name], f"{path}.{branch_name}", depth))
+    return errors
+
+
+def _conditional_event_errors(event: dict) -> list[str]:
+    event_id = str(event.get("id", ""))
+    label = f"conditional event {event_id!r}"
+    errors = []
+    if not event_id:
+        errors.append("conditional event is missing id")
+    observer_scope = str(event.get("observer_scope", "active_character"))
+    if observer_scope != "active_character":
+        errors.append(f"{label} has unsupported observer scope {observer_scope!r}")
+
+    condition = event.get("when", event.get("trigger", {}))
+    if not isinstance(condition, dict):
+        errors.append(f"{label} trigger must be an object")
+        return errors
+    condition_type = str(condition.get("type", ""))
+    required = {
+        "clock_at_least": ("clock_id", "value"),
+        "clock_reaches": ("clock_id", "value"),
+        "flag_present": ("flag",),
+        "scene_is": ("scene_id",),
+        "entity_state_is": ("entity_id", "state"),
+        "player_stat": ("name", "value"),
+        "knowledge_fact_present": ("fact_id",),
+        "conditional_outcome_is": ("event_id", "outcome"),
+        "always": (),
+        "immediate": (),
+    }
+    if condition_type not in required:
+        errors.append(f"{label} has unsupported trigger {condition_type!r}")
+    else:
+        for field in required[condition_type]:
+            if condition.get(field) in (None, ""):
+                errors.append(f"{label} trigger is missing {field}")
+
+    if event.get("check"):
+        errors.extend(_conditional_check_errors(event["check"], f"{label}.check"))
+    outcomes = event.get("outcomes")
+    if not isinstance(outcomes, dict) or not outcomes:
+        errors.append(f"{label} has no outcome branches")
+    else:
+        recognized = False
+        for outcome_name in ("success", "failure"):
+            if outcome_name in outcomes:
+                recognized = True
+                errors.extend(_conditional_payload_errors(
+                    outcomes[outcome_name], f"{label}.{outcome_name}"))
+        if not recognized:
+            errors.append(f"{label} has no success or failure branch")
+    return errors
+
+
+def _perception_layer_errors(layer: dict) -> list[str]:
+    layer_id = str(layer.get("id", ""))
+    label = f"perception layer {layer_id!r}"
+    errors = []
+    if not layer_id:
+        errors.append("perception layer is missing id")
+    if not str(layer.get("scene_id", "")).strip():
+        errors.append(f"{label} is missing scene_id")
+    activation = str(layer.get("activation", "condition")).lower()
+    if activation not in {"condition", "event", "conditional_outcome", "manual"}:
+        errors.append(f"{label} has unsupported activation {activation!r}")
+    mode = str(layer.get("description_mode", "replace")).lower()
+    if mode not in {"replace", "append"}:
+        errors.append(f"{label} has unsupported description mode {mode!r}")
+    if not str(layer.get("description") or layer.get("desc") or "").strip():
+        errors.append(f"{label} has no projected description")
+    visible = layer.get("visible_entity_ids", [])
+    hidden = layer.get("hidden_entity_ids", [])
+    if not isinstance(visible, list):
+        errors.append(f"{label}.visible_entity_ids must be a list")
+        visible = []
+    if not isinstance(hidden, list):
+        errors.append(f"{label}.hidden_entity_ids must be a list")
+        hidden = []
+    overlap = {str(value) for value in visible} & {str(value) for value in hidden}
+    if overlap:
+        errors.append(f"{label} both reveals and hides {sorted(overlap)!r}")
+    if activation == "condition":
+        condition = layer.get("when", {"type": "always"})
+        if not isinstance(condition, dict):
+            errors.append(f"{label} condition must be an object")
+        else:
+            condition_type = str(condition.get("type", ""))
+            required = {
+                "player_stat": ("name", "value"),
+                "knowledge_fact_present": ("fact_id",),
+                "conditional_outcome_is": ("event_id", "outcome"),
+                "flag_present": ("flag",),
+                "scene_is": ("scene_id",),
+                "entity_state_is": ("entity_id", "state"),
+                "always": (),
+                "immediate": (),
+            }
+            if condition_type not in required:
+                errors.append(
+                    f"{label} has unsupported condition {condition_type!r}")
+            else:
+                for field in required[condition_type]:
+                    if condition.get(field) in (None, ""):
+                        errors.append(f"{label} condition is missing {field}")
+    return errors
+
+
+def _payload_perception_refs(payload: object) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    result = set()
+    for field in ("activate_perception_layers", "deactivate_perception_layers"):
+        values = payload.get(field, [])
+        if isinstance(values, str):
+            values = [values]
+        if isinstance(values, list):
+            result.update(str(value) for value in values if str(value))
+    for followup in payload.get("followup_checks", []) or []:
+        if not isinstance(followup, dict):
+            continue
+        result.update(_payload_perception_refs(followup.get("on_success")))
+        result.update(_payload_perception_refs(followup.get("on_failure")))
+    return result
+
+
 def _score_story_node_detail(
     contract: dict,
     detail: dict,
@@ -2174,10 +2399,15 @@ def _score_story_node_detail(
         "npcs": len(detail.get("npcs", [])),
         "objects": len(detail.get("objects", detail.get("items", []))),
         "clues": len(detail.get("clues", [])),
-        "checks": sum(1 for clue in detail.get("clues", [])
-                      if isinstance(clue, dict) and clue.get("check")),
+        "checks": (
+            sum(1 for clue in detail.get("clues", [])
+                if isinstance(clue, dict) and clue.get("check"))
+            + sum(1 for event in detail.get("conditional_events", [])
+                  if isinstance(event, dict) and event.get("check"))
+        ),
         "branches": len(detail.get("branch_edges", [])),
         "state_changes": len(detail.get("state_transitions", [])),
+        "perception_layers": len(detail.get("perception_layers", [])),
     }
     facet_scores = []
     missing_facets = []
@@ -2217,6 +2447,38 @@ def _score_story_node_detail(
             expected.get("branches", 0)) else 0)
     )
 
+    conditional_rows = [
+        row for row in detail.get("conditional_events", [])
+        if isinstance(row, dict)
+    ]
+    valid_conditionals = 0
+    for row in conditional_rows:
+        errors = _conditional_event_errors(row)
+        hard_errors.extend(errors)
+        if not errors:
+            valid_conditionals += 1
+
+    perception_rows = [
+        row for row in detail.get("perception_layers", [])
+        if isinstance(row, dict)
+    ]
+    perception_ids = {
+        str(row.get("id", "")) for row in perception_rows if row.get("id")
+    }
+    valid_perception_layers = 0
+    for row in perception_rows:
+        errors = _perception_layer_errors(row)
+        hard_errors.extend(errors)
+        if not errors:
+            valid_perception_layers += 1
+    for event in conditional_rows:
+        for outcome_name, payload in (event.get("outcomes", {}) or {}).items():
+            unknown = _payload_perception_refs(payload) - perception_ids
+            if unknown:
+                hard_errors.append(
+                    f"conditional event {event.get('id')!r} {outcome_name} "
+                    f"references unknown perception layers {sorted(unknown)!r}")
+
     transitions = [
         row for row in detail.get("state_transitions", []) if isinstance(row, dict)
     ]
@@ -2242,7 +2504,11 @@ def _score_story_node_detail(
         hard_errors.append("one or more scenes escaped the node narrative scope")
 
     causal_contract = len(contract.get("preconditions", [])) + len(contract.get("outcomes", []))
-    causal_records = complete_transitions + valid_branches + len(detail.get("promises_payoffs", []))
+    causal_records = (
+        complete_transitions + valid_branches + valid_conditionals
+        + valid_perception_layers
+        + len(detail.get("promises_payoffs", []))
+    )
     causal_completeness = min(100, round(100 * causal_records / max(1, causal_contract)))
 
     dimensions = {
@@ -2765,11 +3031,47 @@ def _object_instances(items: list[dict]) -> list[dict]:
             resolved = f"{candidate}_{suffix}"
             suffix += 1
         used.add(resolved)
+        item.setdefault("base_id", base)
         item["id"] = resolved
         item["instance_id"] = resolved
         item.setdefault("home_scene", scene)
         result.append(item)
     return result
+
+
+def _bind_perception_entity_instances(world: dict) -> None:
+    """Bind layer-local object ids after same-name scene instances are normalized."""
+    entities = world.get("entities", {})
+
+    def resolve(reference: object, scene_id: str) -> str:
+        raw = str(reference or "")
+        if raw in entities:
+            return raw
+        candidates = [
+            eid for eid, entity in entities.items()
+            if isinstance(entity, dict)
+            and str(entity.get("base_id", "")) == raw
+            and (
+                str(entity.get("scene", "")) == scene_id
+                or scene_id in {str(value) for value in entity.get("all_scenes", [])}
+            )
+        ]
+        return candidates[0] if len(candidates) == 1 else raw
+
+    for layer in world.get("perception_layers", []) or []:
+        if not isinstance(layer, dict):
+            continue
+        scene_id = str(layer.get("scene_id", ""))
+        for field in ("visible_entity_ids", "hidden_entity_ids"):
+            layer[field] = [
+                resolve(value, scene_id) for value in layer.get(field, []) or []
+            ]
+        overrides = layer.get("entity_overrides", {})
+        if isinstance(overrides, dict):
+            layer["entity_overrides"] = {
+                resolve(entity_id, scene_id): value
+                for entity_id, value in overrides.items()
+            }
 
 
 def _merge_rich_record(existing: dict, incoming: dict) -> dict:
@@ -2809,6 +3111,8 @@ def _merge_story_node_details(
     objects: list[dict] = []
     clues: list[dict] = []
     events: list[dict] = []
+    conditional_events: list[dict] = []
+    perception_layers: list[dict] = []
     node_to_scenes: dict[str, list[str]] = {}
     detail_by_node: dict[str, dict] = {}
     scenarios = _normalize_story_scenarios(blueprint)
@@ -2899,6 +3203,89 @@ def _merge_story_node_details(
                 rows.append(row)
                 destination.append(row)
             detail[key] = rows
+        raw_conditionals = [
+            row for row in detail.get("conditional_events", [])
+            if isinstance(row, dict)
+        ]
+        conditional_id_map = {}
+        for index, row in enumerate(raw_conditionals):
+            raw_id = str(row.get("id") or f"conditional-{index + 1:03d}")
+            conditional_id_map[raw_id] = f"{node_id}::{raw_id}"
+        local_perception_layers = []
+        perception_id_map = {}
+        for index, raw in enumerate(detail.get("perception_layers", [])):
+            if not isinstance(raw, dict):
+                continue
+            row = copy.deepcopy(raw)
+            raw_id = str(row.get("id") or f"perception-{index + 1:03d}")
+            row["id"] = f"{node_id}::{raw_id}"
+            perception_id_map[raw_id] = row["id"]
+            row["scenario_id"] = scenario_id
+            if row.get("scene_id"):
+                row["scene_id"] = scoped_id(scenario_id, row["scene_id"])
+            when = dict(row.get("when", {})) if isinstance(row.get("when"), dict) else {}
+            if when.get("scene_id"):
+                when["scene_id"] = scoped_id(scenario_id, when["scene_id"])
+            if when.get("entity_id"):
+                when["entity_id"] = scoped_id(scenario_id, when["entity_id"])
+            if when.get("event_id"):
+                when["event_id"] = conditional_id_map.get(
+                    str(when["event_id"]), str(when["event_id"]))
+            row["when"] = when
+            for field in ("visible_entity_ids", "hidden_entity_ids"):
+                row[field] = [
+                    scoped_id(scenario_id, value)
+                    for value in row.get(field, []) or []
+                ]
+            overrides = row.get("entity_overrides", {})
+            if isinstance(overrides, dict):
+                row["entity_overrides"] = {
+                    scoped_id(scenario_id, entity_id): copy.deepcopy(value)
+                    for entity_id, value in overrides.items()
+                    if isinstance(value, dict)
+                }
+            local_perception_layers.append(row)
+            perception_layers.append(row)
+        detail["perception_layers"] = local_perception_layers
+
+        def rewrite_perception_refs(payload: object) -> None:
+            if not isinstance(payload, dict):
+                return
+            for field in (
+                    "activate_perception_layers", "deactivate_perception_layers"):
+                values = payload.get(field, [])
+                if isinstance(values, str):
+                    values = [values]
+                if isinstance(values, list):
+                    payload[field] = [
+                        perception_id_map.get(str(value), str(value))
+                        for value in values
+                    ]
+            for followup in payload.get("followup_checks", []) or []:
+                if not isinstance(followup, dict):
+                    continue
+                rewrite_perception_refs(followup.get("on_success"))
+                rewrite_perception_refs(followup.get("on_failure"))
+
+        local_conditionals = []
+        for index, raw in enumerate(raw_conditionals):
+            if not isinstance(raw, dict):
+                continue
+            row = copy.deepcopy(raw)
+            raw_id = str(row.get("id") or f"conditional-{index + 1:03d}")
+            row["id"] = conditional_id_map[raw_id]
+            row["scenario_id"] = scenario_id
+            when = dict(row.get("when", {})) if isinstance(row.get("when"), dict) else {}
+            if when.get("scene_id"):
+                when["scene_id"] = scoped_id(scenario_id, when["scene_id"])
+            if when.get("entity_id"):
+                when["entity_id"] = scoped_id(scenario_id, when["entity_id"])
+            row["when"] = when
+            for payload in (row.get("outcomes", {}) or {}).values():
+                rewrite_perception_refs(payload)
+            local_conditionals.append(row)
+            conditional_events.append(row)
+        detail["conditional_events"] = local_conditionals
 
     scene_graph: dict[str, dict] = {}
     for scene in scenes:
@@ -3006,6 +3393,8 @@ def _merge_story_node_details(
         "objects": objects,
         "clues": clues,
         "events": events,
+        "conditional_events": conditional_events,
+        "perception_layers": perception_layers,
         "scene_graph": scene_graph,
         "story_beats": story_beats,
     }

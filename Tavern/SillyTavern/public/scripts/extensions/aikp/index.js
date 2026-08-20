@@ -642,9 +642,15 @@ async function rollPendingCheck() {
             if (d.san.insanity_indef) s += ' ⚠⚠不定性疯狂';
             lines.push(s);
         }
+        if (d.next_check) {
+            const next = d.next_check.skill
+                ? `〈${d.next_check.skill}〉检定`
+                : '理智（SAN）检定';
+            lines.push(`下一步：${next}仍待玩家掷骰`);
+        }
         toastr.info(lines.join('<br>'), 'AIKP 掷骰', { timeOut: 9000, escapeHtml: false });
         if (d.narration) toastr.success(d.narration, '结果', { timeOut: 12000 });
-        $('#aikp_dice_button').removeClass('aikp-dice-active');
+        $('#aikp_dice_button').toggleClass('aikp-dice-active', Boolean(d.next_check));
         updateStatusBar();
     } catch (e) {
         toastr.error('掷骰失败: ' + e.message, 'AIKP');

@@ -122,9 +122,12 @@ def compute_state_snapshot(
     """Generate natural language state summary from session data.
     Pure code computation — no LLM, no embedding. Milliseconds.
     """
-    ps = session.get("player_state", {})
-    current_scene_id = ps.get("current_scene", "")
+    base_ps = session.get("player_state", {})
+    current_scene_id = base_ps.get("current_scene", "")
     scene = world.get("scenes", {}).get(current_scene_id, {})
+    from perception import observer_player_state, projected_entity, scene_projection
+    ps = observer_player_state(session)
+    projection = scene_projection(session, world, current_scene_id)
     entity_states = session.get("entity_states", {})
     flags = session.get("flags", [])
     dispositions = session.get("npc_dispositions", {})
@@ -136,7 +139,9 @@ def compute_state_snapshot(
 
     # Header
     lines.append(f"=== CURRENT STATE (Turn {turn}) ===")
-    lines.append(f"Scene: {scene.get('name', current_scene_id)} [visited]")
+    lines.append(
+        f"Scene: {projection.get('name', scene.get('name', current_scene_id))} "
+        f"[physical_id={current_scene_id}]")
 
     # Investigator (from imported character card, if any)
     pc_name = ps.get("name", "")
@@ -189,7 +194,7 @@ def compute_state_snapshot(
         lines.append("")
         lines.append("Player-visible entities here:")
         for eid in visible_entity_ids:
-            einfo = entity_index.get(eid, {})
+            einfo = projected_entity(eid, session, world) or entity_index.get(eid, {})
             etype = einfo.get("type", "?")
             ename = einfo.get("name", eid)
             estate = entity_states.get(eid, "unknown")
@@ -487,6 +492,10 @@ def initialize_session_from_world(
             next(iter(scoped_scenes.keys())) if scoped_scenes else "")
 
     session["player_state"]["current_scene"] = first_scene_id
+    session["player_state"].setdefault("active_character_id", "player")
+    session.setdefault("active_perception_layers", {})
+    session.setdefault("perception_events", [])
+    session.setdefault("perception_event_seq", 0)
     session["model"] = world.get("name", "")
 
     # Rule system from world book

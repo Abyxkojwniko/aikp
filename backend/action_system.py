@@ -11,7 +11,7 @@ import json
 import re
 from typing import Callable, Optional
 
-from world_state import fact_for, list_interactable_objects
+from world_state import entity_is_visible, fact_for, list_interactable_objects
 
 
 ACTION_ALIASES = {
@@ -294,10 +294,24 @@ def validate_action(proposal: dict, session: dict, world: dict) -> dict:
     kind, location_id = _location(fact)
     accessible = (kind == "inventory" or
                   (kind == "scene" and location_id == current_scene))
-    if not fact.get("exists", True) or not fact.get("visible", False) or not accessible:
+    perceived = entity_is_visible(target_id, world, session)
+    if not fact.get("exists", True) or not perceived or not accessible:
         return {
             "status": "blocked", "events": [],
             "message": "这个对象当前不在你能够接触的位置。",
+        }
+
+    if entity.get("perception_only") is True:
+        if intent not in {"inspect", "read"}:
+            return {
+                "status": "blocked", "events": [],
+                "target_id": target_id, "intent": intent,
+                "message": "这只是当前调查员感知到的表象，不能作为真实物品移动或修改。",
+            }
+        return {
+            "status": "accepted", "events": [], "target_id": target_id,
+            "intent": intent, "requires_adjudication": True,
+            "perception_only": True,
         }
 
     base = {

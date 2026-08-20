@@ -12,7 +12,11 @@ import re
 from typing import Any
 
 from reference_resolver import npc_is_interactable
-from world_state import ensure_fact_state
+from world_state import ensure_fact_state, entity_is_visible
+from conditional_events import (
+    active_observer_id, condition_satisfied, observer_knowledge,
+)
+from perception import projected_entity, scene_projection
 
 
 AUDIT_KINDS = frozenset({
@@ -67,13 +71,17 @@ def _location(fact: dict) -> dict[str, str]:
 
 def _source_evidence(state: dict, relevant_ids: set[str]) -> str:
     world = state["world"]
+    session = state["session"]
     current = state.get("current_scene", {})
+    scene_id = str(session.get("player_state", {}).get("current_scene", ""))
+    projection = scene_projection(session, world, scene_id)
     parts = [
-        str(current.get("desc", "") or current.get("description", "")),
+        str(projection.get("description", "")),
+        str(projection.get("source_text", "")),
         str(current.get("atmosphere", "")),
     ]
     for eid in sorted(relevant_ids):
-        entity = world.get("entities", {}).get(eid, {})
+        entity = projected_entity(eid, session, world, scene_id)
         if not isinstance(entity, dict):
             continue
         parts.extend(str(entity.get(key, "")) for key in (
@@ -211,6 +219,7 @@ def build_narrative_contract(state: dict) -> dict:
                 or eid in set(session.get("companions", []))
             )
         )
+        perceived_entity = projected_entity(eid, session, world, target_scene) or entity
         entity_type = str(entity.get("type", "object"))
         can_act = bool(
             entity_type == "npc" and present
@@ -218,14 +227,14 @@ def build_narrative_contract(state: dict) -> dict:
         )
         entities.append({
             "id": eid,
-            "name": str(entity.get("name", eid)),
+            "name": str(perceived_entity.get("name", eid)),
             "type": entity_type,
             "state": str(session.get("entity_states", {}).get(
                 eid, entity.get("initial_state", "default"))),
             "location": location,
             "exists": exists,
             "known": bool(fact.get("known", False)),
-            "visible": bool(fact.get("visible", False)),
+            "visible": entity_is_visible(eid, world, session),
             "present": present,
             "carried": carried,
             "condition": str(fact.get("condition", "intact")),
@@ -248,6 +257,55 @@ def build_narrative_contract(state: dict) -> dict:
             }
             break
 
+    observer_id = active_observer_id(session)
+    projection = scene_projection(session, world, target_scene, observer_id)
+    active_layer_ids = set(projection["active_layer_ids"])
+    known_observations = {
+        str(row.get("id", "")) for row in observer_knowledge(session, observer_id)
+    }
+    observation_boundaries = []
+    perception_boundaries = []
+    for layer in world.get("perception_layers", []) or []:
+        if (not isinstance(layer, dict)
+                or str(layer.get("scene_id", "")) != target_scene):
+            continue
+        text = str(
+            layer.get("description") or layer.get("desc")
+            or layer.get("source_quote") or "").strip()
+        if text:
+            perception_boundaries.append({
+                "id": str(layer.get("id", "")),
+                "text": text,
+                "available": str(layer.get("id", "")) in active_layer_ids,
+            })
+    event_states = session.get("conditional_event_states", {})
+    for event in world.get("conditional_events", []) or []:
+        if not isinstance(event, dict) or not event.get("id"):
+            continue
+        event_id = str(event["id"])
+        observer_state = event_states.get(event_id, {}).get(observer_id, {})
+        if (not observer_state
+                and not condition_satisfied(event.get("when", {}), session)):
+            continue
+        for outcome_name, outcome in (event.get("outcomes", {}) or {}).items():
+            if not isinstance(outcome, dict):
+                continue
+            observations = outcome.get("observations", outcome.get("observation", []))
+            if not isinstance(observations, list):
+                observations = [observations]
+            for index, raw in enumerate(observations):
+                row = {"text": raw} if isinstance(raw, str) else raw
+                if not isinstance(row, dict):
+                    continue
+                fact_id = str(row.get("id") or f"{event_id}:{outcome_name}:{index}")
+                text = str(row.get("text") or row.get("fact") or "").strip()
+                if text:
+                    observation_boundaries.append({
+                        "id": fact_id,
+                        "text": text,
+                        "available": fact_id in known_observations,
+                    })
+
     return {
         "turn": int(state.get(
             "_contract_turn", int(session.get("current_turn", 0)) + 1)),
@@ -263,6 +321,16 @@ def build_narrative_contract(state: dict) -> dict:
         "story_commitments": _active_story_commitments(
             session, world, target_scene),
         "current_story_node": node,
+        "active_observer_id": observer_id,
+        "observer_knowledge": observer_knowledge(session, observer_id),
+        "conditional_observation_boundaries": observation_boundaries[:80],
+        "scene_projection": {
+            key: projection[key] for key in (
+                "physical_scene_id", "observer_id", "name", "description",
+                "active_layer_ids", "entity_visibility",
+            )
+        },
+        "perception_boundaries": perception_boundaries[:40],
         "source_evidence": _source_evidence(state, relevant_ids),
     }
 
@@ -270,12 +338,24 @@ def build_narrative_contract(state: dict) -> dict:
 def render_contract_block(contract: dict) -> str:
     compact = dict(contract)
     compact.pop("source_evidence", None)
+    # The narration model receives only earned observations and the selected
+    # projection. Inactive text stays in the separate audit contract, where it
+    # can be detected without priming the narrator to repeat it.
+    compact.pop("perception_boundaries", None)
+    compact["conditional_observation_boundaries"] = [
+        row for row in compact.get("conditional_observation_boundaries", [])
+        if row.get("available")
+    ]
     return (
         "=== NARRATIVE COMMITMENTS (CANONICAL, END OF THIS TURN) ===\n"
         "Treat these as binding facts. Prose is an observation of this state, "
         "not permission to change it. Only APPLIED_EVENTS may establish a state "
         "change. A non-present or inactive NPC cannot act or speak. Pending story "
-        "commitments must remain satisfiable; do not skip their prerequisites.\n"
+        "commitments must remain satisfiable; do not skip their prerequisites. "
+        "Private perception is limited to OBSERVER_KNOWLEDGE for ACTIVE_OBSERVER_ID; "
+        "never transfer another investigator's knowledge. SCENE_PROJECTION is "
+        "the only player-visible version of the physical scene; inactive perception "
+        "layers are forbidden.\n"
         + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
     )
 
@@ -414,6 +494,31 @@ def deterministic_violations(content: str, contract: dict) -> list[dict]:
                     "reason": "An unlocked object is narrated as locked.",
                     "source": "deterministic_guard",
                 })
+    compact_content = re.sub(r"\s+", "", content).casefold()
+    for boundary in contract.get("conditional_observation_boundaries", []):
+        if boundary.get("available"):
+            continue
+        text = re.sub(r"\s+", "", str(boundary.get("text", ""))).casefold()
+        if len(text) >= 4 and text in compact_content:
+            violations.append({
+                "kind": "hidden_information_leak",
+                "entity_id": "",
+                "evidence": str(boundary.get("text", ""))[:240],
+                "reason": "A conditional observation was narrated before this observer earned it.",
+                "source": "deterministic_guard",
+            })
+    for boundary in contract.get("perception_boundaries", []):
+        if boundary.get("available"):
+            continue
+        text = re.sub(r"\s+", "", str(boundary.get("text", ""))).casefold()
+        if len(text) >= 6 and text in compact_content:
+            violations.append({
+                "kind": "hidden_information_leak",
+                "entity_id": "",
+                "evidence": str(boundary.get("text", ""))[:240],
+                "reason": "Narration used an inactive observer-specific scene projection.",
+                "source": "deterministic_guard",
+            })
     return violations
 
 
@@ -445,8 +550,13 @@ def grounded_fallback(state: dict) -> str:
         return override
     if state.get("_pending_roll"):
         check = state.get("session", {}).get("pending_check", {})
-        skill = str(check.get("skill", "") or "相应技能")
-        return f"这项行动的结果尚不确定，请先进行〈{skill}〉检定。"
+        if check.get("skill"):
+            label = f"〈{check['skill']}〉"
+        elif check.get("san_check"):
+            label = "理智（SAN）"
+        else:
+            label = "相应技能"
+        return f"这项行动的结果尚不确定，请先进行{label}检定。"
     if state.get("movement_target"):
         scene_id = str(state["movement_target"])
         name = str(world.get("scenes", {}).get(scene_id, {}).get("name", scene_id))

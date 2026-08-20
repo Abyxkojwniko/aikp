@@ -40,6 +40,7 @@ class EntityMemory(TypedDict):
 # ── Player State ───────────────────────────────────────────────
 
 class PlayerState(TypedDict, total=False):
+    active_character_id: str      # stable observer id for private perception facts
     current_scene: str
     inventory: list[str]
     skills: dict[str, int]      # {"侦查": 60, "图书馆使用": 70, ...} (attrs+skills)
@@ -112,6 +113,14 @@ class Session(TypedDict, total=False):
     visited_scene_ids: list[str]          # scenes the player has physically entered
     selected_scene_id: Optional[str]      # explicit frontend-selected reachable destination
     current_scenario_id: str              # selected independent adventure in an anthology
+    knowledge_facts: dict[str, dict[str, dict]]  # observer id -> canonical perceived facts
+    knowledge_events: list[dict]           # immutable private/public observation journal
+    knowledge_event_seq: int               # monotonic observation event sequence
+    conditional_event_states: dict[str, dict[str, dict]]  # event -> observer -> resolution
+    active_perception_layers: dict[str, dict[str, dict]]  # observer -> layer id -> activation
+    perception_events: list[dict]           # immutable scene-projection journal
+    perception_event_seq: int               # monotonic perception event sequence
+    observer_player_states: dict[str, dict]  # optional party sheets keyed by observer id
 
 
 # ── Entity State Definition (world book level) ─────────────────
@@ -258,6 +267,7 @@ def create_session(chat_id: str, model: str) -> Session:
         updated_at=now,
         current_turn=0,
         player_state=PlayerState(
+            active_character_id="player",
             current_scene="",
             inventory=[],
             skills={"Perception": 5, "Strength": 3, "Persuasion": 2},
@@ -306,4 +316,12 @@ def create_session(chat_id: str, model: str) -> Session:
         visited_scene_ids=[],
         selected_scene_id=None,
         current_scenario_id="",
+        knowledge_facts={},
+        knowledge_events=[],
+        knowledge_event_seq=0,
+        conditional_event_states={},
+        active_perception_layers={},
+        perception_events=[],
+        perception_event_seq=0,
+        observer_player_states={},
     )

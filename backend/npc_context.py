@@ -97,10 +97,12 @@ def build_scene_layer(scene_id: str, world: dict,
     scenes = world.get("scenes", {})
     scene = scenes.get(scene_id, {})
     session = session or {}
+    from perception import projected_entity, scene_projection
+    projection = scene_projection(session, world, scene_id)
 
     lines = []
-    name = scene.get("name", scene_id)
-    desc = scene.get("desc", "") or scene.get("description", "")
+    name = projection["name"]
+    desc = projection["description"]
     lines.append(f"=== {name} ===")
     lines.append(desc)
 
@@ -123,15 +125,25 @@ def build_scene_layer(scene_id: str, world: dict,
     ]
     npc_ids = [eid for eid in eids
                if entity_index.get(eid, {}).get("type") == "npc"]
+    projected_index = dict(entity_index)
+    projected_entities = dict(world.get("entities", {}))
+    for eid in eids:
+        projected = projected_entity(eid, session, world)
+        if projected:
+            projected_index[eid] = projected
+            projected_entities[eid] = projected
+    projected_world = dict(world)
+    projected_world["entities"] = projected_entities
     if npc_ids:
-        npc_lines = _npc_summary_lines(npc_ids, entity_index)
+        npc_lines = _npc_summary_lines(npc_ids, projected_index)
         lines.extend(npc_lines)
 
     # Present items/entities (name only, 1 line each)
     other_ids = [eid for eid in eids
                  if entity_index.get(eid, {}).get("type") != "npc"]
     if other_ids:
-        item_lines = _entity_summary_lines(other_ids, entity_index, world)
+        item_lines = _entity_summary_lines(
+            other_ids, projected_index, projected_world)
         lines.extend(item_lines)
 
     return "\n".join(lines)
