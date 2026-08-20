@@ -695,7 +695,7 @@ class HierarchicalReconstructionQualityTests(unittest.TestCase):
 
 
 class ObjectLocationNarrationTests(unittest.TestCase):
-    def test_static_scene_source_cannot_restore_carried_object(self):
+    def _run_carried_object_turn(self, narration):
         world = {
             "name": "Location Ledger", "rule_system": "coc",
             "starting_scene": "study", "opening": "桌上放着铜币。",
@@ -720,15 +720,35 @@ class ObjectLocationNarrationTests(unittest.TestCase):
                 patch("engine.save_session"), \
                 patch("rag.hybrid_search", return_value=[]), \
                 patch("engine.get_or_compress_conversation_summary", return_value=""), \
-                narration_provider(lambda _request: "你看到桌上仍放着铜币。"):
+                narration_provider(lambda _request: narration):
             response = run_gm_turn(
                 [{"role": "user", "content": "我看看桌面"}],
                 model=world["name"], chat_id=session["chat_id"],
                 api_key="manual-provider-no-api-key",
             )
+        return response, session
+
+    def test_static_scene_source_cannot_restore_carried_object(self):
+        response, session = self._run_carried_object_turn(
+            "你看到桌上仍放着铜币。")
 
         self.assertIn("没有在当前场景看到", response)
         self.assertNotIn("桌上仍放着", response)
+        self.assertIn("coin", session["inventory_entity_ids"])
+
+    def test_english_scene_claim_cannot_restore_carried_object(self):
+        response, session = self._run_carried_object_turn(
+            "The 铜币 lies on the table beside you.")
+
+        self.assertIn("没有在当前场景看到", response)
+        self.assertNotIn("lies on the table", response)
+        self.assertIn("coin", session["inventory_entity_ids"])
+
+    def test_explicit_carried_object_claim_remains_allowed(self):
+        response, session = self._run_carried_object_turn(
+            "The 铜币 remains secure in your backpack.")
+
+        self.assertIn("backpack", response)
         self.assertIn("coin", session["inventory_entity_ids"])
 
 

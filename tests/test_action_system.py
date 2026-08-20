@@ -1,7 +1,8 @@
 import sys
 import unittest
+from copy import deepcopy
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -13,7 +14,9 @@ from action_system import (
     detect_action, legacy_action_requirements, looks_like_abstract_action,
     parse_ai_proposal, plan_action, validate_action,
 )
-from engine import _has_player_move_intent, narration_provider, run_gm_turn
+from engine import (
+    _has_player_move_intent, narration_provider, resolve_entity, run_gm_turn,
+)
 from models import create_session
 from parser import (
     _apply_numbered_scene_edges, _apply_scene_coverage_repair,
@@ -23,10 +26,10 @@ from scene_system import (
     commit_scene_transition, list_available_scenes, select_scene_target,
 )
 from scene_index import build_entity_index, build_scene_index
-from server import app
+from server import app, roll_check
 from state_manager import initialize_session_from_world
 from world_state import (
-    append_world_event, fact_for,
+    append_world_event, canonical_state_hash, commit_world_events, fact_for,
     list_interactable_objects,
     select_object_target,
 )
@@ -175,6 +178,124 @@ class FactEventTests(unittest.TestCase):
         coin = next(item for item in self.roster() if item["id"] == "coin")
         self.assertEqual({"kind": "scene", "id": "hall"}, coin["location"])
         self.assertNotIn("coin", self.session["inventory_entity_ids"])
+
+    def test_multi_event_transaction_is_atomic_and_hash_linked(self):
+        before = canonical_state_hash(self.session)
+        committed = commit_world_events(self.session, self.world, [
+            {"type": "item_picked_up", "entity_id": "coin"},
+            {"type": "object_unlocked", "entity_id": "door"},
+        ], actor="player", source="test")
+
+        self.assertEqual(2, len(committed))
+        self.assertEqual(committed[0]["commit_id"], committed[1]["commit_id"])
+        journal = self.session["world_commits"][-1]
+        self.assertEqual(before, journal["before_hash"])
+        self.assertEqual(self.session["world_state_hash"], journal["after_hash"])
+        self.assertNotEqual(journal["before_hash"], journal["after_hash"])
+
+    def test_invalid_late_delta_rolls_back_whole_transaction(self):
+        before = canonical_state_hash(self.session)
+        with self.assertRaises(ValueError):
+            commit_world_events(self.session, self.world, [
+                {"type": "item_picked_up", "entity_id": "coin"},
+                {"type": "entity_moved", "entity_id": "keeper",
+                 "location": {"kind": "scene", "id": "invented"}},
+            ])
+
+        self.assertEqual(before, canonical_state_hash(self.session))
+        self.assertEqual([], self.session["world_events"])
+        self.assertNotIn("coin", self.session["inventory_entity_ids"])
+
+    def test_pickup_rejects_npc_and_nonportable_object_atomically(self):
+        for entity_id in ("keeper", "door"):
+            with self.subTest(entity_id=entity_id):
+                before = deepcopy(self.session)
+                with self.assertRaises(ValueError):
+                    append_world_event(self.session, self.world, {
+                        "type": "item_picked_up", "entity_id": entity_id,
+                    })
+                self.assertEqual(before, self.session)
+
+    def test_authored_state_edge_can_make_object_conditionally_portable(self):
+        self.world["entities"]["coin"].update({
+            "portable": False,
+            "initial_state": "deactivated",
+            "states": {"deactivated": {
+                "triggers": ["pick up"],
+                "on_trigger": {"to_state": "obtained"},
+            }},
+        })
+        session = create_session("conditional-portable", self.world["name"])
+        initialize_session_from_world(session, self.world)
+        state_def = self.world["entities"]["coin"]["states"]["deactivated"]
+        state = {
+            "session": session, "world": self.world,
+            "matched_entity": {
+                "id": "coin", "current_state": "deactivated",
+                "state_def": state_def,
+            },
+            "player_input": "pick up", "turn_summary": {},
+            "_action_events": [], "dice_result": None,
+            "_pending_roll": False,
+        }
+
+        resolve_entity(state)
+
+        self.assertEqual("obtained", session["entity_states"]["coin"])
+        self.assertEqual(
+            {"kind": "inventory", "id": "player"},
+            session["entity_facts"]["coin"]["location"],
+        )
+        self.assertEqual(
+            "deactivated", session["world_events"][-1]["from_state"])
+
+    def test_transfer_rejects_inactive_recipient_and_keeps_inventory(self):
+        append_world_event(self.session, self.world, {
+            "type": "item_picked_up", "entity_id": "coin",
+        })
+        self.session["entity_states"]["keeper"] = "dead"
+        before = deepcopy(self.session)
+
+        with self.assertRaises(ValueError):
+            append_world_event(self.session, self.world, {
+                "type": "item_transferred", "entity_id": "coin",
+                "owner_id": "keeper",
+            })
+
+        self.assertEqual(before, self.session)
+        self.assertIn("coin", self.session["inventory_entity_ids"])
+
+    def test_departed_npc_leaves_scene_and_can_return_explicitly(self):
+        self.session["entity_states"]["keeper"] = "departed"
+        departed = fact_for(self.session, self.world, "keeper")
+
+        self.assertEqual("offstage", departed["location"]["kind"])
+        self.assertTrue(departed["exists"])
+        self.assertFalse(departed["visible"])
+
+        self.session["entity_states"]["keeper"] = "present"
+        returned = fact_for(self.session, self.world, "keeper")
+        self.assertEqual(
+            {"kind": "scene", "id": "study"}, returned["location"])
+        self.assertTrue(returned["visible"])
+        self.assertEqual("intact", returned["condition"])
+
+    def test_dead_npc_body_can_be_explicitly_restored(self):
+        sync_state = self.session["entity_states"]
+        sync_state["keeper"] = "dead"
+        dead = fact_for(self.session, self.world, "keeper")
+        self.assertEqual("dead", dead["condition"])
+
+        from world_state import sync_legacy_transition
+        sync_legacy_transition(
+            self.session, self.world, "keeper", "dead", "present")
+        restored = fact_for(self.session, self.world, "keeper")
+
+        self.assertEqual("present", self.session["entity_states"]["keeper"])
+        self.assertEqual("intact", restored["condition"])
+        self.assertTrue(restored["visible"])
+        self.assertEqual(
+            {"kind": "scene", "id": "study"}, restored["location"])
 
     def test_give_transfers_inventory_to_selected_present_npc(self):
         append_world_event(self.session, self.world, {
@@ -469,14 +590,24 @@ class SceneSystemTests(unittest.TestCase):
             fact_for(self.session, self.world, "guide")["location"],
         )
         self.assertEqual(
-            ["entity_moved"],
+            ["scene_entered", "entity_moved"],
             [event["type"] for event in self.session["world_events"]],
+        )
+        self.assertEqual(
+            self.session["world_events"][-2]["commit_id"],
+            self.session["world_events"][-1]["commit_id"],
+        )
+        self.assertIn("hall", self.session["visited_scene_ids"])
+        self.assertIn("hall", self.session["discovered_scene_ids"])
+        self.assertEqual(
+            canonical_state_hash(self.session),
+            self.session["world_commits"][-1]["after_hash"],
         )
 
         commit_scene_transition(self.session, self.world, "study")
         commit_scene_transition(self.session, self.world, "hall")
 
-        self.assertEqual(1, len(self.session["world_events"]))
+        self.assertEqual(4, len(self.session["world_events"]))
 
     def test_scene_target_api_rejects_non_adjacent_scene(self):
         context = (self.session, self.world, self.scene_index, self.entity_index)
@@ -537,6 +668,83 @@ class SceneSystemTests(unittest.TestCase):
 
         self.assertEqual("hall", self.session["player_state"]["current_scene"])
         self.assertIn("confrontation", response)
+
+    def test_offline_narrator_disables_every_auxiliary_model_call(self):
+        select_scene_target(self.session, "hall", self.world)
+        self.session["current_turn"] = 8
+        self.session["turn_log"] = [
+            {
+                "turn": turn,
+                "scene": "study",
+                "player_input": f"action {turn}",
+                "gm_response": f"result {turn}",
+            }
+            for turn in range(1, 9)
+        ]
+        with patch("engine.load_world", return_value=self.world), \
+                patch("engine.get_indices", return_value=(
+                    self.scene_index, self.entity_index)), \
+                patch("engine.get_session", return_value=self.session), \
+                patch("engine.save_session"), \
+                patch("rag.hybrid_search", return_value=[]), \
+                patch("engine.OpenAI", side_effect=AssertionError(
+                    "offline playtest attempted an external model call")), \
+                narration_provider(lambda _request: (
+                    "The hall lies beyond the door.")):
+            response = run_gm_turn(
+                [{"role": "user", "content": "go there"}],
+                model=self.world["name"], chat_id=self.session["chat_id"],
+                api_key="manual-provider-no-api-key",
+            )
+
+        self.assertEqual("hall", self.session["player_state"]["current_scene"])
+        self.assertIn("hall", response)
+
+    def test_narration_keywords_cannot_mutate_san(self):
+        san_before = self.session["player_state"]["san"]
+        with patch("engine.load_world", return_value=self.world), \
+                patch("engine.get_indices", return_value=(
+                    self.scene_index, self.entity_index)), \
+                patch("engine.get_session", return_value=self.session), \
+                patch("engine.save_session"), \
+                patch("rag.hybrid_search", return_value=[]), \
+                narration_provider(lambda _request: (
+                    "An old account mentions Cthulhu, but nothing changes.")):
+            run_gm_turn(
+                [{"role": "user", "content": "I read the old account."}],
+                model=self.world["name"], chat_id=self.session["chat_id"],
+                api_key="manual-provider-no-api-key",
+            )
+
+        self.assertEqual(san_before, self.session["player_state"]["san"])
+        self.assertIsNone(self.session.get("_pending_san_result"))
+
+    def test_narrator_trust_marker_has_no_state_authority(self):
+        self.session["selected_npc_id"] = "keeper"
+        npc_dynamic = next(iter(self.session["npc_states"].values()))["dynamic"]
+
+        def run(player_input):
+            with patch("engine.load_world", return_value=self.world), \
+                    patch("engine.get_indices", return_value=(
+                        self.scene_index, self.entity_index)), \
+                    patch("engine.get_session", return_value=self.session), \
+                    patch("engine.save_session"), \
+                    patch("rag.hybrid_search", return_value=[]), \
+                    narration_provider(lambda _request: (
+                        "The keeper watches you. 〔信任+999〕")):
+                return run_gm_turn(
+                    [{"role": "user", "content": player_input}],
+                    model=self.world["name"], chat_id=self.session["chat_id"],
+                    api_key="manual-provider-no-api-key",
+                )
+
+        physical_response = run("I wait beside the keeper.")
+        self.assertEqual(0, npc_dynamic["trust"])
+        self.assertNotIn("信任", physical_response)
+
+        social_response = run("I ask the keeper to trust me.")
+        self.assertEqual(1, npc_dynamic["trust"])
+        self.assertNotIn("信任", social_response)
 
     def test_narrator_marker_cannot_reveal_hidden_exit(self):
         with patch("engine.load_world", return_value=self.world), \
@@ -665,6 +873,41 @@ class SceneCoverageRepairTests(unittest.TestCase):
 
 
 class HybridEngineActionTests(unittest.TestCase):
+    def test_authored_action_rolls_back_all_legacy_mutations_on_bad_event(self):
+        world = build_world()
+        state_def = {
+            "triggers": ["help the keeper"],
+            "on_trigger": {
+                "to_state": "helped",
+                "events": [{
+                    "type": "entity_moved", "entity_id": "keeper",
+                    "location": {"kind": "scene", "id": "invented"},
+                }],
+            },
+        }
+        world["entities"]["keeper"]["states"] = {"present": state_def}
+        session = create_session("authored-action-rollback", world["name"])
+        initialize_session_from_world(session, world)
+        before = deepcopy(session)
+        state = {
+            "session": session,
+            "world": world,
+            "matched_entity": {
+                "id": "keeper", "current_state": "present",
+                "state_def": state_def,
+            },
+            "player_input": "I help the keeper.",
+            "turn_summary": {}, "_action_events": [],
+            "dice_result": None, "_pending_roll": False,
+        }
+
+        with self.assertRaises(ValueError):
+            resolve_entity(state)
+
+        self.assertEqual(before, session)
+        self.assertEqual("present", session["entity_states"]["keeper"])
+        self.assertEqual({}, session["npc_dispositions"])
+
     def test_authored_trigger_is_blocked_until_inventory_requirement_is_met(self):
         world = build_world()
         world["entities"]["keeper"]["states"] = {
@@ -837,7 +1080,6 @@ class HybridEngineActionTests(unittest.TestCase):
         self.assertNotIn("dead", response)
         self.assertEqual("present", session["entity_states"]["coin"])
         self.assertEqual([], session["world_events"])
-
     def test_explicit_legacy_destruction_event_allows_matching_narration(self):
         world = build_world()
         world["entities"]["coin"]["states"] = {
@@ -999,6 +1241,73 @@ class HybridEngineActionTests(unittest.TestCase):
         self.assertIsNotNone(session["pending_check"])
         self.assertEqual("coin", session["pending_check"]["entity_id"])
         self.assertEqual([], session["world_events"])
+
+
+class RollTransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.world = build_world()
+        self.world["entities"]["coin"]["states"] = {
+            "present": {
+                "check": "Spot Hidden",
+                "on_pass": {"to_state": "found"},
+                "on_fail": {"to_state": "present"},
+            },
+        }
+        self.session = create_session("roll-transaction", self.world["name"])
+        initialize_session_from_world(self.session, self.world)
+        self.session["pending_check"] = {
+            "entity_id": "coin", "state": "present",
+            "skill": "侦查", "effective": 55, "dc": 55,
+            "san_check": "", "rule_system": "coc", "scene": "study",
+        }
+
+    @staticmethod
+    def _success_roll():
+        return {
+            "d100": 20, "success": True, "verdict": "hard_success",
+        }
+
+    def test_bad_late_roll_event_does_not_partially_persist(self):
+        self.world["entities"]["coin"]["states"]["present"]["on_pass"][
+            "events"] = [{
+                "type": "entity_moved", "entity_id": "keeper",
+                "location": {"kind": "scene", "id": "invented"},
+            }]
+        before = deepcopy(self.session)
+        save = Mock()
+
+        with patch("state_manager.load_session", return_value=self.session), \
+                patch("state_manager.save_session", save), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.resolve_check", return_value=self._success_roll()):
+            with self.assertRaises(ValueError):
+                roll_check(self.session["chat_id"])
+
+        self.assertEqual(before, self.session)
+        save.assert_not_called()
+
+    def test_successful_roll_commits_transition_and_authored_events(self):
+        self.world["entities"]["coin"]["states"]["present"]["on_pass"][
+            "events"] = [{
+                "type": "entity_discovered", "entity_id": "secret",
+            }]
+        saved = []
+
+        with patch("state_manager.load_session", return_value=self.session), \
+                patch("state_manager.save_session", side_effect=saved.append), \
+                patch("engine.load_world", return_value=self.world), \
+                patch("dice.resolve_check", return_value=self._success_roll()):
+            result = roll_check(self.session["chat_id"])
+
+        committed = saved[0]
+        self.assertEqual("hard_success", result["check"]["verdict"])
+        self.assertEqual("found", committed["entity_states"]["coin"])
+        self.assertTrue(committed["entity_facts"]["secret"]["visible"])
+        self.assertIsNone(committed["pending_check"])
+        self.assertEqual(
+            ["entity_discovered", "entity_discovered"],
+            [event["type"] for event in committed["world_events"]],
+        )
 
 
 if __name__ == "__main__":

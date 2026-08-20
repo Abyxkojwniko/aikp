@@ -194,6 +194,9 @@ def compress_story(session: dict, api_key: str = "",
     Called on scene transition. Merges hard facts (trust changes,
     revelations, flags, decisions) into a natural 3-5 sentence paragraph.
     """
+    if not api_key or str(api_key).startswith("manual-provider"):
+        return session.get("_story_summary", "")
+
     log = session.get("turn_log", [])
     if not log:
         return ""

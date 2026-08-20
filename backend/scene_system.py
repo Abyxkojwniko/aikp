@@ -194,10 +194,10 @@ def commit_scene_transition(session: dict, world: dict, scene_id: str) -> None:
     """Record arrival and clear the one-shot destination selection."""
     if scene_id not in world.get("scenes", {}):
         raise ValueError("Unknown scene transition target")
-    session.setdefault("player_state", {})["current_scene"] = scene_id
-    session["selected_scene_id"] = None
     scene = world["scenes"][scene_id]
     applied = session.setdefault("applied_scene_entry_events", [])
+    entry_events = []
+    entry_event_keys = []
     for index, raw_event in enumerate(scene.get("entry_events", []) or []):
         if not isinstance(raw_event, dict):
             continue
@@ -214,8 +214,14 @@ def commit_scene_transition(session: dict, world: dict, scene_id: str) -> None:
             raise ValueError("Scene entry events currently support entity_moved only")
         event.setdefault("location", {"kind": "scene", "id": scene_id})
         event.setdefault("source", "scene_entry")
-        from world_state import append_world_event
-        append_world_event(session, world, event)
+        entry_events.append(event)
         if once:
-            applied.append(event_key)
+            entry_event_keys.append(event_key)
+    from world_state import commit_world_events
+    commit_world_events(session, world, [{
+        "type": "scene_entered",
+        "scene_id": scene_id,
+        "entry_event_keys": entry_event_keys,
+        "source": "validated_movement",
+    }, *entry_events], actor="player", source="scene_transition")
     ensure_scene_state(session, world)

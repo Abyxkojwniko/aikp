@@ -87,7 +87,21 @@ API Key 解析顺序：请求头 `Authorization` → 环境变量 `DEEPSEEK_API_
 |---|---|
 | `DEEPSEEK_API_KEY` | （必填） |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` |
-| `DEEPSEEK_MODEL` | `deepseek-v4-flash` |
+| `DEEPSEEK_MODEL` | `deepseek-chat` |
+| `AIKP_NARRATIVE_AUDIT` | `strict`（`always` 为失效开放，`off` 可关闭） |
+| `AIKP_NARRATIVE_AUDITOR_MODEL` | 与 `DEEPSEEK_MODEL` 相同 |
+
+叙事审计默认使用严格模式，每个需要 LLM 叙述的回合会增加一次独立审计调用；发现冲突时还会增加一次定向修复调用。在线审计不可用或返回无效 JSON 时，严格模式会退回仅由已提交事实生成的保守叙述。离线测试会明确记录为 `skipped_offline`。
+
+### Grounded runtime 方法
+
+当前运行时采用 `propose -> validate -> commit -> narrate -> audit -> repair/fallback`：模型提出动作解释与叙述，代码只提交封闭世界中通过校验的事件，叙述不能直接写 SAN、信任、位置、物品或 NPC 生命周期。实现思路借鉴了以下工作的评价问题，但不声称复现其完整方法或达到其榜单结果：
+
+- [Orchestrated Reality](https://arxiv.org/html/2606.16014)：将生成、工具执行、验证和修复拆成可审计阶段。
+- [NCP-Bench](https://arxiv.org/html/2608.08160)：把跨长程的 setup/payoff 作为显式 narrative commitment 持续追踪。
+- [WSE-bench](https://arxiv.org/html/2608.15654)：用“既有事实、当前冲突、缺失的调和事件”检查世界状态矛盾。
+
+世界事件按批次在副本上归约，通过类型、位置、所有权与生命周期不变量后一次提交，并记录前后状态哈希。动作解析、场景进入和玩家掷骰也使用同一事务边界；任何后置事件失败都会回滚整次行动。
 
 ## 目录
 
@@ -106,6 +120,8 @@ models/                 放置你的世界书（不随仓库分发）
 - AI 仅从「当前可见对象 + 背包对象」的封闭候选集中解析玩家动作。
 - 代码验证位置、可见性、持有关系、锁和道具等前置条件。
 - 验证后的变化写入 `world_events`，当前世界事实从事件与 `entity_facts` 得到。
+- 同一动作产生的多个变化先在副本上执行并检查世界不变量，全部通过才原子提交；每批事件共享 `commit_id`，并记录提交前后的规范状态哈希，失败不会留下半个动作。
+- LLM 叙事生成后会与当前场景、实体位置/生死/开锁状态、已提交事件和剧情承诺进行冲突审计；冲突答案只修复一次，仍不一致则使用仅由已提交事实生成的回退叙述。
 - 旧模组的 `states/triggers` 仅作为明确检定和原文分支的兼容规则。
 - NPC 对话必须选择交谈对象；普通 object 可选择以消除歧义，也可用自然语言指定。
 - 场景导航只暴露当前可达出口；玩家可选择稳定场景 ID，再用“去那里”等自然表达移动。

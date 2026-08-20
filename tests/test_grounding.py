@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 from chunker import Chunk
 from engine import (
+    advance_validated_action_clocks,
     _apply_pending_clock_outcome,
     _advance_action_clocks,
     _generate_narration,
@@ -19,6 +20,7 @@ from engine import (
     _extract_interaction_target,
     _is_dialogue_intent,
     _known_absent_npc,
+    _maybe_arm_dynamic_check,
     _maybe_apply_movement,
     _redact_unrevealed_entities,
     _redact_unrevealed_names,
@@ -26,10 +28,12 @@ from engine import (
     _try_arm_scene_clue,
     assemble_context,
     narrate,
+    narrative_audit_provider,
     narration_provider,
     resolve_entity,
     run_gm_turn,
 )
+from narrative_guard import build_narrative_contract
 from models import create_session
 from npc_context import build_scene_layer
 from parser import (
@@ -105,6 +109,226 @@ class NarrationProviderTests(unittest.TestCase):
         self.assertEqual("manual narration", response)
         self.assertEqual("turn", requests[0]["kind"])
         self.assertEqual("study", requests[0]["metadata"]["scene"])
+
+    @staticmethod
+    def _dynamic_check_state(player_input, resolution=None):
+        return {
+            "player_input": player_input,
+            "world": {},
+            "action_resolution": resolution or {
+                "status": "passthrough", "events": [],
+            },
+            "session": {
+                "rule_system": "coc", "pending_check": None,
+                "player_state": {
+                    "current_scene": "room",
+                    "skills": {"侦查": 55, "攀爬": 40},
+                },
+            },
+        }
+
+    def test_dynamic_check_rejects_unknown_skill(self):
+        state = self._dynamic_check_state("I search the desk.")
+
+        content = _maybe_arm_dynamic_check(
+            state, "Try it. 〔检定：God Mode〕")
+
+        self.assertNotIn("检定", content)
+        self.assertIsNone(state["session"]["pending_check"])
+
+    def test_dynamic_check_rejects_routine_observation(self):
+        state = self._dynamic_check_state("I look around the room.")
+
+        content = _maybe_arm_dynamic_check(
+            state, "Look carefully. 〔检定：Spot Hidden〕")
+
+        self.assertNotIn("检定", content)
+        self.assertIsNone(state["session"]["pending_check"])
+
+    def test_dynamic_check_accepts_known_skill_for_uncertain_action(self):
+        state = self._dynamic_check_state(
+            "I search the desk.",
+            {"status": "accepted", "requires_adjudication": True},
+        )
+
+        content = _maybe_arm_dynamic_check(
+            state, "Search it. 〔检定：Spot Hidden〕")
+
+        self.assertNotIn("检定", content)
+        self.assertEqual("侦查", state["session"]["pending_check"]["skill"])
+        self.assertEqual(55, state["session"]["pending_check"]["effective"])
+        self.assertTrue(state["_dynamic_check_armed"])
+
+    @staticmethod
+    def _audit_state():
+        world = {
+            "name": "Narrative Guard",
+            "scenes": {"room": {
+                "name": "Room", "desc": "A witness lies motionless.",
+                "exits": {},
+            }},
+            "entities": {"witness": {
+                "type": "npc", "name": "Witness", "scene": "room",
+                "initial_state": "present", "known_to_player": True,
+            }},
+        }
+        session = create_session("narrative-guard", world["name"])
+        session["player_state"]["current_scene"] = "room"
+        session["entity_states"]["witness"] = "dead"
+        return {
+            "context_prompt": "Only describe the room.",
+            "player_input": "I look around.",
+            "stream": False,
+            "api_key": "manual-provider-no-api-key",
+            "chat_id": session["chat_id"],
+            "model": world["name"],
+            "world": world,
+            "session": session,
+            "entity_index": {"witness": {
+                "type": "npc", "name": "Witness", "scene": "room"}},
+            "scene_index": {"room": ["witness"]},
+            "current_scene": world["scenes"]["room"],
+            "scene_entities": ["witness"],
+            "movement_target": None,
+            "turn_summary": {},
+            "_action_events": [],
+            "_narration_override": None,
+            "_pending_roll": False,
+            "_clock_events": [],
+        }
+
+    def test_conflicting_narration_is_audited_and_repaired_once(self):
+        state = self._audit_state()
+        narration_calls = []
+        audit_phases = []
+
+        def narrator(request):
+            narration_calls.append(request["kind"])
+            if request["kind"] == "turn":
+                return "Witness stands up and says hello."
+            return "The Witness's body remains still."
+
+        def auditor(request):
+            audit_phases.append(request["phase"])
+            if request["phase"] == "initial":
+                return (
+                    '{"valid":false,"violations":[{'
+                    '"kind":"fact_conflict","entity_id":"witness",'
+                    '"evidence":"stands up","reason":"dead NPC acts"}]}')
+            return '{"valid":true,"violations":[]}'
+
+        with narration_provider(narrator), narrative_audit_provider(auditor):
+            result = narrate(state)
+
+        self.assertEqual("The Witness's body remains still.", result["gm_response"])
+        self.assertEqual(["turn", "narrative_repair"], narration_calls)
+        self.assertEqual(["initial", "repair_confirmation"], audit_phases)
+        self.assertEqual(0, result["_trust_signal"])
+        self.assertTrue(result["_narrative_audit"]["repaired"])
+        self.assertFalse(result["_narrative_audit"]["fallback_used"])
+
+    def test_rejected_narration_cannot_leave_dynamic_roll_lock(self):
+        state = self._audit_state()
+        state["player_input"] = "I search the room."
+        state["action_resolution"] = {
+            "status": "accepted", "requires_adjudication": True,
+        }
+        state["session"]["player_state"]["skills"] = {"侦查": 55}
+
+        def narrator(request):
+            if request["kind"] == "turn":
+                return "Witness stands up. 〔检定：Spot Hidden〕"
+            return "The Witness's body remains still."
+
+        def auditor(request):
+            if request["phase"] == "initial":
+                return (
+                    '{"valid":false,"violations":[{'
+                    '"kind":"fact_conflict","entity_id":"witness",'
+                    '"evidence":"stands up","reason":"dead NPC acts"}]}')
+            return '{"valid":true,"violations":[]}'
+
+        with narration_provider(narrator), narrative_audit_provider(auditor):
+            result = narrate(state)
+
+        self.assertIsNone(result["session"]["pending_check"])
+        self.assertNotIn("_dynamic_check_armed", result)
+        self.assertNotIn("检定", result["gm_response"])
+
+    def test_failed_repair_falls_back_to_committed_facts(self):
+        state = self._audit_state()
+
+        def narrator(request):
+            return "Witness stands up and talks." if request["kind"] == "turn" \
+                else "Witness walks out of the room."
+
+        invalid = (
+            '{"valid":false,"violations":[{'
+            '"kind":"fact_conflict","entity_id":"witness",'
+            '"evidence":"acts","reason":"dead NPC acts"}]}')
+        with narration_provider(narrator), narrative_audit_provider(
+                lambda _request: invalid):
+            result = narrate(state)
+
+        self.assertNotIn("stands", result["gm_response"])
+        self.assertNotIn("walks", result["gm_response"])
+        self.assertTrue(result["_narrative_audit"]["fallback_used"])
+
+    def test_strict_audit_fails_closed_on_invalid_auditor_json(self):
+        state = self._audit_state()
+
+        with patch("engine.NARRATIVE_AUDIT_MODE", "strict"), \
+                narration_provider(lambda _request: (
+                    "The Witness's body remains motionless.")), \
+                narrative_audit_provider(lambda _request: "not-json"):
+            result = narrate(state)
+
+        self.assertEqual(
+            "这次行动没有产生可以确认的额外世界变化。",
+            result["gm_response"],
+        )
+        self.assertTrue(result["_narrative_audit"]["fallback_used"])
+        self.assertEqual(
+            "unavailable", result["_narrative_audit"]["verification_status"])
+
+    def test_story_setup_remains_due_in_a_later_linked_node(self):
+        state = self._audit_state()
+        state["world"]["scenes"]["payoff"] = {
+            "name": "Payoff Room", "desc": "The promised bell hangs here.",
+            "exits": {},
+        }
+        state["world"]["detailed_story_nodes"] = [
+            {
+                "node_id": "setup_node",
+                "scenes": [{"id": "room"}],
+                "promises_payoffs": [{
+                    "setup": "The cracked seal must matter later.",
+                    "payoff": "The bell answers the broken seal.",
+                    "relation": "setup",
+                    "linked_node_id": "payoff_node",
+                    "source_ref": 120,
+                }],
+            },
+            {
+                "node_id": "payoff_node",
+                "scenes": [{"id": "payoff"}],
+                "promises_payoffs": [],
+            },
+        ]
+        session = state["session"]
+        session["visited_scene_ids"] = ["room", "payoff"]
+        session["player_state"]["current_scene"] = "payoff"
+        session["current_beat_id"] = "payoff_node"
+        state["current_scene"] = state["world"]["scenes"]["payoff"]
+        state["scene_entities"] = []
+
+        contract = build_narrative_contract(state)
+
+        commitment = next(
+            row for row in contract["story_commitments"]
+            if row["id"] == "story:setup_node:000")
+        self.assertEqual("due", commitment["status"])
+        self.assertEqual("payoff_node", commitment["due_at"])
 
     def test_scene_transition_advances_exactly_one_turn(self):
         world = {
@@ -273,6 +497,7 @@ class NarrationProviderTests(unittest.TestCase):
         self.assertIn("climb to lighthouse", prompt)
         self.assertIn("【移动提示·重要】", prompt)
         self.assertIn("CRITICAL: You are a Game Master.", prompt)
+        self.assertIn("=== NARRATIVE COMMITMENTS", prompt)
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -357,6 +582,46 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(4, session["clocks"]["development_round"])
         self.assertEqual(["round_4"], session["flags"])
         self.assertEqual(4, events[0]["milestones"][0]["at"])
+
+    def test_blocked_action_does_not_advance_action_clock(self):
+        world = {"action_clocks": {"round": {
+            "name": "Round", "initial": 0, "default_increment": 0,
+            "actions": [{
+                "label": "Open", "triggers": ["open the door"],
+                "increment": 1,
+            }],
+        }}}
+        session = {"clocks": {"round": 0}, "flags": []}
+        state = {
+            "player_input": "I open the door.", "world": world,
+            "session": session, "_action_block": "It is locked.",
+            "action_resolution": {"status": "blocked"},
+        }
+
+        advance_validated_action_clocks(state)
+
+        self.assertEqual(0, session["clocks"]["round"])
+        self.assertEqual([], state["_clock_events"])
+
+    def test_validated_action_advances_action_clock(self):
+        world = {"action_clocks": {"round": {
+            "name": "Round", "initial": 0, "default_increment": 0,
+            "actions": [{
+                "label": "Open", "triggers": ["open the door"],
+                "increment": 1,
+            }],
+        }}}
+        session = {"clocks": {"round": 0}, "flags": []}
+        state = {
+            "player_input": "I open the door.", "world": world,
+            "session": session, "_action_block": "",
+            "action_resolution": {"status": "accepted"},
+        }
+
+        advance_validated_action_clocks(state)
+
+        self.assertEqual(1, session["clocks"]["round"])
+        self.assertEqual(1, state["_clock_events"][0]["increment"])
 
     def test_chinese_campaign_structure_beats_inline_checks(self):
         text = (

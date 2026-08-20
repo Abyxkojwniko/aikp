@@ -9,6 +9,7 @@ for _stream in (_sys.stdout, _sys.stderr):
     except Exception:
         pass
 import time, uuid, json, os as _os
+from copy import deepcopy
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
@@ -686,7 +687,9 @@ def roll_check(chat_id: str):
     from dice import resolve_check, coc_san_loss
     from engine import _apply_pending_clock_outcome, load_world
 
-    session = load_session(chat_id)
+    # Every roll is one rules transaction. Clock/SAN/state/event changes are
+    # staged together and reach disk/cache only after the whole outcome passes.
+    session = deepcopy(load_session(chat_id))
     pc = session.get("pending_check")
     if not pc:
         raise HTTPException(status_code=400, detail="没有待掷的检定")
@@ -705,6 +708,33 @@ def roll_check(chat_id: str):
     out = {"entity": pc.get("entity_id"), "entity_name": entity.get("name", ""),
            "skill": pc.get("skill", ""), "narration": ""}
     narration = []
+    outcome_applied = False
+
+    def apply_authored_outcome(outcome: dict) -> None:
+        nonlocal outcome_applied
+        if not isinstance(outcome, dict):
+            return
+        nxt = outcome.get("to_state")
+        if nxt:
+            old = session.setdefault("entity_states", {}).get(
+                pc.get("entity_id", ""), pc.get("state", "default"))
+            from world_state import sync_legacy_transition
+            sync_legacy_transition(
+                session, world, pc["entity_id"], old, nxt)
+        raw_events = outcome.get("events", [])
+        pending_events = []
+        for raw_event in raw_events if isinstance(raw_events, list) else []:
+            if not isinstance(raw_event, dict):
+                continue
+            payload = dict(raw_event)
+            payload.setdefault("source", "authored_roll_outcome")
+            pending_events.append(payload)
+        if pending_events:
+            from world_state import commit_world_events
+            commit_world_events(
+                session, world, pending_events, actor="rules",
+                source="authored_roll_outcome")
+        outcome_applied = True
 
     # Skill check: main d100 vs target → success level
     if pc.get("skill"):
@@ -760,14 +790,7 @@ def roll_check(chat_id: str):
             narration.append(f"〈{pc.get('skill')}〉检定：{out['check']['verdict_cn']}。")
         else:
             tr = state_def.get("on_pass" if r.get("success") else "on_fail", {})
-            nxt = tr.get("to_state")
-            if nxt:
-                old = session.setdefault("entity_states", {}).get(
-                    pc["entity_id"], pc.get("state", "default"))
-                session["entity_states"][pc["entity_id"]] = nxt
-                from world_state import sync_legacy_transition
-                sync_legacy_transition(
-                    session, world, pc["entity_id"], old, nxt)
+            apply_authored_outcome(tr)
             if tr.get("narration"):
                 narration.append(tr["narration"])
         print(f"[ENGINE] Player rolled {pc['skill']}: roll={out['check']['roll']} "
@@ -787,14 +810,9 @@ def roll_check(chat_id: str):
               f"loss={sr['san_loss']} (now {ps['san']})", flush=True)
         # SAN-only check: transition the entity's state too, so looking once
         # doesn't keep re-triggering the same SAN loss every turn.
-        tr = state_def.get("on_pass") or state_def.get("on_trigger") or {}
-        nxt = tr.get("to_state")
-        if nxt:
-            old = session.setdefault("entity_states", {}).get(
-                pc["entity_id"], pc.get("state", "default"))
-            session["entity_states"][pc["entity_id"]] = nxt
-            from world_state import sync_legacy_transition
-            sync_legacy_transition(session, world, pc["entity_id"], old, nxt)
+        if not outcome_applied:
+            tr = state_def.get("on_pass") or state_def.get("on_trigger") or {}
+            apply_authored_outcome(tr)
 
     session["pending_check"] = None
     save_session(session)

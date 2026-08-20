@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
@@ -43,7 +44,10 @@ def load_session(chat_id: str) -> Session:
 
 
 def save_session(session: Session) -> None:
+    from world_state import canonical_state_hash
+
     session["updated_at"] = time.time()
+    session["world_state_hash"] = canonical_state_hash(session)
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     path = session_path(session["chat_id"])
     # atomic write: write to temp first, then rename
@@ -360,6 +364,9 @@ def get_or_compress_conversation_summary(
     Compresses turns [5:15] via LLM every `compress_every` turns.
     Returns existing summary if not due for recompression.
     """
+    if not api_key or str(api_key).startswith("manual-provider"):
+        return session.get("_cached_summary", "")
+
     turn = session.get("current_turn", 0)
     log = session.get("turn_log", [])
 
@@ -485,6 +492,14 @@ def initialize_session_from_world(
     # Rule system from world book
     rule_system = world.get("rule_system", "dnd")
     session["rule_system"] = rule_system
+    session["narrative_commitments"] = []
+    for index, raw in enumerate(world.get("narrative_commitments", []) or []):
+        if not isinstance(raw, dict):
+            continue
+        commitment = deepcopy(raw)
+        commitment.setdefault("id", f"commitment-{index + 1:03d}")
+        commitment.setdefault("status", "pending")
+        session["narrative_commitments"].append(commitment)
 
     # Percentile defaults keep parser-produced checks rollable before a sheet is
     # imported. SAN remains exclusive to Call of Cthulhu.
@@ -508,7 +523,7 @@ def initialize_session_from_world(
     for eid, entity in scoped_entities.items():
         session["entity_states"][eid] = entity.get("initial_state", "default")
 
-    from world_state import ensure_fact_state
+    from world_state import canonical_state_hash, ensure_fact_state
     ensure_fact_state(session, scoped_world)
     session["discovered_scene_ids"] = []
     session["visited_scene_ids"] = []
@@ -535,4 +550,5 @@ def initialize_session_from_world(
         session["completed_beats"] = []
         session["unlocked_scenes"] = []
 
+    session["world_state_hash"] = canonical_state_hash(session)
     return session

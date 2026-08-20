@@ -3,6 +3,8 @@
 
 import json
 import os
+import hashlib
+from copy import deepcopy
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -15,7 +17,7 @@ from dice import skill_check, coc_san_loss, resolve_check, is_percentile_system
 from config import (
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
     GM_SYSTEM_PROMPT, WORLD_BOOK_DIR, MAX_CONTEXT_CHARS,
-    MAX_SCENE_SOURCE_CHARS,
+    MAX_SCENE_SOURCE_CHARS, NARRATIVE_AUDIT_MODE, NARRATIVE_AUDITOR_MODEL,
 )
 from models import Session, EntityMemory
 from state_manager import (
@@ -43,7 +45,7 @@ from action_system import (
     validate_action,
 )
 from world_state import (
-    append_world_event, ensure_fact_state, list_interactable_objects,
+    append_world_event, commit_world_events, ensure_fact_state, list_interactable_objects,
     reconcile_object_target, scene_entity_ids, sync_legacy_transition,
 )
 from scene_system import (
@@ -53,6 +55,12 @@ from scene_system import (
 from card_parser import (
     looks_like_st_command, parse_st_command, build_player_state_patch,
     apply_patch, summarize_card,
+)
+from narrative_guard import (
+    audit_response_is_structured,
+    build_audit_prompt, build_narrative_contract, build_repair_prompt,
+    deterministic_violations, grounded_fallback, parse_audit_response,
+    render_contract_block,
 )
 
 
@@ -125,6 +133,9 @@ _narration_provider: ContextVar[Optional[NarrationProvider]] = ContextVar(
 ActionPlannerProvider = Callable[[str], str]
 _action_planner_provider: ContextVar[Optional[ActionPlannerProvider]] = ContextVar(
     "aikp_action_planner_provider", default=None)
+NarrativeAuditProvider = Callable[[dict], str]
+_narrative_audit_provider: ContextVar[Optional[NarrativeAuditProvider]] = ContextVar(
+    "aikp_narrative_audit_provider", default=None)
 
 
 @contextmanager
@@ -152,14 +163,32 @@ def action_planner_provider(provider: ActionPlannerProvider) -> Iterator[None]:
         _action_planner_provider.reset(token)
 
 
+@contextmanager
+def narrative_audit_provider(provider: NarrativeAuditProvider) -> Iterator[None]:
+    """Override semantic narration auditing for deterministic playtests."""
+    token = _narrative_audit_provider.set(provider)
+    try:
+        yield
+    finally:
+        _narrative_audit_provider.reset(token)
+
+
+def _external_models_enabled(api_key: str) -> bool:
+    """Return whether auxiliary model calls are allowed for this request."""
+    return bool(
+        api_key
+        and not str(api_key).startswith("manual-provider")
+        and _narration_provider.get() is None
+    )
+
+
 def _action_planner(api_key: str) -> Optional[ActionPlannerProvider]:
     provider = _action_planner_provider.get()
     if provider is not None:
         return provider
     # Offline replay intentionally exercises deterministic planning. Its fake
     # key must never create an external API client.
-    if (_narration_provider.get() is not None or not api_key
-            or api_key.startswith("manual-provider")):
+    if not _external_models_enabled(api_key):
         return None
 
     def call(prompt: str) -> str:
@@ -207,6 +236,214 @@ def _generate_narration(*, messages: list[dict], api_key: str,
         stream=False,
     )
     return response.choices[0].message.content or ""
+
+
+def _semantic_narrative_audit(state: "GMState", content: str,
+                              contract: dict, phase: str) -> list[dict]:
+    """Run the independent NCP-style conflict check when one is available."""
+    provider = _narrative_audit_provider.get()
+    raw = ""
+    request = {
+        "kind": "narrative_audit",
+        "phase": phase,
+        "prompt": build_audit_prompt(
+            contract, state.get("player_input", ""), content),
+        "contract": contract,
+        "narrative": content,
+        "metadata": {
+            "chat_id": state.get("chat_id", ""),
+            "model": state.get("model", ""),
+            "turn": contract.get("turn"),
+        },
+    }
+    if provider is not None:
+        try:
+            raw = str(provider(request) or "")
+        except Exception as exc:
+            print(f"[ENGINE] Narrative audit provider failed: {exc}", flush=True)
+            state["_semantic_audit_status"] = "unavailable"
+            return []
+    elif NARRATIVE_AUDIT_MODE in {"off", "false", "0", "disabled"}:
+        state["_semantic_audit_status"] = "disabled"
+        return []
+    elif (_narration_provider.get() is not None
+          or not state.get("api_key")
+          or str(state.get("api_key", "")).startswith("manual-provider")):
+        state["_semantic_audit_status"] = "skipped_offline"
+        return []
+    else:
+        try:
+            client = OpenAI(
+                api_key=state["api_key"], base_url=DEEPSEEK_BASE_URL)
+            response = client.chat.completions.create(
+                model=NARRATIVE_AUDITOR_MODEL,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a strict but evidence-based narrative integrity "
+                        "auditor. Return JSON only.")},
+                    {"role": "user", "content": request["prompt"]},
+                ],
+                temperature=0,
+                max_tokens=600,
+                stream=False,
+            )
+            raw = response.choices[0].message.content or ""
+        except Exception as exc:
+            print(f"[ENGINE] Narrative audit failed: {exc}", flush=True)
+            state["_semantic_audit_status"] = "unavailable"
+            return []
+    if not raw or not audit_response_is_structured(raw):
+        state["_semantic_audit_status"] = "unavailable"
+        print("[ENGINE] Narrative auditor returned an invalid envelope", flush=True)
+        return []
+    state["_semantic_audit_status"] = "ok"
+    allowed_ids = {
+        str(entity.get("id", ""))
+        for entity in contract.get("entities", [])
+        if entity.get("id")
+    }
+    return parse_audit_response(raw, allowed_ids)
+
+
+def _dedupe_violations(violations: list[dict]) -> list[dict]:
+    result = []
+    seen = set()
+    for violation in violations:
+        key = (
+            str(violation.get("kind", "")),
+            str(violation.get("entity_id", "")),
+            str(violation.get("reason", "")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(violation)
+    return result
+
+
+def _clean_repaired_narration(state: "GMState", content: str) -> str:
+    content = _re.sub(r'\s*〔\s*前往\s*[:：].*?〕\s*', '', content).strip()
+    content = _re.sub(r'\s*〔信任\+\d+〕\s*$', '', content,
+                      flags=_re.MULTILINE).rstrip()
+    content = _redact_unrevealed_entities(
+        content, state["session"], state["world"])
+    content = _redact_unrevealed_names(
+        content, state["session"], state["entity_index"], state["world"])
+    content = _reject_uncommitted_movement(state, content)
+    content = _reject_uncommitted_world_mutation(state, content)
+    return _reject_wrong_location_object_claims(state, content)
+
+
+def _audit_and_repair_narration(state: "GMState", content: str) -> str:
+    """Audit generated prose, repair once, then fail closed if still invalid."""
+    contract = build_narrative_contract(state)
+    violations = _dedupe_violations([
+        *deterministic_violations(content, contract),
+        *_semantic_narrative_audit(state, content, contract, "initial"),
+    ])
+    initial_verification = state.get("_semantic_audit_status", "disabled")
+    strict_unavailable = bool(
+        NARRATIVE_AUDIT_MODE in {"strict", "required", "fail_closed"}
+        and initial_verification == "unavailable"
+    )
+    if strict_unavailable:
+        violations = _dedupe_violations([*violations, {
+            "kind": "fact_conflict", "entity_id": "", "evidence": "",
+            "reason": "Independent narrative verification was unavailable.",
+            "source": "verification_gate",
+        }])
+    repaired = False
+    fallback_used = False
+    final_content = content
+
+    if violations:
+        # A rejected narration cannot carry an out-of-band trust mutation into
+        # the repaired/fallback result.
+        state["_trust_signal"] = 0
+        if state.pop("_dynamic_check_armed", False):
+            state["session"]["pending_check"] = None
+            print(
+                "[ENGINE] Cleared dynamic check from rejected narration",
+                flush=True,
+            )
+        if strict_unavailable:
+            final_content = _clean_repaired_narration(
+                state, grounded_fallback(state))
+            fallback_used = True
+        else:
+            try:
+                final_content = _generate_narration(
+                    messages=[
+                        {"role": "system", "content": (
+                            "You repair an RPG observation to match canonical "
+                            "state. Return only the corrected player-facing "
+                            "narration.")},
+                        {"role": "user", "content": build_repair_prompt(
+                            contract, state.get("player_input", ""), content,
+                            violations)},
+                    ],
+                    api_key=state["api_key"],
+                    temperature=0.1,
+                    max_tokens=1024,
+                    kind="narrative_repair",
+                    metadata={
+                        "chat_id": state.get("chat_id", ""),
+                        "model": state.get("model", ""),
+                        "turn": contract.get("turn"),
+                        "violations": violations,
+                    },
+                )
+                final_content = _clean_repaired_narration(state, final_content)
+                repaired = True
+            except Exception as exc:
+                print(f"[ENGINE] Narrative repair failed: {exc}", flush=True)
+                final_content = ""
+
+            semantic_remaining = (
+                _semantic_narrative_audit(
+                    state, final_content, contract, "repair_confirmation")
+                if final_content else []
+            )
+            repair_verification = state.get(
+                "_semantic_audit_status", initial_verification)
+            remaining = _dedupe_violations([
+                *deterministic_violations(final_content, contract),
+                *semantic_remaining,
+            ])
+            if (NARRATIVE_AUDIT_MODE in {
+                    "strict", "required", "fail_closed"}
+                    and repair_verification == "unavailable"):
+                remaining.append({
+                    "kind": "fact_conflict", "entity_id": "",
+                    "reason": "Repair verification was unavailable.",
+                    "source": "verification_gate",
+                })
+            if not final_content or remaining:
+                final_content = _clean_repaired_narration(
+                    state, grounded_fallback(state))
+                fallback_used = True
+
+    audit_record = {
+        "turn": contract.get("turn"),
+        "valid_initially": not violations,
+        "violations": violations,
+        "repaired": repaired,
+        "fallback_used": fallback_used,
+        "verification_status": initial_verification,
+        "original_sha256": hashlib.sha256(
+            content.encode("utf-8")).hexdigest(),
+        "final_sha256": hashlib.sha256(
+            final_content.encode("utf-8")).hexdigest(),
+    }
+    audits = state["session"].setdefault("narrative_audits", [])
+    audits.append(audit_record)
+    del audits[:-200]
+    state["_narrative_audit"] = audit_record
+    if violations:
+        print(
+            f"[ENGINE] Narrative audit found {len(violations)} violation(s); "
+            f"repaired={repaired} fallback={fallback_used}", flush=True)
+    return final_content
 
 
 def _write_eval_trace(chat_id: str, turn: int, payload: dict) -> None:
@@ -392,6 +629,7 @@ class GMState(TypedDict, total=False):
     action_resolution: dict            # validator decision and proposed events
     _action_events: list[dict]          # committed authoritative events
     _action_block: str                  # deterministic validation denial
+    _narrative_audit: dict              # verifier/repair result for this turn
 
 
 # ── KP Global Knowledge ──────────────────────────────────────
@@ -951,6 +1189,8 @@ def _extract_arrival_traits(session: dict, scene_id: str, scene_name: str,
     NPC's setting, so it works even when the opening narration never described
     them (e.g. 黎明之盏's mansion NPCs). Present NPCs only, observable only —
     secrets/hidden identities are NOT traits (those are disclosure-managed)."""
+    if not _external_models_enabled(api_key):
+        return
     try:
         from npc_trait_extractor import extract_npc_traits
         from npc_state import add_traits
@@ -1292,7 +1532,9 @@ _ENVIRONMENT_PLACEMENT_RE = _re.compile(
     flags=_re.IGNORECASE,
 )
 _CARRIED_PLACEMENT_RE = _re.compile(
-    r'(?:手中|手里|身上|背包|口袋|携带|拿着|握着|持有)',
+    r'(?:手中|手里|身上|背包|口袋|行囊|携带|拿着|握着|持有|收好)|'
+    r'\b(?:hand|hands|backpack|pack|pocket|pocketed|inventory|carried|'
+    r'carrying|holding|held)\b',
     flags=_re.IGNORECASE,
 )
 
@@ -1421,9 +1663,7 @@ def _reject_wrong_location_object_claims(state: "GMState", content: str) -> str:
         window = content[left:min(len(content), match.end() + 20)]
         if _NEGATED_PRESENCE_RE.search(window):
             continue
-        if carried and (
-                _CARRIED_PLACEMENT_RE.search(window)
-                or not _ENVIRONMENT_PLACEMENT_RE.search(window)):
+        if carried and _CARRIED_PLACEMENT_RE.search(window):
             continue
         print(
             f"[ENGINE] Rejected wrong-location object claim: {eid!r} "
@@ -1434,28 +1674,59 @@ def _reject_wrong_location_object_claims(state: "GMState", content: str) -> str:
     return content
 
 
+_DYNAMIC_CHECK_ACTION_RE = _re.compile(
+    r"(?:搜查|搜索|翻找|搜身|调查|查找|寻找|偷听|聆听|撬锁|强行|破门|"
+    r"说服|劝说|恐吓|威胁|攀爬|潜行|躲藏|鉴定|诊断|急救|跟踪|追踪|"
+    r"攻击|搏斗|射击|闪避)|"
+    r"\b(?:search|investigate|rummage|listen|pick\s+(?:the\s+)?lock|"
+    r"force|persuade|convince|intimidate|threaten|climb|sneak|hide|"
+    r"diagnose|first\s+aid|track|attack|fight|shoot|dodge)\b",
+    flags=_re.IGNORECASE,
+)
+
+
 def _maybe_arm_dynamic_check(state: "GMState", content: str) -> str:
     """If the LLM emitted a 〔检定：技能〕 marker for an uncertain action the module
     didn't pre-define, arm a dynamic pending_check (reusing the same player-roll
     pipeline as module checks) and strip the marker from the narration. Skipped
     if a module check is already pending this turn (at most one check per turn)."""
-    if state.get("_pending_roll"):
-        return content
     m = _re.search(r'〔\s*检定\s*[:：]\s*(.+?)\s*〕', content)
     if not m:
         return content
-    skill = m.group(1).strip()
     content = _re.sub(r'〔\s*检定\s*[:：].*?〕', '', content).strip()
+    if state.get("_pending_roll"):
+        return content
+
     session = state["session"]
+    if session.get("pending_check"):
+        return content
+
+    resolution = state.get("action_resolution", {})
+    status = str(resolution.get("status", "passthrough"))
+    player_input = state.get("player_input", "")
+    action_is_uncertain = bool(
+        resolution.get("requires_adjudication")
+        or _find_outcome_clock_action(player_input, state.get("world", {}))
+        or _DYNAMIC_CHECK_ACTION_RE.search(player_input)
+    )
+    if status in {"blocked", "ambiguous"} or not action_is_uncertain:
+        print("[ENGINE] Ignored ungrounded dynamic check marker", flush=True)
+        return content
+
+    proposed_skill = m.group(1).strip()
     ps = session.get("player_state", {})
     rule_system = session.get("rule_system", "coc")
-    sv = ps.get("skills", {}).get(skill, 0)
-    # Attributes are percentile (CoC 7e) — no ×5. Untrained floor, capped at 95.
-    effective = sv if sv > 0 else 15
-    effective = min(max(effective, 15), 95)
+    resolved_skill = _resolve_clue_skill(proposed_skill, ps, rule_system)
+    if not resolved_skill:
+        print(
+            f"[ENGINE] Ignored unknown dynamic check skill: {proposed_skill!r}",
+            flush=True,
+        )
+        return content
+    skill, sv, effective, dc = resolved_skill
     pending_check = {
         "entity_id": "", "state": "", "skill": skill,
-        "skill_value": sv, "effective": effective, "dc": 12,
+        "skill_value": sv, "effective": effective, "dc": dc,
         "san_check": "", "rule_system": rule_system,
         "scene": ps.get("current_scene", ""), "dynamic": True,
         "player_action": state.get("player_input", ""),
@@ -1470,6 +1741,7 @@ def _maybe_arm_dynamic_check(state: "GMState", content: str) -> str:
             "_outcome_clock_increments": outcome_action["outcome_increments"],
         })
     session["pending_check"] = pending_check
+    state["_dynamic_check_armed"] = True
     print(f"[ENGINE] Dynamic check armed by LLM: {skill} (effective {effective})", flush=True)
     return content
 
@@ -1789,8 +2061,7 @@ def parse_input(state: GMState) -> GMState:
     inp = state["player_input"].lower()
     ensure_fact_state(session, world)
     ensure_scene_state(session, world)
-    state["_clock_events"] = _advance_action_clocks(
-        state["player_input"], session, world)
+    state["_clock_events"] = []
 
     # A player may guess a real module object before discovering it (often from
     # prior knowledge of the scenario) and phrase the guess as an accomplished
@@ -2237,7 +2508,7 @@ def judge(state: GMState) -> GMState:
 
 # ── Node: Resolve Entity (NEW) ─────────────────────────────────
 
-def resolve_entity(state: GMState) -> GMState:
+def _resolve_entity_impl(state: GMState) -> GMState:
     """Apply entity state transitions based on dice result or unconditional trigger."""
     matched = state.get("matched_entity")
     session = state["session"]
@@ -2339,8 +2610,6 @@ def resolve_entity(state: GMState) -> GMState:
 
     # Apply state change
     if new_state != current_state:
-        entity_states[eid] = new_state
-        session["entity_states"] = entity_states
         state["matched_entity"]["new_state"] = new_state
         turn_summary["entity_state_changes"][eid] = f"{current_state}→{new_state}"
 
@@ -2357,14 +2626,19 @@ def resolve_entity(state: GMState) -> GMState:
 
     if "on_trigger" in state_def:
         raw_events = state_def.get("on_trigger", {}).get("events", [])
+        pending_events = []
         for raw_event in raw_events if isinstance(raw_events, list) else []:
             if not isinstance(raw_event, dict):
                 continue
             payload = dict(raw_event)
             payload.setdefault("source", "authored_state_trigger")
             payload.setdefault("player_action", state.get("player_input", ""))
-            committed = append_world_event(session, world, payload)
-            state.setdefault("_action_events", []).append(committed)
+            pending_events.append(payload)
+        if pending_events:
+            committed = commit_world_events(
+                session, world, pending_events, actor="rules",
+                source="authored_state_trigger")
+            state.setdefault("_action_events", []).extend(committed)
 
     # Award luck token on critical success
     dice = state.get("dice_result")
@@ -2376,6 +2650,33 @@ def resolve_entity(state: GMState) -> GMState:
 
     # Store narration override in state
     state["_narration_override"] = narration_override
+    return state
+
+
+def resolve_entity(state: GMState) -> GMState:
+    """Resolve one authored action as a transaction over the whole session.
+
+    Legacy resolution changes several coupled fields before applying authored
+    world events. Work on an isolated session so a bad late event cannot leave
+    disposition, SAN, inventory, flags, or cooldowns partially committed.
+    """
+    if not state.get("matched_entity") or state.get("_pending_roll"):
+        return _resolve_entity_impl(state)
+
+    original_session = state["session"]
+    staged_state = dict(state)
+    staged_state["session"] = deepcopy(original_session)
+    staged_state["matched_entity"] = deepcopy(state.get("matched_entity"))
+    staged_state["turn_summary"] = deepcopy(state.get("turn_summary", {}))
+    staged_state["_action_events"] = deepcopy(state.get("_action_events", []))
+
+    result = _resolve_entity_impl(staged_state)
+    original_session.clear()
+    original_session.update(result["session"])
+    for key, value in result.items():
+        if key != "session":
+            state[key] = value
+    state["session"] = original_session
     return state
 
 
@@ -2398,15 +2699,27 @@ def resolve_action(state: GMState) -> GMState:
     summary.setdefault("items_used", [])
     entities = world.get("entities", {})
 
+    pending_events = []
+    old_states = {}
     for event in resolution.get("events", []):
         payload = dict(event)
         payload.setdefault("source", state.get("action_proposal", {}).get(
             "source", "validated_action"))
         payload.setdefault("player_action", state.get("player_input", ""))
         eid = str(payload.get("entity_id", ""))
-        old_state = str(session.get("entity_states", {}).get(eid, "default"))
-        committed = append_world_event(session, world, payload)
-        state["_action_events"].append(committed)
+        old_states[eid] = str(
+            session.get("entity_states", {}).get(eid, "default"))
+        pending_events.append(payload)
+
+    committed_events = commit_world_events(
+        session, world, pending_events, actor="player",
+        source=str(state.get("action_proposal", {}).get(
+            "source", "validated_action")),
+    ) if pending_events else []
+    state["_action_events"].extend(committed_events)
+    for committed in committed_events:
+        eid = str(committed.get("entity_id", ""))
+        old_state = old_states.get(eid, "default")
         new_state = str(session.get("entity_states", {}).get(eid, old_state))
         if old_state != new_state:
             summary["entity_state_changes"][eid] = f"{old_state}→{new_state}"
@@ -2416,6 +2729,20 @@ def resolve_action(state: GMState) -> GMState:
         elif committed.get("type") == "item_used":
             summary["items_used"].append(name)
 
+    return state
+
+
+def advance_validated_action_clocks(state: GMState) -> GMState:
+    """Charge authored action time only after the action passes validation."""
+    resolution = state.get("action_resolution", {})
+    if (state.get("_action_block")
+            or state.get("_hidden_entity_action")
+            or state.get("_blocked_scene_move")
+            or resolution.get("status") in {"blocked", "ambiguous"}):
+        state["_clock_events"] = []
+        return state
+    state["_clock_events"] = _advance_action_clocks(
+        state.get("player_input", ""), state["session"], state["world"])
     return state
 
 
@@ -2551,9 +2878,12 @@ def assemble_context(state: GMState) -> GMState:
 
     # ── Layer 5: RECENT ──
     recent = get_recent_conversation(session, raw_turns=5)
-    summary = get_or_compress_conversation_summary(
-        session, api_key=api_key, base_url=DEEPSEEK_BASE_URL,
-    )
+    if _external_models_enabled(api_key):
+        summary = get_or_compress_conversation_summary(
+            session, api_key=api_key, base_url=DEEPSEEK_BASE_URL,
+        )
+    else:
+        summary = session.get("_cached_summary", "")
     conv_parts = []
     if summary:
         conv_parts.append(f"=== SESSION SUMMARY ===\n{summary}")
@@ -2715,9 +3045,8 @@ def assemble_context(state: GMState) -> GMState:
         parts.append("=== NPC CONTEXT ===")
         parts.append(npc_hit_layer)
         parts.append(
-            "\n[KP指令] 若玩家行动使NPC对玩家的信任感有明显变化（如NPC明显软化、建立连接或产生好感），"
-            "请在回复的最后单独一行输出「〔信任+N〕」（N为1-5的整数），不得让玩家看到此标记。"
-            "若本轮无明显信任变化，不要输出此标记。"
+            "\n[KP指令] NPC 的信任与关系变化只由模组规则、玩家检定和代码提交。"
+            "你只能描写当前已提交的关系状态，不得输出信任数值或状态修改标记。"
         )
 
     # Real-name hard fact — injected INDEPENDENTLY of npc_hit_layer (which can be
@@ -2940,6 +3269,11 @@ def assemble_context(state: GMState) -> GMState:
             "通过调查自己去发现），然后把主动权交还给玩家。"
         )
 
+    # NCP-style explicit fact ledger and commitments. This projection contains
+    # dynamic facts, so it overrides stale initial prose in the source excerpts.
+    parts.append("")
+    parts.append(render_contract_block(build_narrative_contract(state)))
+
     # Final GM instruction
     parts.append("")
     parts.append(
@@ -3083,11 +3417,15 @@ def narrate(state: GMState) -> GMState:
     # Dynamic check: the LLM may request a skill check for an uncertain action the
     # module didn't pre-define — arm it (player rolls next) and strip the marker.
     content = _maybe_arm_dynamic_check(state, content)
-    # Parse trust signal 〔信任+N〕 — strip from player-visible content, store for later.
-    _trust_match = _re.search(r'〔信任\+(\d+)〕', content)
-    state["_trust_signal"] = int(_trust_match.group(1)) if _trust_match else 0
+    # Legacy narrator markers are untrusted output. Strip them but never let
+    # generated prose write relationship state.
+    _trust_match = _re.search(r'〔\s*信任\s*\+\s*\d+\s*〕', content)
+    state["_trust_signal"] = 0
     if _trust_match:
-        content = _re.sub(r'\s*〔信任\+\d+〕\s*$', '', content, flags=_re.MULTILINE).rstrip()
+        content = _re.sub(
+            r'\s*〔\s*信任\s*\+\s*\d+\s*〕\s*', ' ', content).strip()
+        print("[ENGINE] Ignored narrator-authored trust marker", flush=True)
+    content = _audit_and_repair_narration(state, content)
     content = _prepend_clock_milestones(state, content)
     state["gm_response"] = content
     if stream_flag:
@@ -3109,6 +3447,7 @@ workflow.add_node("parse", parse_input)
 workflow.add_node("judge", judge)
 workflow.add_node("resolve", resolve_entity)
 workflow.add_node("resolve_action", resolve_action)
+workflow.add_node("advance_clocks", advance_validated_action_clocks)
 workflow.add_node("assemble", assemble_context)
 workflow.add_node("narrate", narrate)
 
@@ -3116,7 +3455,8 @@ workflow.set_entry_point("parse")
 workflow.add_conditional_edges("parse", _route_after_parse, {END: END, "judge": "judge"})
 workflow.add_edge("judge", "resolve")
 workflow.add_edge("resolve", "resolve_action")
-workflow.add_edge("resolve_action", "assemble")
+workflow.add_edge("resolve_action", "advance_clocks")
+workflow.add_edge("advance_clocks", "assemble")
 workflow.add_edge("assemble", "narrate")
 workflow.add_edge("narrate", END)
 
@@ -3233,6 +3573,7 @@ def run_gm_turn(
         "_action_events": [],
         "_action_block": "",
         "_requested_scene_target": "",
+        "_narrative_audit": {},
     }
 
     # ── Opening narration ──
@@ -3356,6 +3697,18 @@ def run_gm_turn(
         opening = _redact_unrevealed_entities(opening, session, world)
         opening = _redact_unrevealed_names(
             opening, session, entity_index, world)
+        opening_state = dict(state)
+        opening_state.update({
+            "session": session,
+            "player_input": last_user_msg,
+            "current_scene": first_scene,
+            "scene_entities": _scene_entities_with_companions(
+                first_scene_id, scene_index, session, entity_index, world),
+            "context_prompt": opening_ctx,
+            "_contract_turn": 1,
+            "_grounded_fallback": scene_desc or scene_name,
+        })
+        opening = _audit_and_repair_narration(opening_state, opening)
         _write_eval_trace(
             chat_id,
             1,
@@ -3366,6 +3719,7 @@ def run_gm_turn(
                 "player_input": last_user_msg,
                 "context_prompt": opening_ctx,
                 "gm_response": opening,
+                "narrative_audit": opening_state.get("_narrative_audit", {}),
             },
         )
         write_turn_log(session=session, turn=1, scene=first_scene_id,
@@ -3407,6 +3761,7 @@ def run_gm_turn(
             "action_proposal": result.get("action_proposal", {}),
             "action_resolution": result.get("action_resolution", {}),
             "world_events": result.get("_action_events", []),
+            "narrative_audit": result.get("_narrative_audit", {}),
         },
     )
 
@@ -3490,11 +3845,14 @@ def run_gm_turn(
         )
 
         # Compress story from the scene we're leaving
-        try:
-            from npc_context import compress_story
-            compress_story(session, api_key=effective_key, base_url=DEEPSEEK_BASE_URL)
-        except Exception as e:
-            print(f"[ENGINE] Story compression error: {e}", flush=True)
+        if _external_models_enabled(effective_key):
+            try:
+                from npc_context import compress_story
+                compress_story(
+                    session, api_key=effective_key,
+                    base_url=DEEPSEEK_BASE_URL)
+            except Exception as e:
+                print(f"[ENGINE] Story compression error: {e}", flush=True)
 
         # Advance plot_phase if the new scene corresponds to a later phase.
         _advance_plot_phase(world, session, movement_target)
@@ -3570,14 +3928,12 @@ def run_gm_turn(
             _skill = str(_dr.get("skill", "") or _dr.get("skill_name", "")).lower()
             if any(s in _skill for s in ["说服", "persuade", "心理学", "psychology", "魅力", "charm"]):
                 _skill_bonus = 5
-        # LLM trust signal, plus a small fallback only for actual dialogue.
-        # Merely targeting an NPC in combat or another physical action must not
-        # become positive social progress because the narration was long.
-        _trust_signal = result.get("_trust_signal", 0)
+        # Relationship state is rule-owned. A genuine dialogue turn contributes
+        # one deterministic point; authored disposition and successful social
+        # checks are the only larger changes.
         _is_social_turn = _is_dialogue_intent(
             result.get("player_input", ""))
-        _base_trust = (
-            1 if _is_social_turn and len(gm_response_text or "") > 50 else 0)
+        _base_trust = 1 if _is_social_turn else 0
         for eid in matched_npc_ids[:2]:
             einfo = entity_index.get(eid, {})
             npc_name = einfo.get("name", eid)
@@ -3586,7 +3942,7 @@ def run_gm_turn(
                 kn = key.lower().replace(" ", "")
                 if kn == nn or nn in kn or kn in nn:
                     disposition = turn_summary.get("npc_changes", {}).get(eid, {}).get("disposition", 0)
-                    trust_delta = disposition + (_trust_signal if _trust_signal > 0 else _base_trust) + _skill_bonus
+                    trust_delta = disposition + _base_trust + _skill_bonus
                     add_interaction(
                         npc_state.get("dynamic", {}),
                         turn=new_turn,
@@ -3595,24 +3951,10 @@ def run_gm_turn(
                         trust_delta=trust_delta,
                     )
                     print(f"[ENGINE] Trust update for {npc_name}: "
-                          f"signal={_trust_signal} base={_base_trust} skill={_skill_bonus} → Δ{trust_delta}",
+                          f"base={_base_trust} "
+                          f"skill={_skill_bonus} → Δ{trust_delta}",
                           flush=True)
                     break
-
-    # Post-narration: auto SAN detection from GM response (CoC only)
-    if (gm_response_text and session.get("rule_system") == "coc"
-            and not result.get("_san_result")):
-        try:
-            from check_trigger import detect_san_trigger, execute_san_check
-            trigger_kw = detect_san_trigger(gm_response_text)
-            if trigger_kw:
-                ps = session["player_state"]
-                san_result = execute_san_check("0/1d3", ps.get("san", 60))
-                ps["san"] = max(0, san_result["san_after"])
-                session["_pending_san_result"] = san_result
-                print(f"[ENGINE] Auto SAN trigger: '{trigger_kw}' → loss={san_result['san_loss']} (now {ps['san']})", flush=True)
-        except Exception as e:
-            print(f"[ENGINE] SAN auto-detect error: {e}", flush=True)
 
     save_session(session)
     print(f"[ENGINE] Turn {new_turn} saved to session {chat_id}", flush=True)

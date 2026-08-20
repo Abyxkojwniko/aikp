@@ -35,6 +35,10 @@ _load_dotenv()
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+NARRATIVE_AUDIT_MODE = os.environ.get(
+    "AIKP_NARRATIVE_AUDIT", "strict").strip().lower()
+NARRATIVE_AUDITOR_MODEL = os.environ.get(
+    "AIKP_NARRATIVE_AUDITOR_MODEL", DEEPSEEK_MODEL)
 
 
 def _positive_int_env(name: str, default: int) -> int:

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AIKP Check Trigger — dual-path dice check + SAN auto-detection.
+"""AIKP Check Trigger — fixed and dynamic dice-check utilities.
 
 Design: docs/npc-design.md
 
@@ -10,8 +10,9 @@ Path A: JSON-fixed
 Path B: LLM dynamic
   GM narration contains "CHECK:San 12"        -> parse -> dice -> inject next turn
 
-SAN auto-detection:
-  Engine scans GM narration for horror keywords -> auto 1/1d3 SAN check
+The runtime never mutates SAN from narration keywords. SAN loss must come from
+an explicit module ``san_check`` rule; the keyword helpers below remain only for
+backward-compatible tooling.
 """
 
 from __future__ import annotations

@@ -86,7 +86,7 @@ class Session(TypedDict, total=False):
     _story_summary: str           # LLM-compressed prior scene narrative
     _cached_summary: str          # mid-range conversation summary cache
     _cached_summary_turn: int     # turn when _cached_summary was last generated
-    _pending_san_result: Optional[dict]  # auto-SAN result from last turn
+    _pending_san_result: Optional[dict]  # legacy delayed explicit SAN result
     imported_card: Optional[dict]        # parsed .st character card (survives reset)
     pending_check: Optional[dict]        # check awaiting the player's dice roll (/api/roll)
     discovered_clues: list[str]          # scene clue IDs discovered so far
@@ -102,6 +102,10 @@ class Session(TypedDict, total=False):
     entity_facts: dict[str, dict]         # orthogonal location/knowledge/condition facts
     world_events: list[dict]              # immutable authoritative event log
     world_event_seq: int                  # monotonic event sequence
+    world_commits: list[dict]             # atomic PDVA commit journal
+    world_state_hash: str                 # hash of latest canonical state snapshot
+    narrative_commitments: list[dict]     # explicit persistent story obligations
+    narrative_audits: list[dict]          # compact verifier/repair journal
     inventory_entity_ids: list[str]       # stable ids; player_state.inventory is display-only
     selected_object_id: Optional[str]     # optional frontend-selected object target
     discovered_scene_ids: list[str]       # player-known scenes, including visible exits
@@ -292,6 +296,10 @@ def create_session(chat_id: str, model: str) -> Session:
         entity_facts={},
         world_events=[],
         world_event_seq=0,
+        world_commits=[],
+        world_state_hash="",
+        narrative_commitments=[],
+        narrative_audits=[],
         inventory_entity_ids=[],
         selected_object_id=None,
         discovered_scene_ids=[],
